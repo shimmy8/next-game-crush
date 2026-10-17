@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+node_modules/
+.pnpm-store/
+web/dist/
+bin/
+.cache/
+coverage/
+*.test
+*.tsbuildinfo
+.DS_Store

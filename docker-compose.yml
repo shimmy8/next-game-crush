@@ -1,0 +1,48 @@
+services:
+  db:
+    image: pgvector/pgvector:0.8.7-pg16-bookworm
+    environment:
+      POSTGRES_DB: next_game_crush
+      POSTGRES_USER: next_game_crush
+      POSTGRES_PASSWORD: next_game_crush
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U next_game_crush -d next_game_crush"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+  app:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8080}
+      ALLOWED_STEAM_ID: ${ALLOWED_STEAM_ID:-}
+      STEAM_WEB_API_KEY: ${STEAM_WEB_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6-luna}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      DATABASE_URL: postgres://next_game_crush:next_game_crush@db:5432/next_game_crush?sslmode=disable
+      SMTP_URL: smtp://mailpit:1025
+      EMAIL_ACTION_SECRET: ${EMAIL_ACTION_SECRET:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+volumes:
+  postgres_data:
