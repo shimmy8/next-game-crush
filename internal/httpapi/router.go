@@ -14,6 +14,7 @@ import (
 type Dependencies struct {
 	Frontend fs.FS
 	Auth     *auth.Service
+	Sync     SyncService
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -25,6 +26,10 @@ func NewRouter(deps Dependencies) http.Handler {
 		router.Get("/auth/steam/callback", completeSteamLogin(deps.Auth))
 		router.With(deps.Auth.Middleware).Get("/api/me", me)
 		router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/auth/logout", logout(deps.Auth))
+		if deps.Sync != nil {
+			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/sync", startSync(deps.Sync))
+			router.With(deps.Auth.Middleware).Get("/api/sync/{id}", syncStatus(deps.Sync))
+		}
 	}
 	if deps.Frontend != nil {
 		files := http.FileServer(http.FS(deps.Frontend))

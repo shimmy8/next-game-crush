@@ -123,6 +123,9 @@ func (worker *Worker) process(ctx context.Context, lease Lease) error {
 		select {
 		case err := <-result:
 			if err != nil {
+				if errors.Is(err, ErrDeferred) {
+					return nil
+				}
 				if ctx.Err() != nil {
 					return nil
 				}

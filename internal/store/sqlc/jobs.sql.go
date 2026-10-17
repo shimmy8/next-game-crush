@@ -28,9 +28,9 @@ WITH candidate AS (
         lease_until = now() + $3::interval,
         updated_at = now()
     FROM candidate c WHERE j.id = c.id
-    RETURNING j.id, j.kind, j.idempotency_key, j.payload, j.status, j.attempts, j.max_attempts, j.available_at, j.worker_id, j.fencing_token, j.lease_until, j.last_error, j.created_at, j.updated_at
+    RETURNING j.id, j.kind, j.idempotency_key, j.payload, j.status, j.attempts, j.max_attempts, j.available_at, j.worker_id, j.fencing_token, j.lease_until, j.last_error, j.created_at, j.updated_at, j.parent_job_id, j.required, j.stage
 )
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at FROM claimed
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage FROM claimed
 `
 
 type ClaimJobParams struct {
@@ -54,6 +54,9 @@ type ClaimJobRow struct {
 	LastError      pgtype.Text        `json:"last_error"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	ParentJobID    pgtype.UUID        `json:"parent_job_id"`
+	Required       bool               `json:"required"`
+	Stage          string             `json:"stage"`
 }
 
 func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (ClaimJobRow, error) {
@@ -74,6 +77,9 @@ func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (ClaimJobRow
 		&i.LastError,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ParentJobID,
+		&i.Required,
+		&i.Stage,
 	)
 	return i, err
 }
@@ -110,8 +116,8 @@ func (q *Queries) DeadLetterExhaustedLeases(ctx context.Context) error {
 }
 
 const enqueueJob = `-- name: EnqueueJob :one
-INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at)
-VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()))
+INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage)
+VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8, $9)
 ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
 RETURNING id
 `
@@ -123,6 +129,9 @@ type EnqueueJobParams struct {
 	Payload        []byte             `json:"payload"`
 	MaxAttempts    int32              `json:"max_attempts"`
 	AvailableAt    pgtype.Timestamptz `json:"available_at"`
+	ParentJobID    pgtype.UUID        `json:"parent_job_id"`
+	Required       bool               `json:"required"`
+	Stage          string             `json:"stage"`
 }
 
 func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (pgtype.UUID, error) {
@@ -133,6 +142,9 @@ func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (pgtype.
 		arg.Payload,
 		arg.MaxAttempts,
 		arg.AvailableAt,
+		arg.ParentJobID,
+		arg.Required,
+		arg.Stage,
 	)
 	var id pgtype.UUID
 	err := row.Scan(&id)
@@ -168,6 +180,19 @@ func (q *Queries) FailJob(ctx context.Context, arg FailJobParams) (int64, error)
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const failParentsWithDeadRequiredChildren = `-- name: FailParentsWithDeadRequiredChildren :exec
+UPDATE sync_jobs parent SET status='dead', last_error='required child stage failed', updated_at=now()
+WHERE parent.status='waiting' AND EXISTS (
+    SELECT 1 FROM sync_jobs child
+    WHERE child.parent_job_id=parent.id AND child.required AND child.status='dead'
+)
+`
+
+func (q *Queries) FailParentsWithDeadRequiredChildren(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, failParentsWithDeadRequiredChildren)
+	return err
 }
 
 const finishExpiredAttempts = `-- name: FinishExpiredAttempts :exec
@@ -220,6 +245,48 @@ type FinishSuccessfulAttemptParams struct {
 func (q *Queries) FinishSuccessfulAttempt(ctx context.Context, arg FinishSuccessfulAttemptParams) error {
 	_, err := q.db.Exec(ctx, finishSuccessfulAttempt, arg.JobID, arg.WorkerID, arg.FencingToken)
 	return err
+}
+
+const getJobChildren = `-- name: GetJobChildren :many
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id
+`
+
+func (q *Queries) GetJobChildren(ctx context.Context, parentJobID pgtype.UUID) ([]SyncJob, error) {
+	rows, err := q.db.Query(ctx, getJobChildren, parentJobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []SyncJob{}
+	for rows.Next() {
+		var i SyncJob
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.IdempotencyKey,
+			&i.Payload,
+			&i.Status,
+			&i.Attempts,
+			&i.MaxAttempts,
+			&i.AvailableAt,
+			&i.WorkerID,
+			&i.FencingToken,
+			&i.LeaseUntil,
+			&i.LastError,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ParentJobID,
+			&i.Required,
+			&i.Stage,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const insertJobAttempt = `-- name: InsertJobAttempt :exec

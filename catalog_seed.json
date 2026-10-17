@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "observed_date": "2026-10-17",
+  "entries": [
+    {"app_id":2087540,"release_window":"2026-10-21","source_url":"https://store.steampowered.com/app/2087540/","observed_date":"2026-10-17"},
+    {"app_id":4861900,"release_window":"2026-10-27","source_url":"https://store.steampowered.com/app/4861900/","observed_date":"2026-10-17"},
+    {"app_id":5179670,"release_window":"2026-10-28","source_url":"https://store.steampowered.com/app/5179670/","observed_date":"2026-10-17"},
+    {"app_id":4634660,"release_window":"Oct 2026","source_url":"https://store.steampowered.com/app/4634660/","observed_date":"2026-10-17"},
+    {"app_id":5347650,"release_window":"Nov 2026","source_url":"https://store.steampowered.com/app/5347650/","observed_date":"2026-10-17"},
+    {"app_id":5332060,"release_window":"Nov 2026","source_url":"https://store.steampowered.com/app/5332060/","observed_date":"2026-10-17"},
+    {"app_id":4878670,"release_window":"Nov 2026","source_url":"https://store.steampowered.com/app/4878670/","observed_date":"2026-10-17"},
+    {"app_id":4447790,"release_window":"Nov 2026","source_url":"https://store.steampowered.com/app/4447790/","observed_date":"2026-10-17"},
+    {"app_id":4579930,"release_window":"Nov 2026","source_url":"https://store.steampowered.com/app/4579930/","observed_date":"2026-10-17"},
+    {"app_id":5076760,"release_window":"Nov 2026","source_url":"https://store.steampowered.com/app/5076760/","observed_date":"2026-10-17"},
+    {"app_id":4898190,"release_window":"Nov 2026","source_url":"https://store.steampowered.com/app/4898190/","observed_date":"2026-10-17"},
+    {"app_id":4298200,"release_window":"Dec 2026","source_url":"https://store.steampowered.com/app/4298200/","observed_date":"2026-10-17"},
+    {"app_id":5220800,"release_window":"Dec 2026","source_url":"https://store.steampowered.com/app/5220800/","observed_date":"2026-10-17"},
+    {"app_id":2196920,"release_window":"Dec 2026","source_url":"https://store.steampowered.com/app/2196920/","observed_date":"2026-10-17"},
+    {"app_id":4788460,"release_window":"Dec 2026","source_url":"https://store.steampowered.com/app/4788460/","observed_date":"2026-10-17"},
+    {"app_id":4216640,"release_window":"Dec 2026","source_url":"https://store.steampowered.com/app/4216640/","observed_date":"2026-10-17"},
+    {"app_id":4671040,"release_window":"Dec 2026","source_url":"https://store.steampowered.com/app/4671040/","observed_date":"2026-10-17"},
+    {"app_id":4347770,"release_window":"Dec 2026","source_url":"https://store.steampowered.com/app/4347770/","observed_date":"2026-10-17"},
+    {"app_id":4410960,"release_window":"Dec 2026","source_url":"https://store.steampowered.com/app/4410960/","observed_date":"2026-10-17"},
+    {"app_id":4676120,"release_window":"Dec 2026","source_url":"https://store.steampowered.com/app/4676120/","observed_date":"2026-10-17"}
+  ]
+}

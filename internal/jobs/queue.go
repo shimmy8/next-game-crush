@@ -16,6 +16,7 @@ import (
 )
 
 var ErrLeaseLost = errors.New("job lease is no longer owned")
+var ErrDeferred = errors.New("job deferred pending required child stages")
 
 type Spec struct {
 	Kind           string
@@ -23,6 +24,9 @@ type Spec struct {
 	Payload        json.RawMessage
 	MaxAttempts    int
 	AvailableAt    time.Time
+	ParentJobID    uuid.UUID
+	Required       bool
+	Stage          string
 }
 
 type Lease struct {
@@ -67,6 +71,10 @@ func (q *Queue) Enqueue(ctx context.Context, spec Spec) (uuid.UUID, error) {
 	if spec.MaxAttempts < 1 {
 		return uuid.Nil, errors.New("max attempts must be positive")
 	}
+	if spec.ParentJobID == uuid.Nil && !spec.Required {
+		// Root jobs are required by definition; zero-value Specs remain backwards compatible.
+		spec.Required = true
+	}
 	availableAt := pgtype.Timestamptz{}
 	if !spec.AvailableAt.IsZero() {
 		availableAt = timeToPG(spec.AvailableAt)
@@ -74,11 +82,64 @@ func (q *Queue) Enqueue(ctx context.Context, spec Spec) (uuid.UUID, error) {
 	id, err := q.store.Queries.EnqueueJob(ctx, dbgen.EnqueueJobParams{
 		ID: uuidToPG(uuid.New()), Kind: spec.Kind, IdempotencyKey: spec.IdempotencyKey,
 		Payload: spec.Payload, MaxAttempts: int32(spec.MaxAttempts), AvailableAt: availableAt,
+		ParentJobID: nullableUUID(spec.ParentJobID), Required: spec.Required, Stage: spec.Stage,
 	})
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("enqueue job: %w", err)
 	}
 	return uuidFromPG(id)
+}
+
+// AwaitChildren atomically enqueues idempotent child stages and releases the
+// parent lease. The parent is re-queued only after every required child has
+// succeeded. The caller must return ErrDeferred when ready is false.
+func (q *Queue) AwaitChildren(ctx context.Context, lease Lease, specs []Spec) (ready bool, err error) {
+	tx, err := q.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin child scheduling: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var owned bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sync_jobs WHERE id=$1 AND status='running' AND worker_id=$2 AND fencing_token=$3 AND lease_until>now())`, lease.ID, lease.WorkerID, lease.FencingToken).Scan(&owned); err != nil {
+		return false, fmt.Errorf("verify parent lease: %w", err)
+	}
+	if !owned {
+		return false, ErrLeaseLost
+	}
+	queries := q.store.Queries.WithTx(tx)
+	for _, spec := range specs {
+		spec.ParentJobID = lease.ID
+		if !spec.Required {
+			spec.Required = true
+		}
+		if len(spec.Payload) == 0 {
+			spec.Payload = json.RawMessage(`{}`)
+		}
+		if spec.MaxAttempts == 0 {
+			spec.MaxAttempts = 3
+		}
+		if _, err := queries.EnqueueJob(ctx, dbgen.EnqueueJobParams{ID: uuidToPG(uuid.New()), Kind: spec.Kind, IdempotencyKey: spec.IdempotencyKey, Payload: spec.Payload, MaxAttempts: int32(spec.MaxAttempts), AvailableAt: pgtype.Timestamptz{}, ParentJobID: uuidToPG(lease.ID), Required: spec.Required, Stage: spec.Stage}); err != nil {
+			return false, fmt.Errorf("enqueue child stage: %w", err)
+		}
+	}
+	var pending int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE parent_job_id=$1 AND required AND status<>'succeeded'`, lease.ID).Scan(&pending); err != nil {
+		return false, fmt.Errorf("inspect child stages: %w", err)
+	}
+	if pending == 0 {
+		return true, tx.Commit(ctx)
+	}
+	command, err := tx.Exec(ctx, `UPDATE sync_jobs SET status='waiting', attempts=GREATEST(attempts-1,0), worker_id=NULL, fencing_token=NULL, lease_until=NULL, updated_at=now() WHERE id=$1 AND status='running' AND worker_id=$2 AND fencing_token=$3`, lease.ID, lease.WorkerID, lease.FencingToken)
+	if err != nil {
+		return false, fmt.Errorf("defer parent: %w", err)
+	}
+	if command.RowsAffected() != 1 {
+		return false, ErrLeaseLost
+	}
+	if _, err := tx.Exec(ctx, `UPDATE job_attempts SET status='waiting', finished_at=now() WHERE job_id=$1 AND worker_id=$2 AND fencing_token=$3 AND status='running'`, lease.ID, lease.WorkerID, lease.FencingToken); err != nil {
+		return false, fmt.Errorf("finish deferred attempt: %w", err)
+	}
+	return false, tx.Commit(ctx)
 }
 
 func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration) (*Lease, error) {
@@ -102,6 +163,9 @@ func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration)
 	}
 	if err := queries.DeadLetterExhaustedLeases(ctx); err != nil {
 		return nil, fmt.Errorf("dead-letter exhausted leases: %w", err)
+	}
+	if err := queries.FailParentsWithDeadRequiredChildren(ctx); err != nil {
+		return nil, fmt.Errorf("fail parent with dead required child: %w", err)
 	}
 	token := uuid.New()
 	row, err := queries.ClaimJob(ctx, dbgen.ClaimJobParams{
@@ -170,6 +234,11 @@ func (q *Queue) Complete(ctx context.Context, lease Lease) error {
 	}); err != nil {
 		return fmt.Errorf("finish successful attempt: %w", err)
 	}
+	if _, err := tx.Exec(ctx, `UPDATE sync_jobs parent SET status='queued', available_at=now(), updated_at=now()
+		WHERE parent.id=(SELECT parent_job_id FROM sync_jobs WHERE id=$1) AND parent.status='waiting'
+		AND NOT EXISTS (SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.required AND child.status<>'succeeded')`, lease.ID); err != nil {
+		return fmt.Errorf("promote completed parent: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit completion: %w", err)
 	}
@@ -209,6 +278,12 @@ func (q *Queue) Fail(ctx context.Context, lease Lease, cause error, retryAt time
 	}); err != nil {
 		return fmt.Errorf("finish failed attempt: %w", err)
 	}
+	if status == "dead" {
+		if _, err := tx.Exec(ctx, `UPDATE sync_jobs parent SET status='dead', last_error='required child stage failed', updated_at=now()
+			WHERE parent.id=(SELECT parent_job_id FROM sync_jobs WHERE id=$1) AND parent.status='waiting' AND (SELECT required FROM sync_jobs WHERE id=$1)`, lease.ID); err != nil {
+			return fmt.Errorf("fail parent workflow: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit failure: %w", err)
 	}
@@ -223,6 +298,12 @@ func requireOwnership(rows int64) error {
 }
 
 func uuidToPG(value uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: value, Valid: true} }
+func nullableUUID(value uuid.UUID) pgtype.UUID {
+	if value == uuid.Nil {
+		return pgtype.UUID{}
+	}
+	return uuidToPG(value)
+}
 
 func uuidFromPG(value pgtype.UUID) (uuid.UUID, error) {
 	if !value.Valid {

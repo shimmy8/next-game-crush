@@ -19,6 +19,20 @@ type AchievementSummary struct {
 	RawSnapshot           []byte             `json:"raw_snapshot"`
 }
 
+type CatalogEntry struct {
+	GameID  pgtype.UUID        `json:"game_id"`
+	Origin  string             `json:"origin"`
+	AddedAt pgtype.Timestamptz `json:"added_at"`
+}
+
+type CatalogFetchState struct {
+	GameID                pgtype.UUID        `json:"game_id"`
+	Availability          string             `json:"availability"`
+	LastAttemptAt         pgtype.Timestamptz `json:"last_attempt_at"`
+	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
+	Error                 pgtype.Text        `json:"error"`
+}
+
 type EmailDelivery struct {
 	ID             pgtype.UUID        `json:"id"`
 	UserID         pgtype.UUID        `json:"user_id"`
@@ -60,6 +74,9 @@ type Game struct {
 	SourceSnapshot        []byte             `json:"source_snapshot"`
 	CreatedAt             pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	Availability          string             `json:"availability"`
+	LastAttemptAt         pgtype.Timestamptz `json:"last_attempt_at"`
+	ContentHash           pgtype.Text        `json:"content_hash"`
 }
 
 type GameEmbedding struct {
@@ -198,6 +215,9 @@ type SyncJob struct {
 	LastError      pgtype.Text        `json:"last_error"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	ParentJobID    pgtype.UUID        `json:"parent_job_id"`
+	Required       bool               `json:"required"`
+	Stage          string             `json:"stage"`
 }
 
 type User struct {
@@ -213,6 +233,17 @@ type UserGame struct {
 	RecentlyPlayedMinutes int64              `json:"recently_played_minutes"`
 	Source                string             `json:"source"`
 	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
+	LastPlayedAt          pgtype.Timestamptz `json:"last_played_at"`
+}
+
+type UserSourceState struct {
+	UserID                pgtype.UUID        `json:"user_id"`
+	Source                string             `json:"source"`
+	ResourceKey           string             `json:"resource_key"`
+	Availability          string             `json:"availability"`
+	LastAttemptAt         pgtype.Timestamptz `json:"last_attempt_at"`
+	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
+	Error                 pgtype.Text        `json:"error"`
 }
 
 type WishlistEntry struct {

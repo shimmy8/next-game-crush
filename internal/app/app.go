@@ -10,10 +10,13 @@ import (
 	"time"
 
 	"next-game-crush/internal/auth"
+	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/config"
 	"next-game-crush/internal/httpapi"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
+	syncservice "next-game-crush/internal/sync"
 )
 
 type App struct {
@@ -41,6 +44,31 @@ func New(cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	queue := jobs.NewQueue(db)
+	steamClient, err := steam.NewClient(steam.HTTPConfig{APIKey: cfg.SteamWebAPIKey})
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure Steam client: %w", err)
+	}
+	seed, err := catalog.LoadSeed("catalog_seed.json")
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	catalogService, err := catalog.NewService(db, steamClient, seed)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	syncService, err := syncservice.NewService(db, queue, steamClient, catalogService)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	worker := jobs.NewWorker(queue, workerID)
+	if err := syncService.RegisterHandlers(worker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register synchronization handlers: %w", err)
+	}
 	providerClient := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret}, auth.NewSQLRepository(db), auth.NewHTTPProvider(providerClient, "https://steamcommunity.com/openid/"))
 	if err != nil {
@@ -48,7 +76,8 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("configure authentication: %w", err)
 	}
 	deps.Auth = authService
-	return &App{store: db, worker: jobs.NewWorker(queue, workerID), server: &http.Server{
+	deps.Sync = syncService
+	return &App{store: db, worker: worker, server: &http.Server{
 		Addr:              ":8080",
 		Handler:           httpapi.NewRouter(deps),
 		ReadHeaderTimeout: 5 * time.Second,

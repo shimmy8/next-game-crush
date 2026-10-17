@@ -234,6 +234,78 @@ func TestParallelClaimsAreUnique(t *testing.T) {
 	}
 }
 
+func TestDeferredParentPreservesItsFinalAttemptForCompletion(t *testing.T) {
+	queue, db := openTestQueue(t)
+	parentID, err := queue.Enqueue(context.Background(), Spec{Kind: "parent", IdempotencyKey: "parent-final-attempt", MaxAttempts: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := queue.Claim(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Fail(context.Background(), *first, errors.New("temporary"), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := queue.Claim(context.Background(), "worker", time.Minute)
+	if err != nil || second == nil || second.Attempts != 2 {
+		t.Fatalf("final parent attempt = %#v, %v", second, err)
+	}
+	ready, err := queue.AwaitChildren(context.Background(), *second, []Spec{{Kind: "child", IdempotencyKey: "parent-final-attempt:child", Required: true}})
+	if err != nil || ready {
+		t.Fatalf("AwaitChildren = %v, %v; want deferred", ready, err)
+	}
+	var attempts int
+	if err := db.Pool.QueryRow(context.Background(), `SELECT attempts FROM sync_jobs WHERE id=$1`, parentID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Fatalf("deferred parent attempts = %d, want 1", attempts)
+	}
+	child, err := queue.Claim(context.Background(), "worker", time.Minute)
+	if err != nil || child == nil || child.Kind != "child" {
+		t.Fatalf("child claim = %#v, %v", child, err)
+	}
+	if err := queue.Complete(context.Background(), *child); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := queue.Claim(context.Background(), "worker", time.Minute)
+	if err != nil || resumed == nil || resumed.ID != parentID || resumed.Attempts != 2 {
+		t.Fatalf("resumed parent = %#v, %v", resumed, err)
+	}
+}
+
+func TestExpiredRequiredChildFailsWaitingParent(t *testing.T) {
+	queue, db := openTestQueue(t)
+	parentID, err := queue.Enqueue(context.Background(), Spec{Kind: "parent", IdempotencyKey: "expired-child-parent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := queue.Claim(context.Background(), "worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := queue.AwaitChildren(context.Background(), *parent, []Spec{{Kind: "child", IdempotencyKey: "expired-child-parent:child", Required: true, MaxAttempts: 1}})
+	if err != nil || ready {
+		t.Fatalf("AwaitChildren = %v, %v; want deferred", ready, err)
+	}
+	child, err := queue.Claim(context.Background(), "worker", 15*time.Millisecond)
+	if err != nil || child == nil {
+		t.Fatalf("child claim = %#v, %v", child, err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if _, err := queue.Claim(context.Background(), "cleanup", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	var status, lastError string
+	if err := db.Pool.QueryRow(context.Background(), `SELECT status,last_error FROM sync_jobs WHERE id=$1`, parentID).Scan(&status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if status != "dead" || lastError != "required child stage failed" {
+		t.Fatalf("parent terminal state = %s/%q", status, lastError)
+	}
+}
+
 func openTestQueue(t *testing.T) (*Queue, *store.Store) {
 	t.Helper()
 	baseURL := os.Getenv("TEST_DATABASE_URL")

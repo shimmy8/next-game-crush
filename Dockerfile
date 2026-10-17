@@ -12,6 +12,7 @@ ENV GOWORK=off
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ ./cmd/
+COPY db/ ./db/
 COPY internal/ ./internal/
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /next-game-crush ./cmd/next-game-crush
 
@@ -20,6 +21,7 @@ RUN apk add --no-cache ca-certificates && addgroup -S app && adduser -S -G app a
 WORKDIR /app
 COPY --from=go-build /next-game-crush ./next-game-crush
 COPY --from=web-build /src/web/dist ./web/dist
+COPY catalog_seed.json ./catalog_seed.json
 USER app
 EXPOSE 8080
 CMD ["./next-game-crush"]

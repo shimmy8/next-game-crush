@@ -110,7 +110,7 @@ ON CONFLICT (steam_app_id) DO UPDATE SET
     source = EXCLUDED.source,
     last_successful_fetch_at = EXCLUDED.last_successful_fetch_at,
     updated_at = now()
-RETURNING id, steam_app_id, name, source, last_successful_fetch_at, source_snapshot, created_at, updated_at
+RETURNING id, steam_app_id, name, source, last_successful_fetch_at, source_snapshot, created_at, updated_at, availability, last_attempt_at, content_hash
 `
 
 type UpsertGameParams struct {
@@ -139,6 +139,9 @@ func (q *Queries) UpsertGame(ctx context.Context, arg UpsertGameParams) (Game, e
 		&i.SourceSnapshot,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Availability,
+		&i.LastAttemptAt,
+		&i.ContentHash,
 	)
 	return i, err
 }

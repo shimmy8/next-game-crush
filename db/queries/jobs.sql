@@ -1,6 +1,6 @@
 -- name: EnqueueJob :one
-INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at)
-VALUES ($1, $2, $3, $4, $5, COALESCE(sqlc.narg(available_at)::timestamptz, now()))
+INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage)
+VALUES ($1, $2, $3, $4, $5, COALESCE(sqlc.narg(available_at)::timestamptz, now()), sqlc.narg(parent_job_id), sqlc.arg(required), sqlc.arg(stage))
 ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
 RETURNING id;
 
@@ -41,6 +41,13 @@ UPDATE sync_jobs SET status = 'dead', worker_id = NULL, fencing_token = NULL,
     lease_until = NULL, last_error = 'lease expired after maximum attempts', updated_at = now()
 WHERE status = 'running' AND lease_until <= now() AND attempts >= max_attempts;
 
+-- name: FailParentsWithDeadRequiredChildren :exec
+UPDATE sync_jobs parent SET status='dead', last_error='required child stage failed', updated_at=now()
+WHERE parent.status='waiting' AND EXISTS (
+    SELECT 1 FROM sync_jobs child
+    WHERE child.parent_job_id=parent.id AND child.required AND child.status='dead'
+);
+
 -- name: RenewJob :execrows
 UPDATE sync_jobs SET lease_until = now() + sqlc.arg(lease_duration)::interval, updated_at = now()
 WHERE id = sqlc.arg(id) AND status = 'running' AND worker_id = sqlc.arg(worker_id)
@@ -66,3 +73,6 @@ WHERE id = sqlc.arg(id) AND status = 'running' AND worker_id = sqlc.arg(worker_i
 -- name: FinishFailedAttempt :exec
 UPDATE job_attempts SET status = $4, error = $5, finished_at = now()
 WHERE job_id = $1 AND worker_id = $2 AND fencing_token = $3 AND status = 'running';
+
+-- name: GetJobChildren :many
+SELECT * FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id;
