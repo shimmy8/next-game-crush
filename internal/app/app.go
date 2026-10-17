@@ -13,6 +13,7 @@ import (
 	"next-game-crush/internal/auth"
 	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/config"
+	"next-game-crush/internal/feedback"
 	"next-game-crush/internal/httpapi"
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/profile"
@@ -122,6 +123,20 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("register recommendation handlers: %w", err)
 	}
+	feedbackRepository, err := feedback.NewSQLRepository(db)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure feedback repository: %w", err)
+	}
+	feedbackService, err := feedback.NewService(feedbackRepository, openAIClient, cfg.OpenAIModel, queue)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure feedback service: %w", err)
+	}
+	if err := feedbackService.RegisterHandlers(worker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register feedback handlers: %w", err)
+	}
 	syncService.EnableRankingJobs()
 	providerClient := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret}, auth.NewSQLRepository(db), auth.NewHTTPProvider(providerClient, "https://steamcommunity.com/openid/"))
@@ -133,6 +148,7 @@ func New(cfg config.Config) (*App, error) {
 	deps.Sync = syncService
 	deps.Profile = profileService
 	deps.Recommendations = recommendationService
+	deps.Feedback = feedbackService
 	return &App{store: db, worker: worker, server: &http.Server{
 		Addr:              ":8080",
 		Handler:           httpapi.NewRouter(deps),

@@ -52,17 +52,22 @@ type FeedbackClassification struct {
 	Model            string             `json:"model"`
 	InputContentHash string             `json:"input_content_hash"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	SchemaVersion    int32              `json:"schema_version"`
 }
 
 type FeedbackEvent struct {
-	ID               pgtype.UUID        `json:"id"`
-	RecommendationID pgtype.UUID        `json:"recommendation_id"`
-	UserID           pgtype.UUID        `json:"user_id"`
-	Action           string             `json:"action"`
-	Reason           pgtype.Text        `json:"reason"`
-	FreeText         pgtype.Text        `json:"free_text"`
-	IdempotencyKey   string             `json:"idempotency_key"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	ID                      pgtype.UUID        `json:"id"`
+	RecommendationID        pgtype.UUID        `json:"recommendation_id"`
+	UserID                  pgtype.UUID        `json:"user_id"`
+	Action                  string             `json:"action"`
+	Reason                  pgtype.Text        `json:"reason"`
+	FreeText                pgtype.Text        `json:"free_text"`
+	IdempotencyKey          string             `json:"idempotency_key"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	RecommendationSnapshot  []byte             `json:"recommendation_snapshot"`
+	PreviousRankingVersion  int64              `json:"previous_ranking_version"`
+	ResultingRankingVersion pgtype.Int8        `json:"resulting_ranking_version"`
+	RebuildJobID            pgtype.UUID        `json:"rebuild_job_id"`
 }
 
 type Game struct {

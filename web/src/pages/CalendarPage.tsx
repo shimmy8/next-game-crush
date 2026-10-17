@@ -1,11 +1,11 @@
 import { useMemo, useState } from 'react'
-import type { CalendarResponse, Recommendation } from '../api/types'
+import type { CalendarResponse, RankingDiff, Recommendation } from '../api/types'
 import ReleaseBuckets from '../components/ReleaseBuckets'
 import ReleaseCalendar from '../components/ReleaseCalendar'
 import RecommendationCard from '../components/RecommendationCard'
 import { bucketRelease } from '../calendar/dateBuckets'
 
-type CalendarPageProps = { calendar: CalendarResponse; month?: Date }
+type CalendarPageProps = { calendar: CalendarResponse; month?: Date; rankingDiff?: RankingDiff | null }
 
 function filterCalendar(calendar: CalendarResponse, wishlistOnly: boolean, minimum: number, precision: string): CalendarResponse {
   const matches = (item: Recommendation) => (!wishlistOnly || (item.factors.wishlist ?? 0) > 0) && item.score >= minimum && (precision === 'all' || item.release.precision === precision)
@@ -15,7 +15,7 @@ function filterCalendar(calendar: CalendarResponse, wishlistOnly: boolean, minim
   }
 }
 
-export default function CalendarPage({ calendar, month = new Date() }: CalendarPageProps) {
+export default function CalendarPage({ calendar, month = new Date(), rankingDiff }: CalendarPageProps) {
   const [view, setView] = useState<'month' | 'list'>('month')
   const [visibleMonth, setVisibleMonth] = useState(() => new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth(), 1)))
   const [wishlistOnly, setWishlistOnly] = useState(false)
@@ -33,6 +33,7 @@ export default function CalendarPage({ calendar, month = new Date() }: CalendarP
 
   return (
     <section className="calendar-section" aria-labelledby="calendar-title">
+      {rankingDiff && <div className="ranking-diff" role="status"><strong>Рекомендации обновлены · версия {rankingDiff.currentVersion}</strong><span>Добавлено: {rankingDiff.added.length} · Убрано: {rankingDiff.removed.length} · Переставлено: {rankingDiff.reordered.length}</span></div>}
       <header className="section-heading calendar-heading">
         <div><div className="eyebrow">Календарь релизов</div><div className="calendar-title-row"><h2 id="calendar-title">{title}</h2><div className="month-nav"><button type="button" aria-label="Предыдущий месяц" onClick={() => moveMonth(-1)}>←</button><button type="button" aria-label="Следующий месяц" onClick={() => moveMonth(1)}>→</button></div></div></div>
         <div className="view-switch" role="group" aria-label="Вид календаря">

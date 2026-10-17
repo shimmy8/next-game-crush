@@ -33,8 +33,12 @@ func (r *SQLRepository) LoadSignals(ctx context.Context, userID uuid.UUID) ([]Si
 		SELECT game_id FROM wishlist_entries WHERE user_id=$1 UNION
 		SELECT rec.game_id FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id WHERE f.user_id=$1
 	), feedback AS (
-		SELECT rec.game_id,count(*) FILTER (WHERE f.action='like')::int likes,count(*) FILTER (WHERE f.action IN ('dislike','exclude'))::int dislikes
-		FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id WHERE f.user_id=$1 GROUP BY rec.game_id
+		SELECT rec.game_id,
+			(count(*) FILTER (WHERE f.action='like') + count(*) FILTER (WHERE fc.actionable AND fc.polarity='positive'))::int likes,
+			(count(*) FILTER (WHERE f.action IN ('dislike','exclude')) + count(*) FILTER (WHERE fc.actionable AND fc.polarity='negative'))::int dislikes
+		FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id
+		LEFT JOIN feedback_classifications fc ON fc.feedback_id=f.id
+		WHERE f.user_id=$1 GROUP BY rec.game_id
 	)
 	SELECT rel.game_id,e.embedding,COALESCE(ug.playtime_minutes,0),COALESCE(ug.recently_played_minutes,0),
 		CASE WHEN COALESCE(a.total,0)>0 THEN a.achieved::float8/a.total ELSE 0 END,

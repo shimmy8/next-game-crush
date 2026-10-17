@@ -17,6 +17,7 @@ type Dependencies struct {
 	Sync            SyncService
 	Profile         ProfileReadService
 	Recommendations RecommendationReadService
+	Feedback        FeedbackService
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -38,6 +39,11 @@ func NewRouter(deps Dependencies) http.Handler {
 		if deps.Recommendations != nil {
 			router.With(deps.Auth.Middleware).Get("/api/calendar", getCalendar(deps.Recommendations))
 			router.With(deps.Auth.Middleware).Get("/api/recommendations/{id}", getRecommendation(deps.Recommendations))
+		}
+		if deps.Feedback != nil {
+			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/recommendations/{id}/feedback", recordFeedback(deps.Feedback, false))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/recommendations/{id}/reminder", recordFeedback(deps.Feedback, true))
+			router.With(deps.Auth.Middleware).Get("/api/rankings/{version}/diff", rankingDiff(deps.Feedback))
 		}
 	}
 	if deps.Frontend != nil {

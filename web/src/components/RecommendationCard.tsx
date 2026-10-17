@@ -1,5 +1,7 @@
 import type { Recommendation } from '../api/types'
+import type { RankingDiff } from '../api/types'
 import { bucketRelease } from '../calendar/dateBuckets'
+import FeedbackForm from './FeedbackForm'
 
 const precisionLabels: Record<string, string> = { month: 'В течение месяца', quarter: 'В течение квартала', year: 'В течение года', coming_soon: 'Скоро', unknown: 'Дата уточняется' }
 
@@ -12,7 +14,7 @@ export function releaseLabel(release: Recommendation['release']) {
   return (release.precision !== 'day' ? release.raw : undefined) || precisionLabels[release.precision] || 'Дата уточняется'
 }
 
-export default function RecommendationCard({ item, featured = false, compact = false }: { item: Recommendation; featured?: boolean; compact?: boolean }) {
+export default function RecommendationCard({ item, featured = false, compact = false, csrfToken, onRankingUpdated }: { item: Recommendation; featured?: boolean; compact?: boolean; csrfToken?: string; onRankingUpdated?: (diff: RankingDiff) => void }) {
   const wishlist = (item.factors.wishlist ?? 0) > 0
   return (
     <article className={`recommendation-card${featured ? ' recommendation-card--featured' : ''}${compact ? ' recommendation-card--compact' : ''}`}>
@@ -35,11 +37,7 @@ export default function RecommendationCard({ item, featured = false, compact = f
           </details>
         )}
         {!compact && <p className="source-note">Источник объяснения: {item.generatedExplanation ? 'AI, только по сохранённым фактам' : 'детерминированные факторы'}</p>}
-        {!compact && <div className="reaction-row" aria-label="Действия с рекомендацией">
-          <button type="button" disabled title="Будет доступно после подключения обратной связи">Нравится</button>
-          <button type="button" disabled title="Будет доступно после подключения обратной связи">Не моё</button>
-          <button type="button" disabled title="Будет доступно после подключения напоминаний">Напомнить</button>
-        </div>}
+        {!compact && csrfToken && <FeedbackForm recommendationId={item.id} rankingVersion={item.rankingVersion} csrfToken={csrfToken} onRankingUpdated={onRankingUpdated} />}
       </div>
     </article>
   )

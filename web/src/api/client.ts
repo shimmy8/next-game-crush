@@ -59,3 +59,14 @@ export function startSync(csrfToken: string, signal?: AbortSignal) {
 export function getSyncStatus(jobId: string, signal?: AbortSignal) {
   return requestJSON<import('./types').SyncStatus>(`/api/sync/${encodeURIComponent(jobId)}`, { signal })
 }
+
+export function submitFeedback(recommendationId: string, csrfToken: string, input: import('./types').FeedbackInput, signal?: AbortSignal) {
+  const endpoint = input.action === 'remind_me' ? 'reminder' : 'feedback'
+  return requestJSON<import('./types').FeedbackAccepted>(`/api/recommendations/${encodeURIComponent(recommendationId)}/${endpoint}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify(input), signal,
+  })
+}
+
+export function getRankingDiff(version: number, jobId: string, signal?: AbortSignal) {
+  return requestJSON<import('./types').RankingDiff>(`/api/rankings/${version}/diff?jobId=${encodeURIComponent(jobId)}`, { signal })
+}

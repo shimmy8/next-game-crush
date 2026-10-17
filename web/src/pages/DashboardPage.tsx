@@ -1,7 +1,7 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import type { CurrentUser } from '../api/client'
 import { useDashboardData, useSync } from '../api/hooks'
-import type { CalendarResponse, DashboardLoadState, Recommendation } from '../api/types'
+import type { CalendarResponse, DashboardLoadState, RankingDiff, Recommendation } from '../api/types'
 import PreferenceProfile from '../components/PreferenceProfile'
 import RecommendationCard from '../components/RecommendationCard'
 import SyncProgress from '../components/SyncProgress'
@@ -28,9 +28,11 @@ function UpcomingWindows({ calendar }: { calendar: CalendarResponse }) {
 }
 
 export default function DashboardPage({ user, signingOut, onLogout, initialState }: DashboardPageProps) {
+  const [rankingDiff, setRankingDiff] = useState<RankingDiff | null>(null)
   const { state, reload, emptyData } = useDashboardData(initialState)
   const refresh = useCallback(() => { void reload() }, [reload])
   const { sync, starting, requestError, run } = useSync(user.csrfToken, refresh)
+  const rankingUpdated = useCallback((diff: RankingDiff) => { setRankingDiff(diff); void reload() }, [reload])
   const hasData = state.status === 'ready' || state.status === 'stale' || state.status === 'unknown' || state.status === 'empty'
   const data = hasData ? state.data : emptyData
   const recommendations = useMemo(() => flatten(data.calendar), [data.calendar])
@@ -69,14 +71,14 @@ export default function DashboardPage({ user, signingOut, onLogout, initialState
         <div className="dashboard-main">
           <section aria-labelledby="best-match-title">
             <div className="section-heading"><div><div className="eyebrow">Лучшее совпадение</div><h2 id="best-match-title">Ваш следующий фаворит</h2></div></div>
-            {best ? <RecommendationCard item={best} featured /> : <div className="empty-card"><strong>Пока рекомендаций нет</strong><p>Запустите синхронизацию — мы сопоставим любимые механики, темы и активность с будущими релизами.</p><button type="button" onClick={() => { void run() }} disabled={starting}>Собрать профиль</button></div>}
+            {best ? <RecommendationCard item={best} featured csrfToken={user.csrfToken} onRankingUpdated={rankingUpdated} /> : <div className="empty-card"><strong>Пока рекомендаций нет</strong><p>Запустите синхронизацию — мы сопоставим любимые механики, темы и активность с будущими релизами.</p><button type="button" onClick={() => { void run() }} disabled={starting}>Собрать профиль</button></div>}
           </section>
-          {recommendations.length > 1 && <section className="recommendations-section" aria-labelledby="more-title"><div className="section-heading"><div><div className="eyebrow">Ещё кандидаты</div><h2 id="more-title">Стоит присмотреться</h2></div><span>{recommendations.length - 1} игр</span></div><div className="recommendation-grid">{recommendations.slice(1, 7).map((item: Recommendation) => <RecommendationCard item={item} key={item.id} />)}</div></section>}
+          {recommendations.length > 1 && <section className="recommendations-section" aria-labelledby="more-title"><div className="section-heading"><div><div className="eyebrow">Ещё кандидаты</div><h2 id="more-title">Стоит присмотреться</h2></div><span>{recommendations.length - 1} игр</span></div><div className="recommendation-grid">{recommendations.slice(1, 7).map((item: Recommendation) => <RecommendationCard item={item} key={item.id} csrfToken={user.csrfToken} onRankingUpdated={rankingUpdated} />)}</div></section>}
         </div>
         <div className="right-rail"><PreferenceProfile profile={data.profile} /><UpcomingWindows calendar={data.calendar} /></div>
       </div>}
 
-      {hasData && <CalendarPage calendar={data.calendar} />}
+      {hasData && <CalendarPage calendar={data.calendar} rankingDiff={rankingDiff} />}
     </main>
     <footer><span>Next Game Crush</span><span>Только ваш Steam · Локально и прозрачно</span></footer>
   </div>

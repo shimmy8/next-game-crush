@@ -9,8 +9,8 @@
 * { box-sizing: border-box; }
 html { color-scheme: dark; scroll-behavior: smooth; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: #0b0e16; }
-button, select, input { font: inherit; }
-button, a, summary, select, input { outline-offset: 4px; }
+button, select, input, textarea { font: inherit; }
+button, a, summary, select, input, textarea { outline-offset: 4px; }
 :focus-visible { outline: 2px solid #cabdff; }
 button { color: inherit; }
 .skip-link { position: fixed; left: 16px; top: -60px; z-index: 50; padding: 10px 14px; background: var(--ink); color: #0b0e16; border-radius: 8px; }
@@ -66,6 +66,16 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .source-note { color: var(--quiet); font-size: .72rem; }
 .reaction-row { display: flex; gap: 7px; margin-top: 18px; }
 .reaction-row button { border: 1px solid #3a4050; background: transparent; border-radius: 8px; padding: 8px 10px; font-size: .76rem; }
+.reaction-row button[aria-pressed="true"] { border-color: var(--violet); background: var(--violet-soft); }
+.feedback-fields { display: grid; gap: 10px; margin-top: 12px; }
+.feedback-fields label { display: grid; gap: 5px; color: var(--muted); font-size: .75rem; }
+.feedback-fields select, .feedback-fields textarea { width: 100%; color: var(--ink); background: #0f131d; border: 1px solid #3a4050; border-radius: 8px; padding: 8px; }
+.feedback-fields textarea { min-height: 72px; resize: vertical; }
+.feedback-fields > span { color: var(--quiet); font-size: .68rem; text-align: right; }
+.feedback-submit { justify-self: start; border: 1px solid var(--violet); background: var(--violet-soft); border-radius: 8px; padding: 8px 11px; cursor: pointer; }
+.feedback-error { color: #ffafa3; font-size: .75rem; }
+.feedback-status { display: grid; gap: 5px; margin-top: 16px; padding: 11px; border: 1px solid #35594e; border-radius: 8px; background: #12221e; color: var(--muted); font-size: .75rem; }
+.feedback-status strong { color: var(--green); }
 .recommendations-section { margin-top: 58px; }
 .recommendation-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .recommendation-grid .recommendation-card { grid-template-columns: 1fr; }
@@ -101,6 +111,8 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .sync-progress progress { width: 100%; accent-color: var(--violet); margin-top: 10px; }
 .sync-progress ul { padding: 0; margin: 10px 0 0; list-style: none; color: var(--muted); font-size: .75rem; }
 .calendar-section { margin-top: 88px; padding-top: 50px; border-top: 1px solid var(--line); }
+.ranking-diff { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 22px; padding: 14px 16px; border: 1px solid #35594e; border-radius: 10px; background: #12221e; color: var(--muted); font-size: .78rem; }
+.ranking-diff strong { color: var(--green); }
 .calendar-heading { align-items: center; }
 .calendar-title-row { display: flex; align-items: center; gap: 12px; }
 .month-nav { display: flex; gap: 4px; }

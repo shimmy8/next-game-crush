@@ -50,6 +50,19 @@ export type CalendarResponse = {
   tba: Recommendation[]
 }
 
+export type FeedbackAction = 'like' | 'dislike' | 'remind_me'
+export type FeedbackInput = { action: FeedbackAction; reason?: string; freeText?: string; idempotencyKey: string }
+export type FeedbackAccepted = { eventId: string; rebuildJobId: string; previousRankingVersion: number }
+export type RankingDiff = {
+  rebuildStatus: string
+  previousVersion: number
+  currentVersion: number
+  added: string[]
+  removed: string[]
+  reordered: string[]
+	classification?: { taxonomy: string; polarity: string; confidence: number; actionable: boolean }
+}
+
 export type PreferenceProfileData = {
   id: string
   version: number
