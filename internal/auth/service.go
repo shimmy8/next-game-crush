@@ -29,6 +29,7 @@ type Config struct {
 	AllowedSteamID string
 	SessionSecret  string
 	ProviderURL    string
+	FixtureAuth    bool
 }
 
 type LoginState struct {
@@ -63,6 +64,7 @@ type Service struct {
 	repository     Repository
 	provider       Provider
 	now            func() time.Time
+	fixtureAuth    bool
 }
 
 type rotationContextKey struct{}
@@ -92,7 +94,7 @@ func New(cfg Config, repository Repository, provider Provider) (*Service, error)
 		provider = NewHTTPProvider(nil, cfg.ProviderURL)
 	}
 	baseURL.Path = ""
-	return &Service{baseURL: baseURL, allowedSteamID: cfg.AllowedSteamID, secret: []byte(cfg.SessionSecret), providerURL: cfg.ProviderURL, repository: repository, provider: provider, now: time.Now}, nil
+	return &Service{baseURL: baseURL, allowedSteamID: cfg.AllowedSteamID, secret: []byte(cfg.SessionSecret), providerURL: cfg.ProviderURL, repository: repository, provider: provider, now: time.Now, fixtureAuth: cfg.FixtureAuth}, nil
 }
 
 func (s *Service) Begin(returnPath string) (string, error) {
@@ -214,12 +216,40 @@ func (s *Service) Logout(ctx context.Context, id uuid.UUID) error {
 	return s.repository.DeleteSession(ctx, id)
 }
 func (s *Service) BeginFixture(string) (string, error) {
-	return "", errors.New("fixture authentication is not available")
+	if !s.fixtureAuth {
+		return "", errors.New("fixture authentication is not available")
+	}
+	return "/auth/fixture", nil
 }
-func (s *Service) ProviderURL() string { return s.providerURL }
-func (s *Service) Origin() string      { return strings.TrimRight(s.baseURL.String(), "/") }
-func (s *Service) SecureCookies() bool { return s.baseURL.Scheme == "https" }
-func (s *Service) realm() string       { return strings.TrimRight(s.baseURL.String(), "/") + "/" }
+
+type fixtureRepository interface {
+	CreateFixtureSession(context.Context, string, Session) (Session, error)
+}
+
+func (s *Service) CreateFixtureSession(ctx context.Context) (Session, error) {
+	if !s.fixtureAuth {
+		return Session{}, errors.New("fixture authentication is not available")
+	}
+	repo, ok := s.repository.(fixtureRepository)
+	if !ok {
+		return Session{}, errors.New("fixture authentication is not supported")
+	}
+	csrf, err := randomToken(32)
+	if err != nil {
+		return Session{}, err
+	}
+	token, err := randomToken(32)
+	if err != nil {
+		return Session{}, err
+	}
+	session := Session{ID: s.sessionID(token), Token: token, SteamID: s.allowedSteamID, CSRFToken: csrf, ExpiresAt: s.now().Add(2 * time.Hour), ReturnPath: "/"}
+	return repo.CreateFixtureSession(ctx, s.allowedSteamID, session)
+}
+func (s *Service) FixtureEnabled() bool { return s.fixtureAuth }
+func (s *Service) ProviderURL() string  { return s.providerURL }
+func (s *Service) Origin() string       { return strings.TrimRight(s.baseURL.String(), "/") }
+func (s *Service) SecureCookies() bool  { return s.baseURL.Scheme == "https" }
+func (s *Service) realm() string        { return strings.TrimRight(s.baseURL.String(), "/") + "/" }
 func (s *Service) callbackURL(state string) string {
 	return strings.TrimRight(s.baseURL.String(), "/") + "/auth/steam/callback?state=" + url.QueryEscape(state)
 }

@@ -40,7 +40,7 @@ export default function App() {
     }
   }
 
-  if (user) return <DashboardPage user={user} signingOut={signingOut} onLogout={() => { void signOut() }} />
+  if (user) return <DashboardPage user={user} signingOut={signingOut} onLogout={() => { void signOut() }} onDataDeleted={() => setUser(null)} />
 
   return <main className="login-shell"><div className="login-shell__inner"><LoginPage user={null} signingOut={signingOut} onLogout={() => { void signOut() }} /><p role="status" className="api-health">API: {health === 'checking' ? 'проверяем…' : health === 'ok' ? 'на связи' : 'недоступен'}</p></div></main>
 }

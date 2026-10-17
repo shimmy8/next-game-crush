@@ -28,6 +28,7 @@ type Spec struct {
 	Required       bool
 	Optional       bool
 	Stage          string
+	UserID         uuid.UUID
 }
 
 type Lease struct {
@@ -105,6 +106,7 @@ func (q *Queue) Enqueue(ctx context.Context, spec Spec) (uuid.UUID, error) {
 		ID: uuidToPG(uuid.New()), Kind: spec.Kind, IdempotencyKey: spec.IdempotencyKey,
 		Payload: spec.Payload, MaxAttempts: int32(spec.MaxAttempts), AvailableAt: availableAt,
 		ParentJobID: nullableUUID(spec.ParentJobID), Required: spec.Required, Stage: spec.Stage,
+		UserID: nullableUUID(spec.UserID),
 	})
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("enqueue job: %w", err)
@@ -140,7 +142,7 @@ func (q *Queue) AwaitChildren(ctx context.Context, lease Lease, specs []Spec) (r
 		if spec.MaxAttempts == 0 {
 			spec.MaxAttempts = 3
 		}
-		if _, err := queries.EnqueueJob(ctx, dbgen.EnqueueJobParams{ID: uuidToPG(uuid.New()), Kind: spec.Kind, IdempotencyKey: spec.IdempotencyKey, Payload: spec.Payload, MaxAttempts: int32(spec.MaxAttempts), AvailableAt: pgtype.Timestamptz{}, ParentJobID: uuidToPG(lease.ID), Required: spec.Required, Stage: spec.Stage}); err != nil {
+		if _, err := queries.EnqueueJob(ctx, dbgen.EnqueueJobParams{ID: uuidToPG(uuid.New()), Kind: spec.Kind, IdempotencyKey: spec.IdempotencyKey, Payload: spec.Payload, MaxAttempts: int32(spec.MaxAttempts), AvailableAt: pgtype.Timestamptz{}, ParentJobID: uuidToPG(lease.ID), Required: spec.Required, Stage: spec.Stage, UserID: nullableUUID(spec.UserID)}); err != nil {
 			return false, fmt.Errorf("enqueue child stage: %w", err)
 		}
 	}

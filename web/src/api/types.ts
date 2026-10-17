@@ -100,3 +100,7 @@ export type DashboardLoadState =
   | { status: 'unknown'; data: DashboardData; message: string }
   | { status: 'empty'; data: DashboardData }
   | { status: 'error'; message: string }
+
+export type ComponentHealth = { status: string; checkedAt: string; freshAt?: string; message?: string }
+export type JobDiagnostic = { id: string; kind: string; stage: string; status: string; attempts: number; createdAt: string; updatedAt: string; error?: string }
+export type DiagnosticsData = { status: string; components: Record<string, ComponentHealth>; jobs: JobDiagnostic[] }

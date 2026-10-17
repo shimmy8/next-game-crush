@@ -7,11 +7,13 @@ import RecommendationCard from '../components/RecommendationCard'
 import SyncProgress from '../components/SyncProgress'
 import TestDigestButton from '../components/TestDigestButton'
 import CalendarPage from './CalendarPage'
+import DiagnosticsPage from './DiagnosticsPage'
 
 type DashboardPageProps = {
   user: CurrentUser
   signingOut: boolean
   onLogout: () => void
+  onDataDeleted?: () => void
   initialState?: DashboardLoadState
 }
 
@@ -28,7 +30,7 @@ function UpcomingWindows({ calendar }: { calendar: CalendarResponse }) {
   return <aside className="windows-card"><div className="eyebrow">Без точного дня</div><h2>На горизонте</h2><ul>{windows.map(([key, label, count]) => <li key={key}><span>{label}</span><strong>{count}</strong></li>)}</ul><p>Мы не ставим игры в выдуманные даты.</p></aside>
 }
 
-export default function DashboardPage({ user, signingOut, onLogout, initialState }: DashboardPageProps) {
+export default function DashboardPage({ user, signingOut, onLogout, onDataDeleted = onLogout, initialState }: DashboardPageProps) {
   const [rankingDiff, setRankingDiff] = useState<RankingDiff | null>(null)
   const { state, reload, emptyData } = useDashboardData(initialState)
   const refresh = useCallback(() => { void reload() }, [reload])
@@ -76,7 +78,7 @@ export default function DashboardPage({ user, signingOut, onLogout, initialState
           </section>
           {recommendations.length > 1 && <section className="recommendations-section" aria-labelledby="more-title"><div className="section-heading"><div><div className="eyebrow">Ещё кандидаты</div><h2 id="more-title">Стоит присмотреться</h2></div><span>{recommendations.length - 1} игр</span></div><div className="recommendation-grid">{recommendations.slice(1, 7).map((item: Recommendation) => <RecommendationCard item={item} key={item.id} csrfToken={user.csrfToken} onRankingUpdated={rankingUpdated} />)}</div></section>}
         </div>
-        <div className="right-rail"><PreferenceProfile profile={data.profile} /><UpcomingWindows calendar={data.calendar} /><TestDigestButton csrfToken={user.csrfToken} /></div>
+        <div className="right-rail"><PreferenceProfile profile={data.profile} /><UpcomingWindows calendar={data.calendar} /><TestDigestButton csrfToken={user.csrfToken} /><DiagnosticsPage csrfToken={user.csrfToken} onDeleted={onDataDeleted} /></div>
       </div>}
 
       {hasData && <CalendarPage calendar={data.calendar} rankingDiff={rankingDiff} />}

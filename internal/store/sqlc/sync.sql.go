@@ -12,7 +12,7 @@ import (
 )
 
 const findActiveUserSync = `-- name: FindActiveUserSync :one
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result FROM sync_jobs
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id FROM sync_jobs
 WHERE kind = 'steam.sync'
   AND payload->>'user_id' = $1::text
   AND status IN ('queued','running','waiting','retryable')
@@ -42,12 +42,13 @@ func (q *Queries) FindActiveUserSync(ctx context.Context, userID string) (SyncJo
 		&i.Required,
 		&i.Stage,
 		&i.Result,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const getSyncJob = `-- name: GetSyncJob :one
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result FROM sync_jobs WHERE id = $1
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id FROM sync_jobs WHERE id = $1
 `
 
 func (q *Queries) GetSyncJob(ctx context.Context, id pgtype.UUID) (SyncJob, error) {
@@ -72,12 +73,13 @@ func (q *Queries) GetSyncJob(ctx context.Context, id pgtype.UUID) (SyncJob, erro
 		&i.Required,
 		&i.Stage,
 		&i.Result,
+		&i.UserID,
 	)
 	return i, err
 }
 
 const listRecentSyncJobs = `-- name: ListRecentSyncJobs :many
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result FROM sync_jobs ORDER BY created_at DESC LIMIT $1
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id FROM sync_jobs ORDER BY created_at DESC LIMIT $1
 `
 
 func (q *Queries) ListRecentSyncJobs(ctx context.Context, limit int32) ([]SyncJob, error) {
@@ -108,6 +110,7 @@ func (q *Queries) ListRecentSyncJobs(ctx context.Context, limit int32) ([]SyncJo
 			&i.Required,
 			&i.Stage,
 			&i.Result,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}

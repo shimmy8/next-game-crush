@@ -28,9 +28,9 @@ WITH candidate AS (
         lease_until = now() + $3::interval,
         updated_at = now()
     FROM candidate c WHERE j.id = c.id
-    RETURNING j.id, j.kind, j.idempotency_key, j.payload, j.status, j.attempts, j.max_attempts, j.available_at, j.worker_id, j.fencing_token, j.lease_until, j.last_error, j.created_at, j.updated_at, j.parent_job_id, j.required, j.stage, j.result
+    RETURNING j.id, j.kind, j.idempotency_key, j.payload, j.status, j.attempts, j.max_attempts, j.available_at, j.worker_id, j.fencing_token, j.lease_until, j.last_error, j.created_at, j.updated_at, j.parent_job_id, j.required, j.stage, j.result, j.user_id
 )
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result FROM claimed
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id FROM claimed
 `
 
 type ClaimJobParams struct {
@@ -58,6 +58,7 @@ type ClaimJobRow struct {
 	Required       bool               `json:"required"`
 	Stage          string             `json:"stage"`
 	Result         []byte             `json:"result"`
+	UserID         pgtype.UUID        `json:"user_id"`
 }
 
 func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (ClaimJobRow, error) {
@@ -82,6 +83,7 @@ func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (ClaimJobRow
 		&i.Required,
 		&i.Stage,
 		&i.Result,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -118,8 +120,8 @@ func (q *Queries) DeadLetterExhaustedLeases(ctx context.Context) error {
 }
 
 const enqueueJob = `-- name: EnqueueJob :one
-INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage)
-VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8, $9)
+INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id)
+VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8, $9, $10)
 ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
 RETURNING id
 `
@@ -134,6 +136,7 @@ type EnqueueJobParams struct {
 	ParentJobID    pgtype.UUID        `json:"parent_job_id"`
 	Required       bool               `json:"required"`
 	Stage          string             `json:"stage"`
+	UserID         pgtype.UUID        `json:"user_id"`
 }
 
 func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (pgtype.UUID, error) {
@@ -147,6 +150,7 @@ func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (pgtype.
 		arg.ParentJobID,
 		arg.Required,
 		arg.Stage,
+		arg.UserID,
 	)
 	var id pgtype.UUID
 	err := row.Scan(&id)
@@ -250,7 +254,7 @@ func (q *Queries) FinishSuccessfulAttempt(ctx context.Context, arg FinishSuccess
 }
 
 const getJobChildren = `-- name: GetJobChildren :many
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id
 `
 
 func (q *Queries) GetJobChildren(ctx context.Context, parentJobID pgtype.UUID) ([]SyncJob, error) {
@@ -281,6 +285,7 @@ func (q *Queries) GetJobChildren(ctx context.Context, parentJobID pgtype.UUID) (
 			&i.Required,
 			&i.Stage,
 			&i.Result,
+			&i.UserID,
 		); err != nil {
 			return nil, err
 		}

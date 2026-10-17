@@ -33,6 +33,11 @@ type CatalogFetchState struct {
 	Error                 pgtype.Text        `json:"error"`
 }
 
+type DeletedUserTombstone struct {
+	UserID    pgtype.UUID        `json:"user_id"`
+	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
+}
+
 type EmailActionNonce struct {
 	Nonce            pgtype.UUID        `json:"nonce"`
 	DeliveryID       pgtype.UUID        `json:"delivery_id"`
@@ -269,6 +274,7 @@ type SyncJob struct {
 	Required       bool               `json:"required"`
 	Stage          string             `json:"stage"`
 	Result         []byte             `json:"result"`
+	UserID         pgtype.UUID        `json:"user_id"`
 }
 
 type User struct {

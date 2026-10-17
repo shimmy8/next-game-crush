@@ -96,3 +96,19 @@ func logout(service *auth.Service) http.HandlerFunc {
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
+
+func fixtureLogin(service *auth.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !service.FixtureEnabled() {
+			http.NotFound(w, r)
+			return
+		}
+		session, err := service.CreateFixtureSession(r.Context())
+		if err != nil {
+			http.Error(w, "fixture authentication unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		service.SetSessionCookie(w, session)
+		writeJSON(w, map[string]any{"authenticated": true, "csrfToken": session.CSRFToken})
+	}
+}

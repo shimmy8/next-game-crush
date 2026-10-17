@@ -107,3 +107,32 @@ func (r *SQLRepository) DeleteSession(ctx context.Context, id uuid.UUID) error {
 	_, err := r.store.Pool.Exec(ctx, `DELETE FROM sessions WHERE id=$1`, id)
 	return err
 }
+
+func (r *SQLRepository) CreateFixtureSession(ctx context.Context, steamID string, session Session) (Session, error) {
+	tx, err := r.store.Pool.Begin(ctx)
+	if err != nil {
+		return Session{}, err
+	}
+	defer tx.Rollback(ctx)
+	var userID uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT user_id FROM steam_accounts WHERE steam_id=$1`, steamID).Scan(&userID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		userID = uuid.New()
+		if _, err = tx.Exec(ctx, `INSERT INTO users(id)VALUES($1)`, userID); err != nil {
+			return Session{}, err
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO steam_accounts(user_id,steam_id,source,availability)VALUES($1,$2,'fixture','unknown')`, userID, steamID); err != nil {
+			return Session{}, err
+		}
+	} else if err != nil {
+		return Session{}, err
+	}
+	session.UserID = userID
+	if _, err = tx.Exec(ctx, `INSERT INTO sessions(id,user_id,csrf_token,expires_at)VALUES($1,$2,$3,$4)`, session.ID, userID, session.CSRFToken, session.ExpiresAt); err != nil {
+		return Session{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return Session{}, err
+	}
+	return session, nil
+}

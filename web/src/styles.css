@@ -6,6 +6,13 @@
   --ink: #f4f3f8; --muted: #aaaabd; --quiet: #77798f; --panel: #131722; --line: #2a3040;
   --violet: #a890ff; --violet-soft: #292340; --coral: #ff826f; --green: #73d0ad;
 }
+
+.diagnostics-card { background: #11151f; border: 1px solid var(--line); border-radius: 1.25rem; padding: 1.25rem; }
+.diagnostics-list { display: grid; gap: .65rem; list-style: none; margin: 1rem 0; padding: 0; }
+.diagnostics-list li { align-items: baseline; display: grid; gap: .25rem .75rem; grid-template-columns: 1fr auto; }
+.diagnostics-list time { color: var(--muted, #746b64); font-size: .8rem; grid-column: 1 / -1; }
+.danger-button { background: #7e2d2d; border: 0; border-radius: .75rem; color: white; cursor: pointer; padding: .7rem .9rem; }
+.delete-confirm { display: grid; gap: .75rem; }
 * { box-sizing: border-box; }
 html { color-scheme: dark; scroll-behavior: smooth; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: #0b0e16; }

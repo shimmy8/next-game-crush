@@ -25,6 +25,12 @@ type Config struct {
 	SMTPURL              string
 	EmailActionSecret    string
 	SessionSecret        string
+	TestHarness          bool
+	FixtureAuth          bool
+	SteamWebAPIBaseURL   string
+	SteamStoreBaseURL    string
+	OpenAIBaseURL        string
+	HTTPAddr             string
 }
 
 func Load() (Config, error) {
@@ -39,6 +45,12 @@ func Load() (Config, error) {
 		SMTPURL:              envOrDefault("SMTP_URL", "smtp://localhost:1025"),
 		EmailActionSecret:    os.Getenv("EMAIL_ACTION_SECRET"),
 		SessionSecret:        os.Getenv("SESSION_SECRET"),
+		TestHarness:          os.Getenv("TEST_HARNESS_MODE") == "1",
+		FixtureAuth:          os.Getenv("FIXTURE_AUTH_ENABLED") == "1",
+		SteamWebAPIBaseURL:   strings.TrimSpace(os.Getenv("STEAM_WEB_API_BASE_URL")),
+		SteamStoreBaseURL:    strings.TrimSpace(os.Getenv("STEAM_STORE_BASE_URL")),
+		OpenAIBaseURL:        strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
+		HTTPAddr:             envOrDefault("HTTP_ADDR", ":8080"),
 	}
 	cfg.OpenAI = OpenAICapability{Enabled: cfg.OpenAIAPIKey != ""}
 	var problems []string
@@ -74,6 +86,12 @@ func Load() (Config, error) {
 	}
 	if len(problems) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %s", strings.Join(problems, "; "))
+	}
+	if cfg.FixtureAuth && !cfg.TestHarness {
+		return Config{}, fmt.Errorf("invalid configuration: FIXTURE_AUTH_ENABLED requires TEST_HARNESS_MODE=1")
+	}
+	if !cfg.TestHarness && (cfg.SteamWebAPIBaseURL != "" || cfg.SteamStoreBaseURL != "" || cfg.OpenAIBaseURL != "") {
+		return Config{}, fmt.Errorf("invalid configuration: test upstream URL overrides require TEST_HARNESS_MODE=1")
 	}
 	return cfg, nil
 }

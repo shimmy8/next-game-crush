@@ -1,6 +1,6 @@
 -- name: EnqueueJob :one
-INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage)
-VALUES ($1, $2, $3, $4, $5, COALESCE(sqlc.narg(available_at)::timestamptz, now()), sqlc.narg(parent_job_id), sqlc.arg(required), sqlc.arg(stage))
+INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id)
+VALUES ($1, $2, $3, $4, $5, COALESCE(sqlc.narg(available_at)::timestamptz, now()), sqlc.narg(parent_job_id), sqlc.arg(required), sqlc.arg(stage), sqlc.narg(user_id))
 ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
 RETURNING id;
 

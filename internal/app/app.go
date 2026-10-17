@@ -49,7 +49,7 @@ func New(cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	queue := jobs.NewQueue(db)
-	steamClient, err := steam.NewClient(steam.HTTPConfig{APIKey: cfg.SteamWebAPIKey})
+	steamClient, err := steam.NewClient(steam.HTTPConfig{APIKey: cfg.SteamWebAPIKey, WebAPIBaseURL: cfg.SteamWebAPIBaseURL, StoreBaseURL: cfg.SteamStoreBaseURL})
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure Steam client: %w", err)
@@ -77,6 +77,7 @@ func New(cfg config.Config) (*App, error) {
 	openAIClient, err := ai.NewOpenAI(ai.OpenAIConfig{
 		APIKey: cfg.OpenAIAPIKey, Model: cfg.OpenAIModel,
 		EmbeddingModel: cfg.OpenAIEmbeddingModel,
+		BaseURL:        cfg.OpenAIBaseURL,
 		HTTPClient:     &http.Client{Timeout: 30 * time.Second},
 	})
 	if err != nil {
@@ -164,7 +165,7 @@ func New(cfg config.Config) (*App, error) {
 	}
 	syncService.EnableRankingJobs()
 	providerClient := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret}, auth.NewSQLRepository(db), auth.NewHTTPProvider(providerClient, "https://steamcommunity.com/openid/"))
+	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret, FixtureAuth: cfg.FixtureAuth}, auth.NewSQLRepository(db), auth.NewHTTPProvider(providerClient, "https://steamcommunity.com/openid/"))
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure authentication: %w", err)
@@ -175,8 +176,9 @@ func New(cfg config.Config) (*App, error) {
 	deps.Recommendations = recommendationService
 	deps.Feedback = feedbackService
 	deps.Digests = notificationService
+	deps.Data = httpapi.NewSQLDataService(db, cfg.OpenAI.Enabled, strings.TrimSpace(cfg.SMTPURL) != "")
 	return &App{store: db, worker: worker, server: &http.Server{
-		Addr:              ":8080",
+		Addr:              cfg.HTTPAddr,
 		Handler:           httpapi.NewRouter(deps),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,

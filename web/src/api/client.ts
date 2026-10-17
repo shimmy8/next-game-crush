@@ -76,3 +76,16 @@ export function sendTestDigest(csrfToken: string, signal?: AbortSignal) {
     method: 'POST', headers: { 'X-CSRF-Token': csrfToken }, signal,
   })
 }
+
+export async function getDiagnostics(signal?: AbortSignal): Promise<import('./types').DiagnosticsData> {
+  const [health, jobs] = await Promise.all([
+    requestJSON<Omit<import('./types').DiagnosticsData, 'jobs'>>('/api/health', { signal }),
+    requestJSON<import('./types').JobDiagnostic[]>('/api/jobs', { signal }),
+  ])
+  return { ...health, jobs }
+}
+
+export async function deleteImportedData(csrfToken: string): Promise<void> {
+  const response = await fetch('/api/data', { method: 'DELETE', credentials: 'same-origin', headers: { 'X-CSRF-Token': csrfToken } })
+  if (!response.ok) throw new Error('Unable to delete imported data')
+}

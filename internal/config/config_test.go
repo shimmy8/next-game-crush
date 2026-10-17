@@ -84,3 +84,12 @@ func TestLoadEnablesOpenAIWithTrimmedKey(t *testing.T) {
 		t.Error("OpenAIAPIKey must be trimmed")
 	}
 }
+
+func TestFixtureAuthFailsClosedOutsideTestHarness(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv("FIXTURE_AUTH_ENABLED", "1")
+	t.Setenv("TEST_HARNESS_MODE", "")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "TEST_HARNESS_MODE=1") {
+		t.Fatalf("Load() error = %v, want fail-closed fixture-auth validation", err)
+	}
+}

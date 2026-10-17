@@ -92,7 +92,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 				return err
 			}
 			summaryPayload, _ := json.Marshal(map[string]any{"version": 1, "profile_id": built.ID})
-			if _, err := s.queue.Enqueue(ctx, jobs.Spec{Kind: "ai.profile_summary", Stage: "profile_summary", Required: false, IdempotencyKey: lease.IdempotencyKey + ":summary:v1", Payload: summaryPayload, MaxAttempts: 3}); err != nil {
+			if _, err := s.queue.Enqueue(ctx, jobs.Spec{Kind: "ai.profile_summary", Stage: "profile_summary", Required: false, IdempotencyKey: lease.IdempotencyKey + ":summary:v1", Payload: summaryPayload, MaxAttempts: 3, UserID: payload.UserID}); err != nil {
 				return err
 			}
 		}

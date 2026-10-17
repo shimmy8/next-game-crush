@@ -19,13 +19,15 @@ type Dependencies struct {
 	Recommendations RecommendationReadService
 	Feedback        FeedbackService
 	Digests         DigestService
+	Data            DataService
 }
 
 func NewRouter(deps Dependencies) http.Handler {
 	router := chi.NewRouter()
 	router.Use(middleware.Recoverer)
-	router.Get("/api/health", health)
+	router.Get("/api/health", health(deps.Data))
 	if deps.Auth != nil {
+		if deps.Auth.FixtureEnabled() { router.Post("/auth/fixture", fixtureLogin(deps.Auth)) }
 		router.Get("/auth/steam", beginSteamLogin(deps.Auth))
 		router.Get("/auth/steam/callback", completeSteamLogin(deps.Auth))
 		router.With(deps.Auth.Middleware).Get("/api/me", me)
@@ -48,6 +50,10 @@ func NewRouter(deps Dependencies) http.Handler {
 		}
 		if deps.Digests != nil {
 			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/digests/test", sendTestDigest(deps.Digests))
+		}
+		if deps.Data != nil {
+			router.With(deps.Auth.Middleware).Get("/api/jobs", listJobs(deps.Data))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Delete("/api/data", deleteData(deps.Data, deps.Auth))
 		}
 	}
 	if deps.Digests != nil {
