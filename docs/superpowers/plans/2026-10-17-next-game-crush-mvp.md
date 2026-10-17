@@ -6,7 +6,7 @@
 
 **Architecture:** A Go modular monolith serves a React/Vite frontend and REST API, runs PostgreSQL-backed background jobs, and integrates with Steam, OpenAI, and SMTP through isolated adapters. PostgreSQL with `pgvector` is the only persistent service; the ranking engine remains deterministic while OpenAI supplies structured features, embeddings, profile summaries, feedback classification, and grounded explanations.
 
-**Tech Stack:** Go 1.20, `chi`, `pgx`, `sqlc`, `goose`, PostgreSQL + `pgvector`, React, TypeScript, Vite, Tailwind CSS, pnpm, OpenAI Responses and Embeddings APIs, Mailpit, Docker Compose.
+**Tech Stack:** Go 1.27.2, `chi`, `pgx`, `sqlc`, `goose`, PostgreSQL + `pgvector`, React, TypeScript, Vite, Tailwind CSS, pnpm, OpenAI Responses and Embeddings APIs, Mailpit, Docker Compose.
 
 **Spec:** `docs/superpowers/specs/2026-10-17-next-game-crush-mvp-design.md`
 
@@ -23,12 +23,23 @@
 - Accept optional free-text feedback up to 500 characters and treat low-confidence classification as non-actionable.
 - Keep secrets in environment variables and out of Git, PostgreSQL, logs, and model inputs.
 - Preserve the last successful Steam and OpenAI-derived state when an optional external call fails.
-- Run locally with the installed Go 1.20, Node 26, pnpm 11, Docker, and Docker Compose toolchains.
+- Run locally with the installed Go 1.27.2, Node 26, pnpm 11, Docker, and Docker Compose toolchains.
+
+### Compatibility and execution contracts
+
+- Resolve current stable releases of `chi`, `pgx`, `goose`, and `pgvector-go` against Go 1.27.2, then commit the exact resolved versions in `go.mod` and `go.sum`.
+- Run Go commands with `GOWORK=off` because an unrelated parent `go.work` exists outside this repository.
+- Pin the `sqlc` tool version in project tooling so local and CI generation are reproducible.
+- Pin PostgreSQL to `pgvector/pgvector:0.8.7-pg16-bookworm`.
+- Use `APP_BASE_URL=http://localhost:8080` as the canonical origin. Vite is a development-only proxy for `/api`, `/auth`, and `/actions`.
+- `OPENAI_API_KEY` is optional at startup so deterministic ranking remains available; authentication and signing secrets remain required.
+- All stored embeddings are exactly 1536 dimensions. Request that dimension and reject an incompatible model response before persistence.
+- Host-side database tests use `TEST_DATABASE_URL`, a published port, a readiness check, and an isolated disposable test database; they never recreate the application database.
 
 ## Review Focus
 
 - Private or partially private Steam data must become an explicit unavailable/stale state while preserving the last successful snapshot; pin this in Task 4 adapter tests and Task 5 workflow tests.
-- Repeated sync and digest requests must not duplicate rows, jobs, feedback, or email; pin this in Tasks 2, 5, 9, and 10.
+- Repeated sync and digest requests must not duplicate rows, jobs, or feedback; SMTP acceptance followed by process failure must become an explicit ambiguous delivery rather than an automatic resend. Pin this in Tasks 2, 5, 9, and 10.
 - Imprecise and malformed release dates must never be displayed as fabricated exact days; pin this in Task 5 and Task 8.
 - OpenAI refusal, invalid schema, timeout, or missing credentials must preserve deterministic recommendations and a template explanation; pin this in Task 6 and Task 7.
 - Empty vectors, sparse profiles, repeated dislikes, and low-confidence free text must not corrupt or overfit ranking; pin this in Task 7 and Task 9.
@@ -56,6 +67,8 @@
 - Create: `web/src/main.tsx`
 - Create: `web/src/App.tsx`
 - Create: `web/src/styles.css`
+- Create: `web/src/test/setup.ts`
+- Create: `web/vitest.config.ts`
 - Create: `docker-compose.yml`
 - Create: `Dockerfile`
 - Create: `.dockerignore`
@@ -71,32 +84,32 @@
 
 - [ ] **Step 1: Write failing configuration and health tests**
 
-Add tests named `TestLoadRejectsMissingRequiredSecrets`, `TestLoadUsesDocumentedModelDefaults`, and `TestHealthReturnsOK`. Assert that missing required variables produce named validation errors, defaults equal `gpt-6-luna` and `text-embedding-3-small`, and health returns HTTP 200 with JSON status `ok`.
+Add tests named `TestLoadRejectsMissingRequiredSecrets`, `TestLoadAllowsMissingOpenAIKey`, `TestLoadUsesDocumentedModelDefaults`, and `TestHealthReturnsOK`. Assert that missing required authentication/signing variables produce named validation errors, a missing OpenAI key produces a disabled capability without startup failure, defaults equal `gpt-6-luna` and `text-embedding-3-small`, and health returns HTTP 200 with JSON status `ok`.
 
 - [ ] **Step 2: Run the focused tests and verify failure**
 
-Run: `go test ./internal/config ./internal/httpapi`
+Run: `GOWORK=off go test ./internal/config ./internal/httpapi`
 
 Expected: FAIL because the packages and functions do not exist.
 
 - [ ] **Step 3: Implement the minimal Go service and React shell**
 
-Use `chi` for routing. Make the frontend display the product name, API health, and a disabled login action that Task 3 will activate. Configure Vite to proxy `/api` and `/auth` to `http://localhost:8080`. Define `dev`, `build`, `test`, `typecheck`, and `lint` scripts in `web/package.json` from the start.
+Use pinned `chi` for routing. Make the frontend display the product name, API health, and a disabled login action that Task 3 will activate. Configure Vite to proxy `/api`, `/auth`, and `/actions` to the canonical Go origin `http://localhost:8080`. Define `dev`, `build`, `test`, `typecheck`, and `lint` scripts in `web/package.json`; configure Vitest with jsdom and Testing Library while excluding Playwright specs.
 
 - [ ] **Step 4: Add local services and developer commands**
 
-Define PostgreSQL with `pgvector`, Mailpit, and the application in Compose. Add `make dev`, `make test`, `make build`, and `make down`; list required secret variable names with empty values in `.env.example`.
+Define pinned PostgreSQL with `pgvector`, Mailpit, and the application in Compose. Publish a host test port and define `TEST_DATABASE_URL`. Add `make dev`, `make test`, `make build`, and `make down`; list required secret variable names with empty values in `.env.example`. Treat `OPENAI_API_KEY` as optional and expose disabled AI capability through configuration.
 
 - [ ] **Step 5: Verify the foundation**
 
-Run: `go test ./internal/config ./internal/httpapi && pnpm --dir web install && pnpm --dir web run build && docker compose config`
+Run: `GOWORK=off go test ./internal/config ./internal/httpapi && pnpm --dir web install && pnpm --dir web run build && docker compose config`
 
 Expected: tests PASS, frontend build succeeds, and Compose configuration validates.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add go.mod cmd internal/config internal/app internal/httpapi web docker-compose.yml Dockerfile .dockerignore .gitignore .env.example Makefile
+git add go.mod go.sum cmd internal/config internal/app internal/httpapi web docker-compose.yml Dockerfile .dockerignore .gitignore .env.example Makefile
 git commit -m "chore: bootstrap Next Game Crush runtime"
 ```
 
@@ -114,43 +127,48 @@ git commit -m "chore: bootstrap Next Game Crush runtime"
 - Create: `internal/store/store_test.go`
 - Create: `internal/jobs/queue.go`
 - Create: `internal/jobs/queue_test.go`
+- Create: `internal/jobs/worker.go`
+- Create: `internal/jobs/worker_test.go`
+- Modify: `internal/app/app.go`
 - Generate: `internal/store/sqlc/*`
 
 **Interfaces:**
 - Consumes: `config.Config.DatabaseURL` from Task 1.
 - Produces: `store.Open(context.Context, string) (*store.Store, error)`.
 - Produces: `jobs.Queue.Enqueue(ctx, jobs.Spec) (uuid.UUID, error)`.
-- Produces: `jobs.Queue.Claim(ctx, workerID string, lease time.Duration) (*jobs.Job, error)`.
-- Produces: `jobs.Queue.Complete(ctx, jobID uuid.UUID) error` and `Fail(ctx, jobID uuid.UUID, cause error, retryAt time.Time) error`.
+- Produces: `jobs.Queue.Claim(ctx, workerID string, lease time.Duration) (*jobs.Lease, error)`, where the lease contains a unique fencing token.
+- Produces: `jobs.Queue.Renew(ctx, lease jobs.Lease, duration time.Duration) error`.
+- Produces: `jobs.Queue.Complete(ctx, lease jobs.Lease) error` and `Fail(ctx, lease jobs.Lease, cause error, retryAt time.Time) error`; stale tokens must fail.
+- Produces: `jobs.Worker.Register(kind string, handler jobs.Handler) error` and `Run(context.Context) error` with graceful shutdown.
 
 - [ ] **Step 1: Write failing migration and queue integration tests**
 
-Add `TestMigrateCreatesRequiredTables`, `TestEnqueueIsIdempotent`, and `TestClaimSkipsLeasedJob`. Assert the presence of every entity named in the spec, a repeated idempotency key returning the same job ID, and a second worker not claiming a leased job.
+Add `TestMigrateCreatesRequiredTables`, `TestEnqueueIsIdempotent`, `TestClaimSkipsLeasedJob`, `TestExpiredLeaseCanBeReclaimed`, `TestStaleLeaseCannotCompleteOrFail`, `TestRetryBackoffAndAttemptExhaustion`, and `TestParallelClaimsAreUnique`. Assert the presence of every entity named in the spec, a repeated idempotency key returning the same job ID, and fencing-token ownership for every state change.
 
 - [ ] **Step 2: Run tests against PostgreSQL and verify failure**
 
-Run: `docker compose up -d db && go test ./internal/store ./internal/jobs`
+Run: `docker compose up -d db && make wait-test-db && TEST_DATABASE_URL=postgres://next_game_crush_test:next_game_crush_test@localhost:55432/next_game_crush_test?sslmode=disable GOWORK=off go test ./internal/store ./internal/jobs`
 
 Expected: FAIL because migrations and queue do not exist.
 
 - [ ] **Step 3: Add schema and typed SQL**
 
-Enable the `vector` extension. Use `github.com/google/uuid` at Go boundaries, UUID primary keys for application entities, Steam AppID as `BIGINT`, SteamID as text, `vector(1536)` for default embeddings, JSONB only for source payload snapshots and algorithm metadata, and unique constraints for all sync/delivery idempotency keys.
+Enable the `vector` extension. Use `github.com/google/uuid` at domain boundaries and define explicit repository conversions for sqlc/pgx UUID values, including nullability. Map vectors through `pgvector-go` and add an insert/read/cosine-query round trip. Use UUID primary keys for application entities, Steam AppID as `BIGINT`, SteamID as text, `vector(1536)` for embeddings, JSONB only for source snapshots and algorithm metadata, and unique constraints for sync/delivery idempotency keys.
 
 - [ ] **Step 4: Implement queue leasing**
 
-Claim jobs transactionally with `FOR UPDATE SKIP LOCKED`. A failed job increments attempts, records the error, and moves to `retryable` or `dead` according to `max_attempts`.
+Claim jobs transactionally with `FOR UPDATE SKIP LOCKED` and issue a new fencing token on every claim. Renewal, completion, and failure updates match job ID, running status, worker ID, and fencing token. A failed job increments attempts, records the error, and moves to `retryable` or `dead` according to `max_attempts`. Wire the worker into `app.App` and stop it through the parent context.
 
 - [ ] **Step 5: Generate queries and verify**
 
-Run: `sqlc generate && go test ./internal/store ./internal/jobs`
+Run: `make sqlc && TEST_DATABASE_URL=postgres://next_game_crush_test:next_game_crush_test@localhost:55432/next_game_crush_test?sslmode=disable GOWORK=off go test ./internal/store ./internal/jobs`
 
 Expected: PASS, including idempotency and competing-worker tests.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add db sqlc.yaml internal/store internal/jobs
+git add db sqlc.yaml internal/store internal/jobs internal/app go.mod go.sum Makefile docker-compose.yml
 git commit -m "feat: add persistence and PostgreSQL job queue"
 ```
 
@@ -178,7 +196,7 @@ git commit -m "feat: add persistence and PostgreSQL job queue"
 
 - [ ] **Step 1: Write failing authentication tests**
 
-Add tests named `TestCompleteAcceptsVerifiedAllowlistedSteamID`, `TestCompleteRejectsDifferentSteamID`, `TestCompleteRejectsInvalidReturnTo`, `TestSessionCookieIsHTTPOnlySameSite`, and `TestMutationRejectsMissingCSRF`.
+Add tests named `TestCompleteAcceptsVerifiedAllowlistedSteamID`, `TestCompleteRejectsDifferentSteamID`, `TestCompleteRejectsInvalidReturnTo`, `TestCompleteRejectsUnsolicitedOrReplayedState`, `TestCompleteRejectsClaimedIDProviderMismatch`, `TestLoginRotatesSession`, `TestSessionExpires`, `TestLogoutInvalidatesSession`, `TestSessionCookieIsHTTPOnlySameSite`, `TestHTTPSCookieIsSecure`, `TestMutationRejectsMissingOrWrongCSRF`, and `TestFixtureAuthCannotStartOutsideTestHarness`.
 
 - [ ] **Step 2: Verify the tests fail**
 
@@ -272,6 +290,8 @@ git commit -m "feat: add typed Steam API adapters"
 - Create: `db/queries/catalog.sql`
 - Create: `db/queries/library.sql`
 - Modify: `internal/jobs/queue.go`
+- Modify: `internal/jobs/worker.go`
+- Modify: `internal/app/app.go`
 - Create: `internal/httpapi/sync_handlers.go`
 - Modify: `internal/httpapi/router.go`
 
@@ -282,6 +302,7 @@ git commit -m "feat: add typed Steam API adapters"
 - Produces: `sync.SelectAchievementTargets(games []sync.UserGame, limit int) []int64` with `limit=30`.
 - Produces: `catalog.ParseReleaseDate(raw string, now time.Time) catalog.ReleaseWindow`.
 - Produces: `POST /api/sync` and `GET /api/sync/{id}`.
+- Produces: registered job handlers for `steam.sync`, `catalog.refresh`, and `achievements.sync`, with versioned payload schemas and parent-workflow completion only after required child stages finish.
 
 - [ ] **Step 1: Write failing date and achievement-selection tests**
 
@@ -303,7 +324,7 @@ Make each stage independently idempotent. Persist availability and fetch time se
 
 - [ ] **Step 5: Add authenticated sync endpoints**
 
-Return HTTP 202 with a job ID from `POST /api/sync`; expose stage, progress, last successful fetch time, and sanitized error details from the status endpoint.
+Return HTTP 202 with a job ID from `POST /api/sync`; expose stage, progress, last successful fetch time, and sanitized error details from the status endpoint. Require authentication and a valid CSRF token, and test both negative cases. Register the handlers with the worker and test enqueue-to-completion through a real queue.
 
 - [ ] **Step 6: Verify workflow behavior**
 
@@ -314,7 +335,7 @@ Expected: PASS, including private-profile snapshot preservation and duplicate pr
 - [ ] **Step 7: Commit**
 
 ```bash
-git add catalog_seed.json internal/catalog internal/sync internal/httpapi db/queries/catalog.sql db/queries/library.sql internal/jobs
+git add catalog_seed.json internal/catalog internal/sync internal/httpapi db/queries/catalog.sql db/queries/library.sql internal/jobs internal/app internal/store/sqlc
 git commit -m "feat: synchronize Steam profile and release catalog"
 ```
 
@@ -335,6 +356,9 @@ git commit -m "feat: synchronize Steam profile and release catalog"
 - Create: `internal/ai/testdata/embedding_response.json`
 - Create: `db/queries/features.sql`
 - Create: `db/queries/embeddings.sql`
+- Modify: `internal/jobs/worker.go`
+- Modify: `internal/app/app.go`
+- Generate: `internal/store/sqlc/*`
 
 **Interfaces:**
 - Produces: `ai.Client.ExtractGameFeatures(ctx, ai.GameEvidence) (ai.GameFeatures, error)`.
@@ -345,7 +369,7 @@ git commit -m "feat: synchronize Steam profile and release catalog"
 
 - [ ] **Step 1: Write failing schema and failure-mode tests**
 
-Assert strict decoding for every structured output, rejection of unknown evidence IDs, free-text length enforcement, redaction of secrets, refusal detection, timeout propagation, invalid-vector dimension rejection, and no persistence of invalid output.
+Assert strict decoding for every structured output, rejection of unknown evidence IDs, free-text length enforcement, redaction of secrets, refusal detection, timeout propagation, invalid-vector dimension rejection, no persistence of invalid output, and deterministic disabled-capability behavior when `OPENAI_API_KEY` is absent.
 
 - [ ] **Step 2: Verify tests fail**
 
@@ -355,7 +379,7 @@ Expected: FAIL because the adapter and schemas do not exist.
 
 - [ ] **Step 3: Implement OpenAI REST calls**
 
-Use the Responses API with strict JSON Schema for generation and `/v1/embeddings` for vectors. Send only normalized game evidence and opaque local evidence keys; never send SteamID, API keys, session IDs, or email data.
+Use the Responses API with strict JSON Schema for generation and `/v1/embeddings` for vectors. Request exactly 1536 dimensions and reject any other returned length. Send only normalized game evidence and opaque local evidence keys; never send SteamID, API keys, session IDs, or email data. Register versioned `ai.features`, `ai.embedding`, and `ai.profile_summary` job handlers.
 
 - [ ] **Step 4: Implement content-hash caching**
 
@@ -370,7 +394,7 @@ Expected: PASS using fixtures and `httptest.Server` only.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add internal/ai db/queries/features.sql db/queries/embeddings.sql
+git add internal/ai db/queries/features.sql db/queries/embeddings.sql internal/jobs internal/app internal/store/sqlc
 git commit -m "feat: add structured OpenAI and embedding adapters"
 ```
 
@@ -392,6 +416,9 @@ git commit -m "feat: add structured OpenAI and embedding adapters"
 - Create: `internal/httpapi/profile_handlers.go`
 - Create: `internal/httpapi/recommendation_handlers.go`
 - Modify: `internal/httpapi/router.go`
+- Modify: `internal/jobs/worker.go`
+- Modify: `internal/app/app.go`
+- Generate: `internal/store/sqlc/*`
 
 **Interfaces:**
 - Consumes: Tasks 5 and 6 catalog, user signals, structured features, and embeddings.
@@ -399,6 +426,7 @@ git commit -m "feat: add structured OpenAI and embedding adapters"
 - Produces: `recommendations.Score(recommendations.Factors, recommendations.Weights) recommendations.Result`.
 - Produces: `recommendations.Service.Rebuild(ctx, userID uuid.UUID) ([]recommendations.Recommendation, error)`.
 - Produces: `GET /api/profile`, `GET /api/calendar`, and `GET /api/recommendations/{id}`.
+- Produces: registered `profile.rebuild` and `recommendations.rebuild` handlers; completion records the new profile/ranking versions.
 
 - [ ] **Step 1: Write failing vector-profile tests**
 
@@ -435,7 +463,7 @@ Expected: PASS, including sparse-profile and OpenAI-fallback cases.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add internal/profile internal/recommendations internal/httpapi db/queries/profiles.sql db/queries/recommendations.sql
+git add internal/profile internal/recommendations internal/httpapi db/queries/profiles.sql db/queries/recommendations.sql internal/jobs internal/app internal/store/sqlc
 git commit -m "feat: add semantic profiles and deterministic ranking"
 ```
 
@@ -503,6 +531,8 @@ git commit -m "feat: add profile and release calendar UI"
 - Create: `internal/httpapi/feedback_handlers.go`
 - Create: `internal/httpapi/feedback_handlers_test.go`
 - Modify: `internal/httpapi/router.go`
+- Modify: `internal/jobs/worker.go`
+- Modify: `internal/app/app.go`
 - Create: `web/src/components/FeedbackForm.tsx`
 - Create: `web/src/components/FeedbackForm.test.tsx`
 - Modify: `web/src/components/RecommendationCard.tsx`
@@ -510,8 +540,9 @@ git commit -m "feat: add profile and release calendar UI"
 
 **Interfaces:**
 - Consumes: Task 6 `ClassifyFeedback` and Task 7 profile/recommendation rebuild services.
-- Produces: `feedback.Service.Record(ctx, feedback.Command) (feedback.Event, error)`.
+- Produces: `feedback.Service.Record(ctx, feedback.Command) (feedback.Accepted, error)`, where `Accepted` contains event ID, rebuild job ID, and previous ranking version.
 - Produces: `POST /api/recommendations/{id}/feedback` and `POST /api/recommendations/{id}/reminder`.
+- Produces: `GET /api/rankings/{version}/diff` with rebuild status, current version, and added/removed/reordered recommendation IDs.
 
 - [ ] **Step 1: Write failing service tests**
 
@@ -529,11 +560,11 @@ Expected: FAIL because the feedback loop is absent.
 
 - [ ] **Step 4: Implement feedback persistence and classification**
 
-Persist the original recommendation snapshot before classification. Apply only high-confidence structured signals automatically; enqueue profile and recommendation rebuild jobs with stable idempotency keys.
+Persist the original recommendation snapshot before classification. Apply only high-confidence structured signals automatically; enqueue versioned `feedback.classify`, profile rebuild, and recommendation rebuild jobs with stable idempotency keys. Scope keys to the event/workflow ID so retries deduplicate while later legitimate feedback and sync workflows still run.
 
 - [ ] **Step 5: Implement feedback UI and visible changes**
 
-Use optimistic reaction state only for the saved event, not for the new ranking. Display the server-computed ranking diff after the rebuild finishes.
+Use optimistic reaction state only for the saved event, not for the new ranking. Poll the accepted rebuild job, then fetch and display the server-computed ranking diff. Require authentication and CSRF for feedback and reminder endpoints and test both failures.
 
 - [ ] **Step 6: Verify the full feedback loop**
 
@@ -544,7 +575,7 @@ Expected: PASS, including idempotency, confidence threshold, and visible ranking
 - [ ] **Step 7: Commit**
 
 ```bash
-git add internal/feedback internal/httpapi db/queries/feedback.sql web/src
+git add internal/feedback internal/httpapi db/queries/feedback.sql web/src internal/jobs internal/app internal/store/sqlc
 git commit -m "feat: learn from structured and free-text feedback"
 ```
 
@@ -562,6 +593,9 @@ git commit -m "feat: learn from structured and free-text feedback"
 - Create: `internal/httpapi/email_action_handlers_test.go`
 - Create: `db/queries/notifications.sql`
 - Modify: `internal/httpapi/router.go`
+- Modify: `internal/jobs/worker.go`
+- Modify: `internal/app/app.go`
+- Generate: `internal/store/sqlc/*`
 - Create: `web/src/components/TestDigestButton.tsx`
 - Modify: `web/src/pages/DashboardPage.tsx`
 
@@ -572,7 +606,7 @@ git commit -m "feat: learn from structured and free-text feedback"
 
 - [ ] **Step 1: Write failing signing and digest tests**
 
-Assert token expiry, signature tampering, purpose/recommendation binding, duplicate delivery prevention, deterministic ordering, no repeated unchanged recommendations, and escaped user/game text in HTML.
+Assert token expiry, signature tampering, purpose/recommendation binding, duplicate delivery-job prevention, deterministic ordering, no repeated unchanged recommendations, escaped user/game text in HTML, failure before SMTP acceptance returning to retryable state, and failure after SMTP acceptance/before database confirmation becoming `ambiguous` rather than automatically resending.
 
 - [ ] **Step 2: Write failing email-action tests**
 
@@ -586,11 +620,11 @@ Expected: FAIL because notification services are absent.
 
 - [ ] **Step 4: Implement digest composition and SMTP delivery**
 
-Include upcoming wishlist releases, top new recommendations, grounded explanations, and Like/Dislike/Remind links. Use a delivery idempotency key based on user, digest kind, content hash, and ISO week.
+Include upcoming wishlist releases, top new recommendations, grounded explanations, and Like/Dislike/Remind links. Use a delivery idempotency key based on user, digest kind, content hash, and ISO week. Persist `pending`, `sending`, `sent`, `failed`, and `ambiguous` states with attempt ownership. Never claim unconditional exactly-once SMTP delivery: an ambiguous attempt requires manual inspection or an explicit resend action.
 
 - [ ] **Step 5: Implement signed email actions**
 
-Tokens contain only opaque IDs, action, issued-at, expiry, nonce, and signature. Mark a nonce consumed transactionally with recording feedback.
+Tokens contain only opaque IDs, action, issued-at, expiry, nonce, and signature. Mark a nonce consumed transactionally with recording feedback. Require authentication and CSRF for `POST /api/digests/test`; register the digest handler with the worker.
 
 - [ ] **Step 6: Verify against Mailpit**
 
@@ -601,7 +635,7 @@ Expected: PASS; a manual `POST /api/digests/test` in the running app produces on
 - [ ] **Step 7: Commit**
 
 ```bash
-git add internal/notifications internal/httpapi db/queries/notifications.sql web/src
+git add internal/notifications internal/httpapi db/queries/notifications.sql web/src internal/jobs internal/app internal/store/sqlc
 git commit -m "feat: add signed local recommendation digest"
 ```
 
@@ -631,11 +665,11 @@ git commit -m "feat: add signed local recommendation digest"
 
 - [ ] **Step 1: Write failing deletion and diagnostic tests**
 
-Assert deletion removes user-derived library, wishlist, achievements, profiles, vectors, recommendations, feedback, jobs, and deliveries while retaining shared catalog games. Assert diagnostics never return secret values or raw OpenAI prompts.
+Assert deletion removes user-derived library, wishlist, achievements, profiles, vectors, recommendations, feedback, jobs, and deliveries while retaining shared catalog games. Assert diagnostics never return secret values or raw OpenAI prompts. Add a concurrent-worker test proving an in-flight job cannot recreate deleted user data, plus unauthenticated and wrong-CSRF deletion tests.
 
 - [ ] **Step 2: Write the failing smoke test**
 
-Use test-only fixture authentication and fake Steam/OpenAI servers. Cover login, sync, achievements, profile, calendar buckets, feedback, visible re-ranking, test digest, signed email feedback, retry-safe repeated sync, and deletion.
+Use test-only fixture authentication and fake Steam/OpenAI servers. Prove fixture authentication fails closed unless the dedicated test-harness flag is set. Cover login, sync, achievements, profile, calendar buckets, feedback, visible re-ranking, test digest, signed email feedback, retry-safe repeated sync, and deletion.
 
 - [ ] **Step 3: Run and verify failure**
 
@@ -649,11 +683,11 @@ Return component state, freshness timestamps, and sanitized job errors. Delete u
 
 - [ ] **Step 5: Document local setup and real-account verification**
 
-Document prerequisites, environment variables, Steam profile visibility, OpenAI key setup, seed-catalog editing, startup, Mailpit, cleanup, and a manual demo script. Keep real credentials out of examples.
+Document prerequisites, environment variables, Steam profile visibility, OpenAI key setup, seed-catalog editing, startup, Mailpit, cleanup, and a manual demo script. Keep real credentials out of examples. Document `APP_BASE_URL` as the Go origin and the Vite URL as development-only.
 
 - [ ] **Step 6: Add the complete verification target**
 
-`make verify` must run migrations from empty PostgreSQL, `sqlc generate` with a clean-tree check, Go tests with race detection, frontend tests/typecheck/lint/build, and Playwright smoke tests.
+`make verify` must create and wait for an isolated disposable test database, run migrations there, run pinned `sqlc` generation with a diff check scoped to `internal/store/sqlc`, run Go tests with race detection, frontend tests/typecheck/lint/build, install the pinned Playwright Chromium browser when absent, and run smoke tests. Configure Playwright `webServer` entries for fake services, Go, and Vite with readiness URLs; Vitest must exclude Playwright specs.
 
 - [ ] **Step 7: Run all verification**
 
