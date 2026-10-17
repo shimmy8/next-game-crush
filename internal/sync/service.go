@@ -51,7 +51,14 @@ type Service struct {
 	client  steam.Client
 	catalog *catalog.Service
 	now     func() time.Time
+	aiJobs  AIJobPlanner
 }
+
+type AIJobPlanner interface {
+	PlanFeatureJobs(context.Context, uuid.UUID, string) ([]jobs.Spec, error)
+}
+
+func (s *Service) SetAIJobPlanner(planner AIJobPlanner) { s.aiJobs = planner }
 
 func NewService(database *store.Store, queue *jobs.Queue, client steam.Client, catalogService *catalog.Service) (*Service, error) {
 	if database == nil || queue == nil || client == nil || catalogService == nil {
@@ -133,6 +140,19 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 		for _, child := range childJobs {
 			if child.Required && child.Status != "succeeded" {
 				return errors.New("required synchronization stage is incomplete")
+			}
+		}
+		if s.aiJobs != nil {
+			specs, err := s.aiJobs.PlanFeatureJobs(ctx, payload.UserID, lease.IdempotencyKey)
+			if err != nil {
+				return err
+			}
+			for _, spec := range specs {
+				// AI is optional: enqueue independent workflows so exhausted AI
+				// retries never dead-letter the successful Steam synchronization.
+				if _, err := s.queue.Enqueue(ctx, spec); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

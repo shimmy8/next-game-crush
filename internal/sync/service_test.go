@@ -203,8 +203,12 @@ func TestReleasedWishlistGameIsNotCatalogMember(t *testing.T) {
 
 func TestWorkerRunsEnqueuedWorkflowToRequiredChildCompletion(t *testing.T) {
 	service, fake, db, userID := newTestService(t)
+	service.SetAIJobPlanner(testAIPlanner{})
 	worker := jobs.NewWorker(service.queue, "sync-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second))
 	if err := service.RegisterHandlers(worker); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Register("ai.features", func(context.Context, jobs.Lease) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	jobID, err := service.Start(context.Background(), userID)
@@ -243,12 +247,70 @@ func TestWorkerRunsEnqueuedWorkflowToRequiredChildCompletion(t *testing.T) {
 	if children != 2 || succeeded != 2 {
 		t.Fatalf("child jobs = %d/%d succeeded, want 2/2", succeeded, children)
 	}
+	var aiStatus string
+	if err := db.Pool.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE kind='ai.features' AND parent_job_id IS NULL`).Scan(&aiStatus); err != nil {
+		t.Fatal(err)
+	}
+	if aiStatus != "succeeded" {
+		t.Fatalf("independent AI job status = %s", aiStatus)
+	}
 	fake.mu.Lock()
 	ownedCalls := fake.ownedCalls
 	fake.mu.Unlock()
 	if ownedCalls != 1 {
 		t.Fatalf("parent reran Steam import after children: owned calls = %d", ownedCalls)
 	}
+}
+
+func TestAIFailureDoesNotFailSteamSynchronization(t *testing.T) {
+	service, _, db, userID := newTestService(t)
+	service.SetAIJobPlanner(failingAIPlanner{})
+	worker := jobs.NewWorker(service.queue, "ai-failure-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second), jobs.WithRetryBase(time.Millisecond))
+	if err := service.RegisterHandlers(worker); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.Register("ai.features", func(context.Context, jobs.Lease) error { return errors.New("simulated refusal") }); err != nil {
+		t.Fatal(err)
+	}
+	jobID, err := service.Start(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var steamStatus string
+		var aiStatus *string
+		if err := db.Pool.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE id=$1`, jobID).Scan(&steamStatus); err != nil {
+			t.Fatal(err)
+		}
+		_ = db.Pool.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE kind='ai.features' AND parent_job_id IS NULL`).Scan(&aiStatus)
+		if steamStatus == "succeeded" && aiStatus != nil && *aiStatus == "dead" {
+			break
+		}
+		if steamStatus == "dead" || time.Now().After(deadline) {
+			t.Fatalf("steam/AI status = %s/%v", steamStatus, aiStatus)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type testAIPlanner struct{}
+
+func (testAIPlanner) PlanFeatureJobs(_ context.Context, _ uuid.UUID, rootKey string) ([]jobs.Spec, error) {
+	return []jobs.Spec{{Kind: "ai.features", Stage: "ai_features", Required: true, IdempotencyKey: rootKey + ":ai.features:v1:test", Payload: []byte(`{"version":1}`), MaxAttempts: 3}}, nil
+}
+
+type failingAIPlanner struct{}
+
+func (failingAIPlanner) PlanFeatureJobs(_ context.Context, _ uuid.UUID, rootKey string) ([]jobs.Spec, error) {
+	return []jobs.Spec{{Kind: "ai.features", Stage: "ai_features", IdempotencyKey: rootKey + ":ai.features:v1:failure", Payload: []byte(`{"version":1}`), MaxAttempts: 1}}, nil
 }
 
 func TestWorkerLeavesReleasedWishlistGameOutsideCatalog(t *testing.T) {

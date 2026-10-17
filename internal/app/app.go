@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"next-game-crush/internal/ai"
 	"next-game-crush/internal/auth"
 	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/config"
@@ -69,6 +70,26 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("register synchronization handlers: %w", err)
 	}
+	openAIClient, err := ai.NewOpenAI(ai.OpenAIConfig{
+		APIKey: cfg.OpenAIAPIKey, Model: cfg.OpenAIModel,
+		EmbeddingModel: cfg.OpenAIEmbeddingModel,
+		HTTPClient:     &http.Client{Timeout: 30 * time.Second},
+	})
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure OpenAI client: %w", err)
+	}
+	aiService, err := ai.NewService(ai.NewSQLRepository(db), openAIClient, cfg.OpenAIModel, cfg.OpenAIEmbeddingModel)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure AI jobs: %w", err)
+	}
+	aiService.SetQueue(queue)
+	if err := aiService.RegisterHandlers(worker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register AI handlers: %w", err)
+	}
+	syncService.SetAIJobPlanner(aiService)
 	providerClient := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret}, auth.NewSQLRepository(db), auth.NewHTTPProvider(providerClient, "https://steamcommunity.com/openid/"))
 	if err != nil {
