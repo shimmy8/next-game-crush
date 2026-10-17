@@ -222,17 +222,19 @@ func TestWorkerRunsEnqueuedWorkflowToRequiredChildCompletion(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var status string
+		var aiStatus *string
 		if err := db.Pool.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE id=$1`, jobID).Scan(&status); err != nil {
 			t.Fatal(err)
 		}
-		if status == "succeeded" {
+		_ = db.Pool.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE kind='ai.features' AND parent_job_id IS NULL`).Scan(&aiStatus)
+		if status == "succeeded" && aiStatus != nil && *aiStatus == "succeeded" {
 			break
 		}
 		if status == "dead" {
 			t.Fatal("workflow dead-lettered")
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("workflow status = %s after timeout", status)
+			t.Fatalf("workflow/AI status = %s/%v after timeout", status, aiStatus)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
