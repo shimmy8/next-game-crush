@@ -18,6 +18,7 @@ type Dependencies struct {
 	Profile         ProfileReadService
 	Recommendations RecommendationReadService
 	Feedback        FeedbackService
+	Digests         DigestService
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -45,6 +46,12 @@ func NewRouter(deps Dependencies) http.Handler {
 			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/recommendations/{id}/reminder", recordFeedback(deps.Feedback, true))
 			router.With(deps.Auth.Middleware).Get("/api/rankings/{version}/diff", rankingDiff(deps.Feedback))
 		}
+		if deps.Digests != nil {
+			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/digests/test", sendTestDigest(deps.Digests))
+		}
+	}
+	if deps.Digests != nil {
+		router.Get("/actions/feedback/{token}", emailFeedbackAction(deps.Digests))
 	}
 	if deps.Frontend != nil {
 		files := http.FileServer(http.FS(deps.Frontend))

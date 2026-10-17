@@ -16,6 +16,7 @@ import (
 	"next-game-crush/internal/feedback"
 	"next-game-crush/internal/httpapi"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/notifications"
 	"next-game-crush/internal/profile"
 	"next-game-crush/internal/recommendations"
 	"next-game-crush/internal/steam"
@@ -137,6 +138,30 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("register feedback handlers: %w", err)
 	}
+	notificationRepository, err := notifications.NewSQLRepository(db)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure notification repository: %w", err)
+	}
+	smtpSender, err := notifications.NewSMTPSender(cfg.SMTPURL)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure SMTP sender: %w", err)
+	}
+	actionSigner, err := notifications.NewSigner([]byte(cfg.EmailActionSecret), "recommendation-feedback")
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure email actions: %w", err)
+	}
+	notificationService, err := notifications.NewService(notificationRepository, queue, smtpSender, actionSigner, cfg.AppBaseURL)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure notifications: %w", err)
+	}
+	if err := notificationService.RegisterHandlers(worker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register notification handlers: %w", err)
+	}
 	syncService.EnableRankingJobs()
 	providerClient := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret}, auth.NewSQLRepository(db), auth.NewHTTPProvider(providerClient, "https://steamcommunity.com/openid/"))
@@ -149,6 +174,7 @@ func New(cfg config.Config) (*App, error) {
 	deps.Profile = profileService
 	deps.Recommendations = recommendationService
 	deps.Feedback = feedbackService
+	deps.Digests = notificationService
 	return &App{store: db, worker: worker, server: &http.Server{
 		Addr:              ":8080",
 		Handler:           httpapi.NewRouter(deps),

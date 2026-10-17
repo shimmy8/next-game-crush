@@ -33,14 +33,44 @@ type CatalogFetchState struct {
 	Error                 pgtype.Text        `json:"error"`
 }
 
+type EmailActionNonce struct {
+	Nonce            pgtype.UUID        `json:"nonce"`
+	DeliveryID       pgtype.UUID        `json:"delivery_id"`
+	UserID           pgtype.UUID        `json:"user_id"`
+	RecommendationID pgtype.UUID        `json:"recommendation_id"`
+	Action           string             `json:"action"`
+	IssuedAt         pgtype.Timestamptz `json:"issued_at"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+	ConsumedAt       pgtype.Timestamptz `json:"consumed_at"`
+	FeedbackEventID  pgtype.UUID        `json:"feedback_event_id"`
+}
+
 type EmailDelivery struct {
-	ID             pgtype.UUID        `json:"id"`
-	UserID         pgtype.UUID        `json:"user_id"`
-	IdempotencyKey string             `json:"idempotency_key"`
-	Status         string             `json:"status"`
-	AcceptedAt     pgtype.Timestamptz `json:"accepted_at"`
-	Error          pgtype.Text        `json:"error"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	ID                pgtype.UUID        `json:"id"`
+	UserID            pgtype.UUID        `json:"user_id"`
+	IdempotencyKey    string             `json:"idempotency_key"`
+	Status            string             `json:"status"`
+	AcceptedAt        pgtype.Timestamptz `json:"accepted_at"`
+	Error             pgtype.Text        `json:"error"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	Kind              string             `json:"kind"`
+	ContentHash       string             `json:"content_hash"`
+	Recipient         string             `json:"recipient"`
+	Subject           string             `json:"subject"`
+	TextBody          string             `json:"text_body"`
+	HtmlBody          string             `json:"html_body"`
+	AttemptWorkerID   pgtype.Text        `json:"attempt_worker_id"`
+	AttemptToken      pgtype.UUID        `json:"attempt_token"`
+	ConfirmationToken pgtype.UUID        `json:"confirmation_token"`
+	AttemptStartedAt  pgtype.Timestamptz `json:"attempt_started_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type EmailDeliveryRecommendation struct {
+	DeliveryID       pgtype.UUID `json:"delivery_id"`
+	RecommendationID pgtype.UUID `json:"recommendation_id"`
+	GameID           pgtype.UUID `json:"game_id"`
+	ContentHash      string      `json:"content_hash"`
 }
 
 type FeedbackClassification struct {

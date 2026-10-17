@@ -70,3 +70,9 @@ export function submitFeedback(recommendationId: string, csrfToken: string, inpu
 export function getRankingDiff(version: number, jobId: string, signal?: AbortSignal) {
   return requestJSON<import('./types').RankingDiff>(`/api/rankings/${version}/diff?jobId=${encodeURIComponent(jobId)}`, { signal })
 }
+
+export function sendTestDigest(csrfToken: string, signal?: AbortSignal) {
+  return requestJSON<{ deliveryId: string, status: 'pending' }>('/api/digests/test', {
+    method: 'POST', headers: { 'X-CSRF-Token': csrfToken }, signal,
+  })
+}

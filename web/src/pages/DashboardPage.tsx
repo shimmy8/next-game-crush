@@ -5,6 +5,7 @@ import type { CalendarResponse, DashboardLoadState, RankingDiff, Recommendation 
 import PreferenceProfile from '../components/PreferenceProfile'
 import RecommendationCard from '../components/RecommendationCard'
 import SyncProgress from '../components/SyncProgress'
+import TestDigestButton from '../components/TestDigestButton'
 import CalendarPage from './CalendarPage'
 
 type DashboardPageProps = {
@@ -75,7 +76,7 @@ export default function DashboardPage({ user, signingOut, onLogout, initialState
           </section>
           {recommendations.length > 1 && <section className="recommendations-section" aria-labelledby="more-title"><div className="section-heading"><div><div className="eyebrow">Ещё кандидаты</div><h2 id="more-title">Стоит присмотреться</h2></div><span>{recommendations.length - 1} игр</span></div><div className="recommendation-grid">{recommendations.slice(1, 7).map((item: Recommendation) => <RecommendationCard item={item} key={item.id} csrfToken={user.csrfToken} onRankingUpdated={rankingUpdated} />)}</div></section>}
         </div>
-        <div className="right-rail"><PreferenceProfile profile={data.profile} /><UpcomingWindows calendar={data.calendar} /></div>
+        <div className="right-rail"><PreferenceProfile profile={data.profile} /><UpcomingWindows calendar={data.calendar} /><TestDigestButton csrfToken={user.csrfToken} /></div>
       </div>}
 
       {hasData && <CalendarPage calendar={data.calendar} rankingDiff={rankingDiff} />}

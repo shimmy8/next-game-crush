@@ -82,8 +82,10 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .recommendation-grid .cover-panel { min-height: 185px; border-right: 0; border-bottom: 1px solid var(--line); }
 .recommendation-grid .recommendation-card__body { padding: 22px; }
 .recommendation-grid .recommendation-card h3 { font-size: 1.45rem; }
-.profile-card, .windows-card { padding: 24px; border: 1px solid var(--line); border-radius: 14px; background: #11151f; }
-.profile-card h2, .windows-card h2 { margin: 8px 0 14px; font-size: 1.2rem; }
+.profile-card, .windows-card, .digest-card { padding: 24px; border: 1px solid var(--line); border-radius: 14px; background: #11151f; }
+.profile-card h2, .windows-card h2, .digest-card h2 { margin: 8px 0 14px; font-size: 1.2rem; }
+.digest-card p { color: var(--muted); font-size: .82rem; line-height: 1.5; }
+.digest-card button { width: 100%; }
 .profile-card > p { color: #b8b7c4; line-height: 1.58; font-size: .88rem; }
 .confidence-line { display: flex; justify-content: space-between; margin-top: 22px; color: var(--muted); font-size: .75rem; }
 .confidence-line strong { color: var(--ink); }
