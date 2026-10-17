@@ -1,0 +1,1 @@
+{"response":{"game_count":2,"games":[{"appid":620,"name":"Portal 2","playtime_forever":1234,"img_icon_url":"portal-icon","playtime_windows_forever":1200,"playtime_mac_forever":20,"playtime_linux_forever":14,"rtime_last_played":1690000000},{"appid":440,"name":"Team Fortress 2","playtime_forever":300,"img_icon_url":"tf2-icon","rtime_last_played":1680000000}]}}
