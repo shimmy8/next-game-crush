@@ -1,13 +1,19 @@
 # Isolate this module from any enclosing Go workspace.
 export GOWORK := off
 
-.PHONY: dev test build down wait-test-db
+SQLC_VERSION := v1.31.1
+SQLC_IMAGE := sqlc/sqlc:$(SQLC_VERSION:v%=%)
+
+.PHONY: dev test build down wait-test-db sqlc
 
 dev:
 	docker compose up --build
 
 wait-test-db:
 	docker compose up --quiet-pull --wait --wait-timeout 60 test-db
+
+sqlc:
+	docker run --rm -v "$(CURDIR):/src" -w /src $(SQLC_IMAGE) generate
 
 test:
 	go test ./...

@@ -1,0 +1,68 @@
+-- name: EnqueueJob :one
+INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at)
+VALUES ($1, $2, $3, $4, $5, COALESCE(sqlc.narg(available_at)::timestamptz, now()))
+ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+RETURNING id;
+
+-- name: ClaimJob :one
+WITH candidate AS (
+    SELECT id FROM sync_jobs
+    WHERE attempts < max_attempts
+      AND available_at <= now()
+      AND (status IN ('queued', 'retryable') OR (status = 'running' AND lease_until <= now()))
+    ORDER BY available_at, created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+), claimed AS (
+    UPDATE sync_jobs j SET
+        attempts = attempts + 1,
+        status = 'running', worker_id = sqlc.arg(worker_id),
+        fencing_token = sqlc.arg(fencing_token),
+        lease_until = now() + sqlc.arg(lease_duration)::interval,
+        updated_at = now()
+    FROM candidate c WHERE j.id = c.id
+    RETURNING j.*
+)
+SELECT * FROM claimed;
+
+-- name: InsertJobAttempt :exec
+INSERT INTO job_attempts (id, job_id, attempt, worker_id, fencing_token, started_at, status)
+SELECT $1, j.id, j.attempts, j.worker_id, j.fencing_token, now(), 'running'
+FROM sync_jobs j WHERE j.id = $2 AND j.status = 'running' AND j.worker_id = $3 AND j.fencing_token = $4;
+
+-- name: FinishExpiredAttempts :exec
+UPDATE job_attempts a SET status = 'expired', error = 'lease expired', finished_at = now()
+FROM sync_jobs j
+WHERE a.job_id = j.id AND a.fencing_token = j.fencing_token AND a.status = 'running'
+  AND j.status = 'running' AND j.lease_until <= now();
+
+-- name: DeadLetterExhaustedLeases :exec
+UPDATE sync_jobs SET status = 'dead', worker_id = NULL, fencing_token = NULL,
+    lease_until = NULL, last_error = 'lease expired after maximum attempts', updated_at = now()
+WHERE status = 'running' AND lease_until <= now() AND attempts >= max_attempts;
+
+-- name: RenewJob :execrows
+UPDATE sync_jobs SET lease_until = now() + sqlc.arg(lease_duration)::interval, updated_at = now()
+WHERE id = sqlc.arg(id) AND status = 'running' AND worker_id = sqlc.arg(worker_id)
+  AND fencing_token = sqlc.arg(fencing_token) AND lease_until > now();
+
+-- name: CompleteJob :execrows
+UPDATE sync_jobs SET status = 'succeeded', worker_id = NULL, fencing_token = NULL,
+    lease_until = NULL, last_error = NULL, updated_at = now()
+WHERE id = $1 AND status = 'running' AND worker_id = $2 AND fencing_token = $3 AND lease_until > now();
+
+-- name: FinishSuccessfulAttempt :exec
+UPDATE job_attempts SET status = 'succeeded', finished_at = now()
+WHERE job_id = $1 AND worker_id = $2 AND fencing_token = $3 AND status = 'running';
+
+-- name: FailJob :execrows
+UPDATE sync_jobs SET
+    status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'retryable' END,
+    available_at = sqlc.arg(retry_at), last_error = sqlc.arg(cause),
+    worker_id = NULL, fencing_token = NULL, lease_until = NULL, updated_at = now()
+WHERE id = sqlc.arg(id) AND status = 'running' AND worker_id = sqlc.arg(worker_id)
+  AND fencing_token = sqlc.arg(fencing_token) AND lease_until > now();
+
+-- name: FinishFailedAttempt :exec
+UPDATE job_attempts SET status = $4, error = $5, finished_at = now()
+WHERE job_id = $1 AND worker_id = $2 AND fencing_token = $3 AND status = 'running';
