@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getCurrentUser, logout, type CurrentUser } from './api/client'
 import LoginPage from './pages/LoginPage'
+import DashboardPage from './pages/DashboardPage'
 
 type Health = 'checking' | 'ok' | 'unavailable'
 
@@ -39,14 +40,7 @@ export default function App() {
     }
   }
 
-  return (
-    <main className="mx-auto flex min-h-screen max-w-3xl items-center px-6 py-16">
-      <div className="w-full">
-        <LoginPage user={user} signingOut={signingOut} onLogout={() => { void signOut() }} />
-        <p role="status" className="mt-8 text-sm text-slate-300">
-          API health: {health === 'checking' ? 'checking…' : health}
-        </p>
-      </div>
-    </main>
-  )
+  if (user) return <DashboardPage user={user} signingOut={signingOut} onLogout={() => { void signOut() }} />
+
+  return <main className="login-shell"><div className="login-shell__inner"><LoginPage user={null} signingOut={signingOut} onLogout={() => { void signOut() }} /><p role="status" className="api-health">API: {health === 'checking' ? 'проверяем…' : health === 'ok' ? 'на связи' : 'недоступен'}</p></div></main>
 }
