@@ -14,6 +14,23 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+  test-db:
+    image: pgvector/pgvector:0.8.7-pg16-bookworm
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: next_game_crush_test
+      POSTGRES_USER: next_game_crush_test
+      POSTGRES_PASSWORD: next_game_crush_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    # Test data disappears when this container stops; never use the app volume.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U next_game_crush_test -d next_game_crush_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
   mailpit:
     image: axllent/mailpit:v1.27
     ports:

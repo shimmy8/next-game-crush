@@ -50,3 +50,37 @@ func TestLoadUsesDocumentedModelDefaults(t *testing.T) {
 		t.Errorf("OpenAIEmbeddingModel = %q, want text-embedding-3-small", cfg.OpenAIEmbeddingModel)
 	}
 }
+
+func TestLoadAllowsMissingOpenAIKey(t *testing.T) {
+	for _, value := range []string{"", " \t\n"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnvironment(t)
+			t.Setenv("OPENAI_API_KEY", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.OpenAI.Enabled {
+				t.Error("OpenAI must be disabled without a nonblank key")
+			}
+			if cfg.OpenAIAPIKey != "" {
+				t.Error("OpenAIAPIKey must be empty after trimming whitespace")
+			}
+		})
+	}
+}
+
+func TestLoadEnablesOpenAIWithTrimmedKey(t *testing.T) {
+	setRequiredEnvironment(t)
+	t.Setenv("OPENAI_API_KEY", " test-openai-key \t")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OpenAI.Enabled {
+		t.Error("OpenAI must be enabled with a configured key")
+	}
+	if cfg.OpenAIAPIKey != "test-openai-key" {
+		t.Error("OpenAIAPIKey must be trimmed")
+	}
+}

@@ -1,10 +1,13 @@
 # Isolate this module from any enclosing Go workspace.
 export GOWORK := off
 
-.PHONY: dev test build down
+.PHONY: dev test build down wait-test-db
 
 dev:
 	docker compose up --build
+
+wait-test-db:
+	docker compose up --quiet-pull --wait --wait-timeout 60 test-db
 
 test:
 	go test ./...

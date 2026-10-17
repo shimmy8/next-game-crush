@@ -7,12 +7,18 @@ import (
 	"strings"
 )
 
+// OpenAICapability reports whether credentials are configured for AI calls.
+type OpenAICapability struct {
+	Enabled bool
+}
+
 // Config contains runtime configuration. Never log it: it contains credentials.
 type Config struct {
 	AppBaseURL           string
 	AllowedSteamID       string
 	SteamWebAPIKey       string
 	OpenAIAPIKey         string
+	OpenAI               OpenAICapability
 	OpenAIModel          string
 	OpenAIEmbeddingModel string
 	DatabaseURL          string
@@ -26,7 +32,7 @@ func Load() (Config, error) {
 		AppBaseURL:           envOrDefault("APP_BASE_URL", "http://localhost:8080"),
 		AllowedSteamID:       os.Getenv("ALLOWED_STEAM_ID"),
 		SteamWebAPIKey:       os.Getenv("STEAM_WEB_API_KEY"),
-		OpenAIAPIKey:         os.Getenv("OPENAI_API_KEY"),
+		OpenAIAPIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		OpenAIModel:          envOrDefault("OPENAI_MODEL", "gpt-6-luna"),
 		OpenAIEmbeddingModel: envOrDefault("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
 		DatabaseURL:          envOrDefault("DATABASE_URL", "postgres://next_game_crush:next_game_crush@localhost:5432/next_game_crush?sslmode=disable"),
@@ -34,6 +40,7 @@ func Load() (Config, error) {
 		EmailActionSecret:    os.Getenv("EMAIL_ACTION_SECRET"),
 		SessionSecret:        os.Getenv("SESSION_SECRET"),
 	}
+	cfg.OpenAI = OpenAICapability{Enabled: cfg.OpenAIAPIKey != ""}
 	var problems []string
 	for _, required := range []struct{ name, value string }{
 		{"ALLOWED_STEAM_ID", cfg.AllowedSteamID},

@@ -21,7 +21,7 @@ func NewRouter(deps Dependencies) http.Handler {
 	if deps.Frontend != nil {
 		files := http.FileServer(http.FS(deps.Frontend))
 		router.Get("/*", func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/api" || r.URL.Path == "/auth" || strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/") {
+			if r.URL.Path == "/api" || r.URL.Path == "/auth" || r.URL.Path == "/actions" || strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/") || strings.HasPrefix(r.URL.Path, "/actions/") {
 				http.NotFound(w, r)
 				return
 			}
