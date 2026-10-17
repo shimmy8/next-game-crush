@@ -82,31 +82,31 @@
 - Produces: `httpapi.NewRouter(httpapi.Dependencies) http.Handler`.
 - Produces: `GET /api/health -> {"status":"ok"}`.
 
-- [ ] **Step 1: Write failing configuration and health tests**
+- [x] **Step 1: Write failing configuration and health tests**
 
 Add tests named `TestLoadRejectsMissingRequiredSecrets`, `TestLoadAllowsMissingOpenAIKey`, `TestLoadUsesDocumentedModelDefaults`, and `TestHealthReturnsOK`. Assert that missing required authentication/signing variables produce named validation errors, a missing OpenAI key produces a disabled capability without startup failure, defaults equal `gpt-6-luna` and `text-embedding-3-small`, and health returns HTTP 200 with JSON status `ok`.
 
-- [ ] **Step 2: Run the focused tests and verify failure**
+- [x] **Step 2: Run the focused tests and verify failure**
 
 Run: `GOWORK=off go test ./internal/config ./internal/httpapi`
 
 Expected: FAIL because the packages and functions do not exist.
 
-- [ ] **Step 3: Implement the minimal Go service and React shell**
+- [x] **Step 3: Implement the minimal Go service and React shell**
 
 Use pinned `chi` for routing. Make the frontend display the product name, API health, and a disabled login action that Task 3 will activate. Configure Vite to proxy `/api`, `/auth`, and `/actions` to the canonical Go origin `http://localhost:8080`. Define `dev`, `build`, `test`, `typecheck`, and `lint` scripts in `web/package.json`; configure Vitest with jsdom and Testing Library while excluding Playwright specs.
 
-- [ ] **Step 4: Add local services and developer commands**
+- [x] **Step 4: Add local services and developer commands**
 
 Define pinned PostgreSQL with `pgvector`, Mailpit, and the application in Compose. Publish a host test port and define `TEST_DATABASE_URL`. Add `make dev`, `make test`, `make build`, and `make down`; list required secret variable names with empty values in `.env.example`. Treat `OPENAI_API_KEY` as optional and expose disabled AI capability through configuration.
 
-- [ ] **Step 5: Verify the foundation**
+- [x] **Step 5: Verify the foundation**
 
 Run: `GOWORK=off go test ./internal/config ./internal/httpapi && pnpm --dir web install && pnpm --dir web run build && docker compose config`
 
 Expected: tests PASS, frontend build succeeds, and Compose configuration validates.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add go.mod go.sum cmd internal/config internal/app internal/httpapi web docker-compose.yml Dockerfile .dockerignore .gitignore .env.example Makefile
@@ -141,31 +141,31 @@ git commit -m "chore: bootstrap Next Game Crush runtime"
 - Produces: `jobs.Queue.Complete(ctx, lease jobs.Lease) error` and `Fail(ctx, lease jobs.Lease, cause error, retryAt time.Time) error`; stale tokens must fail.
 - Produces: `jobs.Worker.Register(kind string, handler jobs.Handler) error` and `Run(context.Context) error` with graceful shutdown.
 
-- [ ] **Step 1: Write failing migration and queue integration tests**
+- [x] **Step 1: Write failing migration and queue integration tests**
 
 Add `TestMigrateCreatesRequiredTables`, `TestEnqueueIsIdempotent`, `TestClaimSkipsLeasedJob`, `TestExpiredLeaseCanBeReclaimed`, `TestStaleLeaseCannotCompleteOrFail`, `TestRetryBackoffAndAttemptExhaustion`, and `TestParallelClaimsAreUnique`. Assert the presence of every entity named in the spec, a repeated idempotency key returning the same job ID, and fencing-token ownership for every state change.
 
-- [ ] **Step 2: Run tests against PostgreSQL and verify failure**
+- [x] **Step 2: Run tests against PostgreSQL and verify failure**
 
 Run: `docker compose up -d db && make wait-test-db && TEST_DATABASE_URL=postgres://next_game_crush_test:next_game_crush_test@localhost:55432/next_game_crush_test?sslmode=disable GOWORK=off go test ./internal/store ./internal/jobs`
 
 Expected: FAIL because migrations and queue do not exist.
 
-- [ ] **Step 3: Add schema and typed SQL**
+- [x] **Step 3: Add schema and typed SQL**
 
 Enable the `vector` extension. Use `github.com/google/uuid` at domain boundaries and define explicit repository conversions for sqlc/pgx UUID values, including nullability. Map vectors through `pgvector-go` and add an insert/read/cosine-query round trip. Use UUID primary keys for application entities, Steam AppID as `BIGINT`, SteamID as text, `vector(1536)` for embeddings, JSONB only for source snapshots and algorithm metadata, and unique constraints for sync/delivery idempotency keys.
 
-- [ ] **Step 4: Implement queue leasing**
+- [x] **Step 4: Implement queue leasing**
 
 Claim jobs transactionally with `FOR UPDATE SKIP LOCKED` and issue a new fencing token on every claim. Renewal, completion, and failure updates match job ID, running status, worker ID, and fencing token. A failed job increments attempts, records the error, and moves to `retryable` or `dead` according to `max_attempts`. Wire the worker into `app.App` and stop it through the parent context.
 
-- [ ] **Step 5: Generate queries and verify**
+- [x] **Step 5: Generate queries and verify**
 
 Run: `make sqlc && TEST_DATABASE_URL=postgres://next_game_crush_test:next_game_crush_test@localhost:55432/next_game_crush_test?sslmode=disable GOWORK=off go test ./internal/store ./internal/jobs`
 
 Expected: PASS, including idempotency and competing-worker tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add db sqlc.yaml internal/store internal/jobs internal/app go.mod go.sum Makefile docker-compose.yml
@@ -194,31 +194,31 @@ git commit -m "feat: add persistence and PostgreSQL job queue"
 - Produces: `auth.Middleware(next http.Handler) http.Handler` and `auth.RequireCSRF(next http.Handler) http.Handler`.
 - Produces: `GET /auth/steam`, `GET /auth/steam/callback`, `POST /auth/logout`, and `GET /api/me`.
 
-- [ ] **Step 1: Write failing authentication tests**
+- [x] **Step 1: Write failing authentication tests**
 
 Add tests named `TestCompleteAcceptsVerifiedAllowlistedSteamID`, `TestCompleteRejectsDifferentSteamID`, `TestCompleteRejectsInvalidReturnTo`, `TestCompleteRejectsUnsolicitedOrReplayedState`, `TestCompleteRejectsClaimedIDProviderMismatch`, `TestLoginRotatesSession`, `TestSessionExpires`, `TestLogoutInvalidatesSession`, `TestSessionCookieIsHTTPOnlySameSite`, `TestHTTPSCookieIsSecure`, `TestMutationRejectsMissingOrWrongCSRF`, and `TestFixtureAuthCannotStartOutsideTestHarness`.
 
-- [ ] **Step 2: Verify the tests fail**
+- [x] **Step 2: Verify the tests fail**
 
 Run: `go test ./internal/auth ./internal/httpapi -run 'Auth|Steam|Session|CSRF|Complete'`
 
 Expected: FAIL because authentication is not implemented.
 
-- [ ] **Step 3: Implement OpenID verification and allowlisting**
+- [x] **Step 3: Implement OpenID verification and allowlisting**
 
 Validate the provider response server-side, extract the 64-bit SteamID from the claimed ID, compare it exactly with `ALLOWED_STEAM_ID`, upsert the user/account, rotate the session ID after login, and validate the configured realm and return URL.
 
-- [ ] **Step 4: Add the login UI**
+- [x] **Step 4: Add the login UI**
 
 Show what data will be imported, a Steam login button, private-data limitations, authenticated identity, and logout. Fetch `/api/me` on application startup.
 
-- [ ] **Step 5: Verify authentication behavior**
+- [x] **Step 5: Verify authentication behavior**
 
 Run: `go test ./internal/auth ./internal/httpapi && pnpm --dir web run build`
 
 Expected: PASS and frontend production build succeeds.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add internal/auth internal/httpapi db/queries/users.sql web/src
@@ -248,27 +248,27 @@ git commit -m "feat: add allowlisted Steam OpenID login"
 - Produces: `Achievements(ctx, steamID string, appID int64) (steam.AchievementSummary, steam.Availability, error)`.
 - Produces: `GameDetails(ctx, appID int64) (steam.GameDetails, error)`.
 
-- [ ] **Step 1: Write fixture-based failing contract tests**
+- [x] **Step 1: Write fixture-based failing contract tests**
 
 Cover normal public responses, empty wishlist, missing achievements, malformed release dates, HTTP 429 retry metadata, and a private profile. Assert that private or absent data returns a typed `Availability` and does not masquerade as an empty successful import.
 
-- [ ] **Step 2: Verify contract tests fail without network access**
+- [x] **Step 2: Verify contract tests fail without network access**
 
 Run: `go test ./internal/steam`
 
 Expected: FAIL because the adapter is absent.
 
-- [ ] **Step 3: Implement the HTTP adapters**
+- [x] **Step 3: Implement the HTTP adapters**
 
 Use injected `http.Client` and base URLs so tests use `httptest.Server`. Add request timeouts, bounded concurrency, `Retry-After` parsing, response-size limits, and sanitized errors that never contain the Web API key.
 
-- [ ] **Step 4: Verify all adapter states**
+- [x] **Step 4: Verify all adapter states**
 
 Run: `go test ./internal/steam -race`
 
 Expected: PASS with no live Steam calls.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/steam
@@ -304,35 +304,35 @@ git commit -m "feat: add typed Steam API adapters"
 - Produces: `POST /api/sync` and `GET /api/sync/{id}`.
 - Produces: registered job handlers for `steam.sync`, `catalog.refresh`, and `achievements.sync`, with versioned payload schemas and parent-workflow completion only after required child stages finish.
 
-- [ ] **Step 1: Write failing date and achievement-selection tests**
+- [x] **Step 1: Write failing date and achievement-selection tests**
 
 Assert exact dates, localized month/year, quarter, year, `Coming Soon`, and malformed text map to the correct precision without a fabricated day. Assert target selection is capped at 30 and orders games by recency, playtime, then stable AppID.
 
-- [ ] **Step 2: Write failing synchronization tests**
+- [x] **Step 2: Write failing synchronization tests**
 
 Add `TestSyncIsIdempotent`, `TestSyncAddsWishlistGameToCatalog`, `TestSyncPreservesSnapshotWhenProfileBecomesPrivate`, and `TestReleaseChangeAppendsHistory`. Use fake Steam clients and a real test database.
 
-- [ ] **Step 3: Run and verify failure**
+- [x] **Step 3: Run and verify failure**
 
 Run: `go test ./internal/catalog ./internal/sync`
 
 Expected: FAIL because services are absent.
 
-- [ ] **Step 4: Implement the workflow and catalog seed**
+- [x] **Step 4: Implement the workflow and catalog seed**
 
 Make each stage independently idempotent. Persist availability and fetch time separately from data rows. Seed 20 AppIDs manually reviewed from Steam's visible upcoming-release pages on the implementation date, recording the source URL and observed date beside each entry; append unreleased wishlist AppIDs before metadata refresh. Manual seed curation is a development input, never an automated HTML scraper.
 
-- [ ] **Step 5: Add authenticated sync endpoints**
+- [x] **Step 5: Add authenticated sync endpoints**
 
 Return HTTP 202 with a job ID from `POST /api/sync`; expose stage, progress, last successful fetch time, and sanitized error details from the status endpoint. Require authentication and a valid CSRF token, and test both negative cases. Register the handlers with the worker and test enqueue-to-completion through a real queue.
 
-- [ ] **Step 6: Verify workflow behavior**
+- [x] **Step 6: Verify workflow behavior**
 
 Run: `go test ./internal/catalog ./internal/sync ./internal/httpapi -race`
 
 Expected: PASS, including private-profile snapshot preservation and duplicate prevention.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add catalog_seed.json internal/catalog internal/sync internal/httpapi db/queries/catalog.sql db/queries/library.sql internal/jobs internal/app internal/store/sqlc
@@ -367,31 +367,31 @@ git commit -m "feat: synchronize Steam profile and release catalog"
 - Produces: `ClassifyFeedback(ctx, ai.FeedbackText) (ai.FeedbackClassification, error)`.
 - Produces: `Embed(ctx, []string) ([][]float32, error)`.
 
-- [ ] **Step 1: Write failing schema and failure-mode tests**
+- [x] **Step 1: Write failing schema and failure-mode tests**
 
 Assert strict decoding for every structured output, rejection of unknown evidence IDs, free-text length enforcement, redaction of secrets, refusal detection, timeout propagation, invalid-vector dimension rejection, no persistence of invalid output, and deterministic disabled-capability behavior when `OPENAI_API_KEY` is absent.
 
-- [ ] **Step 2: Verify tests fail**
+- [x] **Step 2: Verify tests fail**
 
 Run: `go test ./internal/ai`
 
 Expected: FAIL because the adapter and schemas do not exist.
 
-- [ ] **Step 3: Implement OpenAI REST calls**
+- [x] **Step 3: Implement OpenAI REST calls**
 
 Use the Responses API with strict JSON Schema for generation and `/v1/embeddings` for vectors. Request exactly 1536 dimensions and reject any other returned length. Send only normalized game evidence and opaque local evidence keys; never send SteamID, API keys, session IDs, or email data. Register versioned `ai.features`, `ai.embedding`, and `ai.profile_summary` job handlers.
 
-- [ ] **Step 4: Implement content-hash caching**
+- [x] **Step 4: Implement content-hash caching**
 
 Hash canonical model ID, schema version, prompt version, and normalized input. Reuse the latest valid result for the same hash; an error must leave the previous valid row unchanged.
 
-- [ ] **Step 5: Verify the adapter without live calls**
+- [x] **Step 5: Verify the adapter without live calls**
 
 Run: `go test ./internal/ai -race`
 
 Expected: PASS using fixtures and `httptest.Server` only.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add internal/ai db/queries/features.sql db/queries/embeddings.sql internal/jobs internal/app internal/store/sqlc
@@ -428,39 +428,39 @@ git commit -m "feat: add structured OpenAI and embedding adapters"
 - Produces: `GET /api/profile`, `GET /api/calendar`, and `GET /api/recommendations/{id}`.
 - Produces: registered `profile.rebuild` and `recommendations.rebuild` handlers; completion records the new profile/ranking versions.
 
-- [ ] **Step 1: Write failing vector-profile tests**
+- [x] **Step 1: Write failing vector-profile tests**
 
 Assert weighted positive and negative centroids, safe handling of zero vectors, sparse profiles, deterministic ordering for ties, and no NaN/Inf values.
 
-- [ ] **Step 2: Write failing scoring tests**
+- [x] **Step 2: Write failing scoring tests**
 
 Use the exact weights from the spec. Assert wishlist adds 30, semantic similarity contributes at most 25, one dislike applies a soft penalty rather than a hard exclusion, repeated explicit feedback can exclude, uncertainty subtracts 5, and output clamps to 0–100.
 
-- [ ] **Step 3: Write failing service tests**
+- [x] **Step 3: Write failing service tests**
 
 Assert candidate retrieval excludes released and explicitly hidden games, persists factor snapshots and algorithm version, uses template explanations after an OpenAI refusal, and returns deterministic results when embeddings are absent.
 
-- [ ] **Step 4: Run and verify failure**
+- [x] **Step 4: Run and verify failure**
 
 Run: `go test ./internal/profile ./internal/recommendations`
 
 Expected: FAIL because profile and ranking services are absent.
 
-- [ ] **Step 5: Implement profile and retrieval**
+- [x] **Step 5: Implement profile and retrieval**
 
 Generate positive/negative centroids, retrieve nearest upcoming games with `pgvector`, merge mandatory wishlist candidates, and pass the bounded candidate set to deterministic scoring.
 
-- [ ] **Step 6: Implement scoring and grounded explanations**
+- [x] **Step 6: Implement scoring and grounded explanations**
 
 Persist every factor before requesting an explanation. Supply only those evidence rows to OpenAI; fall back to a template built from the same factors.
 
-- [ ] **Step 7: Add read APIs and verify**
+- [x] **Step 7: Add read APIs and verify**
 
 Run: `go test ./internal/profile ./internal/recommendations ./internal/httpapi -race`
 
 Expected: PASS, including sparse-profile and OpenAI-fallback cases.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add internal/profile internal/recommendations internal/httpapi db/queries/profiles.sql db/queries/recommendations.sql internal/jobs internal/app internal/store/sqlc
@@ -491,31 +491,31 @@ git commit -m "feat: add semantic profiles and deterministic ranking"
 - Produces: month grid, agenda, filters, sync status, profile evidence, and recommendation detail UI.
 - Produces: `bucketRelease(window: ReleaseWindow): CalendarBucket`.
 
-- [ ] **Step 1: Write failing date-bucket and calendar tests**
+- [x] **Step 1: Write failing date-bucket and calendar tests**
 
 Assert an exact date appears on the correct day, month/quarter/year/coming-soon/unknown values appear only in their named buckets, filters affect grid and agenda identically, and no imprecise value receives a fabricated day.
 
-- [ ] **Step 2: Run frontend tests and verify failure**
+- [x] **Step 2: Run frontend tests and verify failure**
 
 Run: `pnpm --dir web test --run`
 
 Expected: FAIL because components and bucketing do not exist.
 
-- [ ] **Step 3: Implement data hooks and loading/error states**
+- [x] **Step 3: Implement data hooks and loading/error states**
 
 Poll an active sync job with bounded backoff. Distinguish unavailable, stale, incomplete, failed, and ready states in visible copy.
 
-- [ ] **Step 4: Implement profile and calendar views**
+- [x] **Step 4: Implement profile and calendar views**
 
 Render a responsive month grid, week agenda, release-window buckets, evidence drawer, wishlist marker, score, confidence, and deterministic/AI explanation source.
 
-- [ ] **Step 5: Verify UI behavior and production build**
+- [x] **Step 5: Verify UI behavior and production build**
 
 Run: `pnpm --dir web test --run && pnpm --dir web run typecheck && pnpm --dir web run build`
 
 Expected: tests, typecheck, and production build PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add web
@@ -544,35 +544,35 @@ git commit -m "feat: add profile and release calendar UI"
 - Produces: `POST /api/recommendations/{id}/feedback` and `POST /api/recommendations/{id}/reminder`.
 - Produces: `GET /api/rankings/{version}/diff` with rebuild status, current version, and added/removed/reordered recommendation IDs.
 
-- [ ] **Step 1: Write failing service tests**
+- [x] **Step 1: Write failing service tests**
 
 Add `TestRecordIsIdempotent`, `TestLowConfidenceTextDoesNotChangeProfile`, `TestLikeRaisesRelatedCandidate`, `TestSingleDislikeDoesNotBanGenre`, and `TestTextOver500CharactersIsRejected`.
 
-- [ ] **Step 2: Write failing handler and component tests**
+- [x] **Step 2: Write failing handler and component tests**
 
 Assert authentication and CSRF are required, the UI accepts a predefined reason plus optional text, displays pending re-ranking, and marks added/removed/reordered results after refresh.
 
-- [ ] **Step 3: Run and verify failure**
+- [x] **Step 3: Run and verify failure**
 
 Run: `go test ./internal/feedback ./internal/httpapi && pnpm --dir web test --run FeedbackForm`
 
 Expected: FAIL because the feedback loop is absent.
 
-- [ ] **Step 4: Implement feedback persistence and classification**
+- [x] **Step 4: Implement feedback persistence and classification**
 
 Persist the original recommendation snapshot before classification. Apply only high-confidence structured signals automatically; enqueue versioned `feedback.classify`, profile rebuild, and recommendation rebuild jobs with stable idempotency keys. Scope keys to the event/workflow ID so retries deduplicate while later legitimate feedback and sync workflows still run.
 
-- [ ] **Step 5: Implement feedback UI and visible changes**
+- [x] **Step 5: Implement feedback UI and visible changes**
 
 Use optimistic reaction state only for the saved event, not for the new ranking. Poll the accepted rebuild job, then fetch and display the server-computed ranking diff. Require authentication and CSRF for feedback and reminder endpoints and test both failures.
 
-- [ ] **Step 6: Verify the full feedback loop**
+- [x] **Step 6: Verify the full feedback loop**
 
 Run: `go test ./internal/feedback ./internal/httpapi ./internal/recommendations -race && pnpm --dir web test --run && pnpm --dir web run build`
 
 Expected: PASS, including idempotency, confidence threshold, and visible ranking-diff tests.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add internal/feedback internal/httpapi db/queries/feedback.sql web/src internal/jobs internal/app internal/store/sqlc
@@ -604,35 +604,35 @@ git commit -m "feat: learn from structured and free-text feedback"
 - Produces: `notifications.Service.SendTestDigest(ctx, userID uuid.UUID) (deliveryID uuid.UUID, error)`.
 - Produces: `POST /api/digests/test` and `GET /actions/feedback/{token}`.
 
-- [ ] **Step 1: Write failing signing and digest tests**
+- [x] **Step 1: Write failing signing and digest tests**
 
 Assert token expiry, signature tampering, purpose/recommendation binding, duplicate delivery-job prevention, deterministic ordering, no repeated unchanged recommendations, escaped user/game text in HTML, failure before SMTP acceptance returning to retryable state, and failure after SMTP acceptance/before database confirmation becoming `ambiguous` rather than automatically resending.
 
-- [ ] **Step 2: Write failing email-action tests**
+- [x] **Step 2: Write failing email-action tests**
 
 Assert a valid link records exactly one feedback event without opening a session, while expired, altered, or replayed action tokens fail safely.
 
-- [ ] **Step 3: Run and verify failure**
+- [x] **Step 3: Run and verify failure**
 
 Run: `go test ./internal/notifications ./internal/httpapi -run 'Digest|Signer|EmailAction'`
 
 Expected: FAIL because notification services are absent.
 
-- [ ] **Step 4: Implement digest composition and SMTP delivery**
+- [x] **Step 4: Implement digest composition and SMTP delivery**
 
 Include upcoming wishlist releases, top new recommendations, grounded explanations, and Like/Dislike/Remind links. Use a delivery idempotency key based on user, digest kind, content hash, and ISO week. Persist `pending`, `sending`, `sent`, `failed`, and `ambiguous` states with attempt ownership. Never claim unconditional exactly-once SMTP delivery: an ambiguous attempt requires manual inspection or an explicit resend action.
 
-- [ ] **Step 5: Implement signed email actions**
+- [x] **Step 5: Implement signed email actions**
 
 Tokens contain only opaque IDs, action, issued-at, expiry, nonce, and signature. Mark a nonce consumed transactionally with recording feedback. Require authentication and CSRF for `POST /api/digests/test`; register the digest handler with the worker.
 
-- [ ] **Step 6: Verify against Mailpit**
+- [x] **Step 6: Verify against Mailpit**
 
 Run: `docker compose up -d db mailpit && go test ./internal/notifications ./internal/httpapi -race`
 
 Expected: PASS; a manual `POST /api/digests/test` in the running app produces one readable Mailpit message.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add internal/notifications internal/httpapi db/queries/notifications.sql web/src internal/jobs internal/app internal/store/sqlc
@@ -663,45 +663,45 @@ git commit -m "feat: add signed local recommendation digest"
 - Produces: `GET /api/jobs`, expanded `GET /api/health`, and `DELETE /api/data`.
 - Produces: `make verify` as the single complete verification command.
 
-- [ ] **Step 1: Write failing deletion and diagnostic tests**
+- [x] **Step 1: Write failing deletion and diagnostic tests**
 
 Assert deletion removes user-derived library, wishlist, achievements, profiles, vectors, recommendations, feedback, jobs, and deliveries while retaining shared catalog games. Assert diagnostics never return secret values or raw OpenAI prompts. Add a concurrent-worker test proving an in-flight job cannot recreate deleted user data, plus unauthenticated and wrong-CSRF deletion tests.
 
-- [ ] **Step 2: Write the failing smoke test**
+- [x] **Step 2: Write the failing smoke test**
 
 Use test-only fixture authentication and fake Steam/OpenAI servers. Prove fixture authentication fails closed unless the dedicated test-harness flag is set. Cover login, sync, achievements, profile, calendar buckets, feedback, visible re-ranking, test digest, signed email feedback, retry-safe repeated sync, and deletion.
 
-- [ ] **Step 3: Run and verify failure**
+- [x] **Step 3: Run and verify failure**
 
 Run: `go test ./internal/httpapi -run 'Delete|Diagnostic' && pnpm --dir web exec playwright test tests/e2e/smoke.spec.ts`
 
 Expected: FAIL because diagnostics, deletion, and the test harness are incomplete.
 
-- [ ] **Step 4: Implement diagnostics and deletion**
+- [x] **Step 4: Implement diagnostics and deletion**
 
 Return component state, freshness timestamps, and sanitized job errors. Delete user-owned rows in a transaction and invalidate active sessions after success.
 
-- [ ] **Step 5: Document local setup and real-account verification**
+- [x] **Step 5: Document local setup and real-account verification**
 
 Document prerequisites, environment variables, Steam profile visibility, OpenAI key setup, seed-catalog editing, startup, Mailpit, cleanup, and a manual demo script. Keep real credentials out of examples. Document `APP_BASE_URL` as the Go origin and the Vite URL as development-only.
 
-- [ ] **Step 6: Add the complete verification target**
+- [x] **Step 6: Add the complete verification target**
 
 `make verify` must create and wait for an isolated disposable test database, run migrations there, run pinned `sqlc` generation with a diff check scoped to `internal/store/sqlc`, run Go tests with race detection, frontend tests/typecheck/lint/build, install the pinned Playwright Chromium browser when absent, and run smoke tests. Configure Playwright `webServer` entries for fake services, Go, and Vite with readiness URLs; Vitest must exclude Playwright specs.
 
-- [ ] **Step 7: Run all verification**
+- [x] **Step 7: Run all verification**
 
 Run: `make verify`
 
 Expected: all migrations, generated-code checks, Go tests, frontend checks, production builds, and the end-to-end smoke test PASS.
 
-- [ ] **Step 8: Perform a real local smoke run**
+- [x] **Step 8: Perform a real local smoke run**
 
 Run: `docker compose up --build`
 
 Expected: the allowlisted Steam account can log in, complete synchronization, see recommendations in both calendar views, submit feedback, observe re-ranking, and receive one test digest in Mailpit.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add internal/httpapi web/src web/tests web/playwright.config.ts web/package.json Makefile README.md docs/local-demo.md
