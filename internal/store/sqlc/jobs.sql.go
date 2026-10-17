@@ -28,9 +28,9 @@ WITH candidate AS (
         lease_until = now() + $3::interval,
         updated_at = now()
     FROM candidate c WHERE j.id = c.id
-    RETURNING j.id, j.kind, j.idempotency_key, j.payload, j.status, j.attempts, j.max_attempts, j.available_at, j.worker_id, j.fencing_token, j.lease_until, j.last_error, j.created_at, j.updated_at, j.parent_job_id, j.required, j.stage
+    RETURNING j.id, j.kind, j.idempotency_key, j.payload, j.status, j.attempts, j.max_attempts, j.available_at, j.worker_id, j.fencing_token, j.lease_until, j.last_error, j.created_at, j.updated_at, j.parent_job_id, j.required, j.stage, j.result
 )
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage FROM claimed
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result FROM claimed
 `
 
 type ClaimJobParams struct {
@@ -57,6 +57,7 @@ type ClaimJobRow struct {
 	ParentJobID    pgtype.UUID        `json:"parent_job_id"`
 	Required       bool               `json:"required"`
 	Stage          string             `json:"stage"`
+	Result         []byte             `json:"result"`
 }
 
 func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (ClaimJobRow, error) {
@@ -80,6 +81,7 @@ func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (ClaimJobRow
 		&i.ParentJobID,
 		&i.Required,
 		&i.Stage,
+		&i.Result,
 	)
 	return i, err
 }
@@ -248,7 +250,7 @@ func (q *Queries) FinishSuccessfulAttempt(ctx context.Context, arg FinishSuccess
 }
 
 const getJobChildren = `-- name: GetJobChildren :many
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id
 `
 
 func (q *Queries) GetJobChildren(ctx context.Context, parentJobID pgtype.UUID) ([]SyncJob, error) {
@@ -278,6 +280,7 @@ func (q *Queries) GetJobChildren(ctx context.Context, parentJobID pgtype.UUID) (
 			&i.ParentJobID,
 			&i.Required,
 			&i.Stage,
+			&i.Result,
 		); err != nil {
 			return nil, err
 		}

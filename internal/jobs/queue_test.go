@@ -50,6 +50,83 @@ func TestClaimSkipsLeasedJob(t *testing.T) {
 	}
 }
 
+func TestRecordResultRequiresCurrentFencingToken(t *testing.T) {
+	queue, db := openTestQueue(t)
+	id, err := queue.Enqueue(context.Background(), Spec{Kind: "profile.rebuild", IdempotencyKey: "profile:user:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := queue.Claim(context.Background(), "worker-a", time.Minute)
+	if err != nil || lease == nil {
+		t.Fatalf("claim=%#v err=%v", lease, err)
+	}
+	stale := *lease
+	stale.FencingToken = uuid.New()
+	if err := queue.RecordResult(context.Background(), stale, map[string]any{"profileVersion": 1}); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("stale result error=%v", err)
+	}
+	if err := queue.RecordResult(context.Background(), *lease, map[string]any{"profileVersion": 2}); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := db.Pool.QueryRow(context.Background(), `SELECT (result->>'profileVersion')::int FROM sync_jobs WHERE id=$1`, id).Scan(&version); err != nil || version != 2 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+}
+
+func TestNestedRequiredFailurePromotesGrandparentWhenParentIsOptional(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	_, _ = queue.Enqueue(ctx, Spec{Kind: "sync", IdempotencyKey: "nested-root"})
+	root, _ := queue.Claim(ctx, "worker", time.Minute)
+	ready, err := queue.AwaitChildren(ctx, *root, []Spec{{Kind: "feature", IdempotencyKey: "nested-feature", Optional: true, MaxAttempts: 1}})
+	if err != nil || ready {
+		t.Fatalf("feature wait ready=%v err=%v", ready, err)
+	}
+	feature, _ := queue.Claim(ctx, "worker", time.Minute)
+	ready, err = queue.AwaitChildren(ctx, *feature, []Spec{{Kind: "embedding", IdempotencyKey: "nested-embedding", Required: true, MaxAttempts: 1}})
+	if err != nil || ready {
+		t.Fatalf("embedding wait ready=%v err=%v", ready, err)
+	}
+	embedding, _ := queue.Claim(ctx, "worker", time.Minute)
+	if err := queue.Fail(ctx, *embedding, errors.New("embedding failed"), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var rootStatus, featureStatus string
+	if err := db.Pool.QueryRow(ctx, `SELECT r.status,f.status FROM sync_jobs r JOIN sync_jobs f ON f.parent_job_id=r.id WHERE r.id=$1`, root.ID).Scan(&rootStatus, &featureStatus); err != nil {
+		t.Fatal(err)
+	}
+	if rootStatus != "queued" || featureStatus != "dead" {
+		t.Fatalf("root/feature=%s/%s, want queued/dead", rootStatus, featureStatus)
+	}
+}
+
+func TestNestedExpiredRequiredLeasePromotesGrandparentWhenParentIsOptional(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	_, _ = queue.Enqueue(ctx, Spec{Kind: "sync", IdempotencyKey: "expired-root"})
+	root, _ := queue.Claim(ctx, "worker", time.Minute)
+	_, _ = queue.AwaitChildren(ctx, *root, []Spec{{Kind: "feature", IdempotencyKey: "expired-feature", Optional: true, MaxAttempts: 1}})
+	feature, _ := queue.Claim(ctx, "worker", time.Minute)
+	_, _ = queue.AwaitChildren(ctx, *feature, []Spec{{Kind: "embedding", IdempotencyKey: "expired-embedding", Required: true, MaxAttempts: 1}})
+	embedding, _ := queue.Claim(ctx, "worker", 15*time.Millisecond)
+	if embedding == nil {
+		t.Fatal("embedding not claimed")
+	}
+	time.Sleep(30 * time.Millisecond)
+	reclaimed, err := queue.Claim(ctx, "next-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed == nil || reclaimed.ID != root.ID {
+		t.Fatalf("reclaimed=%#v, want root %s", reclaimed, root.ID)
+	}
+	var featureStatus string
+	if err := db.Pool.QueryRow(ctx, `SELECT status FROM sync_jobs WHERE id=$1`, feature.ID).Scan(&featureStatus); err != nil || featureStatus != "dead" {
+		t.Fatalf("feature=%s err=%v", featureStatus, err)
+	}
+}
+
 func TestExpiredLeaseCanBeReclaimed(t *testing.T) {
 	queue, _ := openTestQueue(t)
 	id, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: "reclaim"})

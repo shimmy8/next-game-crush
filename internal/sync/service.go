@@ -46,12 +46,13 @@ type Status struct {
 }
 
 type Service struct {
-	store   *store.Store
-	queue   *jobs.Queue
-	client  steam.Client
-	catalog *catalog.Service
-	now     func() time.Time
-	aiJobs  AIJobPlanner
+	store       *store.Store
+	queue       *jobs.Queue
+	client      steam.Client
+	catalog     *catalog.Service
+	now         func() time.Time
+	aiJobs      AIJobPlanner
+	rankingJobs bool
 }
 
 type AIJobPlanner interface {
@@ -59,6 +60,7 @@ type AIJobPlanner interface {
 }
 
 func (s *Service) SetAIJobPlanner(planner AIJobPlanner) { s.aiJobs = planner }
+func (s *Service) EnableRankingJobs()                   { s.rankingJobs = true }
 
 func NewService(database *store.Store, queue *jobs.Queue, client steam.Client, catalogService *catalog.Service) (*Service, error) {
 	if database == nil || queue == nil || client == nil || catalogService == nil {
@@ -137,22 +139,67 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 		return fmt.Errorf("inspect synchronization stages: %w", err)
 	}
 	if len(childJobs) > 0 {
+		hasAI, hasProfile, hasRecommendations := false, false, false
 		for _, child := range childJobs {
+			switch child.Stage {
+			case "ai_features":
+				hasAI = true
+			case "profile":
+				hasProfile = true
+			case "recommendations":
+				hasRecommendations = true
+			}
 			if child.Required && child.Status != "succeeded" {
 				return errors.New("required synchronization stage is incomplete")
 			}
 		}
-		if s.aiJobs != nil {
+		if s.aiJobs != nil && !hasAI {
 			specs, err := s.aiJobs.PlanFeatureJobs(ctx, payload.UserID, lease.IdempotencyKey)
 			if err != nil {
 				return err
 			}
-			for _, spec := range specs {
-				// AI is optional: enqueue independent workflows so exhausted AI
-				// retries never dead-letter the successful Steam synchronization.
-				if _, err := s.queue.Enqueue(ctx, spec); err != nil {
+			if !s.rankingJobs {
+				for _, spec := range specs {
+					if _, err := s.queue.Enqueue(ctx, spec); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			for i := range specs {
+				specs[i].Optional = true
+				specs[i].Required = false
+			}
+			if len(specs) > 0 {
+				ready, err := s.queue.AwaitChildren(ctx, lease, specs)
+				if err != nil {
 					return err
 				}
+				if !ready {
+					return jobs.ErrDeferred
+				}
+			}
+		}
+		if !s.rankingJobs {
+			return nil
+		}
+		encoded, _ := json.Marshal(payload)
+		if !hasProfile {
+			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "profile.rebuild", Stage: "profile", Required: true, IdempotencyKey: lease.IdempotencyKey + ":profile:v1", Payload: encoded, MaxAttempts: 3}})
+			if err != nil {
+				return err
+			}
+			if !ready {
+				return jobs.ErrDeferred
+			}
+		}
+		if !hasRecommendations {
+			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: lease.IdempotencyKey + ":recommendations:v1", Payload: encoded, MaxAttempts: 3}})
+			if err != nil {
+				return err
+			}
+			if !ready {
+				return jobs.ErrDeferred
 			}
 		}
 		return nil

@@ -149,6 +149,7 @@ type PreferenceProfile struct {
 	InputContentHash  pgtype.Text        `json:"input_content_hash"`
 	AlgorithmMetadata []byte             `json:"algorithm_metadata"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	BuildKey          pgtype.Text        `json:"build_key"`
 }
 
 type ProfileEmbedding struct {
@@ -173,12 +174,26 @@ type Recommendation struct {
 	Explanation                 pgtype.Text        `json:"explanation"`
 	ExplanationInputContentHash pgtype.Text        `json:"explanation_input_content_hash"`
 	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	RankingVersion              int64              `json:"ranking_version"`
+	ExplanationEvidence         []byte             `json:"explanation_evidence"`
+	ExplanationGenerated        bool               `json:"explanation_generated"`
 }
 
 type RecommendationFactor struct {
 	RecommendationID pgtype.UUID `json:"recommendation_id"`
 	Factors          []byte      `json:"factors"`
 	Weights          []byte      `json:"weights"`
+}
+
+type RecommendationRun struct {
+	ID               pgtype.UUID        `json:"id"`
+	UserID           pgtype.UUID        `json:"user_id"`
+	ProfileID        pgtype.UUID        `json:"profile_id"`
+	RankingVersion   int64              `json:"ranking_version"`
+	AlgorithmVersion string             `json:"algorithm_version"`
+	BuildKey         string             `json:"build_key"`
+	Published        bool               `json:"published"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
 type Session struct {
@@ -218,6 +233,7 @@ type SyncJob struct {
 	ParentJobID    pgtype.UUID        `json:"parent_job_id"`
 	Required       bool               `json:"required"`
 	Stage          string             `json:"stage"`
+	Result         []byte             `json:"result"`
 }
 
 type User struct {

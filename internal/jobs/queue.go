@@ -26,6 +26,7 @@ type Spec struct {
 	AvailableAt    time.Time
 	ParentJobID    uuid.UUID
 	Required       bool
+	Optional       bool
 	Stage          string
 }
 
@@ -47,6 +48,27 @@ type Queue struct {
 
 func NewQueue(db *store.Store) *Queue {
 	return &Queue{store: db}
+}
+
+// RecordResult stores version metadata produced by a running handler. The
+// fencing predicate prevents a stale worker from overwriting a reclaimed job.
+func (q *Queue) RecordResult(ctx context.Context, lease Lease, result any) error {
+	if q == nil || q.store == nil {
+		return errors.New("queue store is required")
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("encode job result: %w", err)
+	}
+	command, err := q.store.Pool.Exec(ctx, `UPDATE sync_jobs SET result=$1,updated_at=now()
+		WHERE id=$2 AND status='running' AND worker_id=$3 AND fencing_token=$4 AND lease_until>now()`, encoded, lease.ID, lease.WorkerID, lease.FencingToken)
+	if err != nil {
+		return fmt.Errorf("record job result: %w", err)
+	}
+	if command.RowsAffected() != 1 {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 func (q *Queue) Enqueue(ctx context.Context, spec Spec) (uuid.UUID, error) {
@@ -109,7 +131,7 @@ func (q *Queue) AwaitChildren(ctx context.Context, lease Lease, specs []Spec) (r
 	queries := q.store.Queries.WithTx(tx)
 	for _, spec := range specs {
 		spec.ParentJobID = lease.ID
-		if !spec.Required {
+		if !spec.Required && !spec.Optional {
 			spec.Required = true
 		}
 		if len(spec.Payload) == 0 {
@@ -123,7 +145,7 @@ func (q *Queue) AwaitChildren(ctx context.Context, lease Lease, specs []Spec) (r
 		}
 	}
 	var pending int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE parent_job_id=$1 AND required AND status<>'succeeded'`, lease.ID).Scan(&pending); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE parent_job_id=$1 AND status NOT IN ('succeeded','dead')`, lease.ID).Scan(&pending); err != nil {
 		return false, fmt.Errorf("inspect child stages: %w", err)
 	}
 	if pending == 0 {
@@ -166,6 +188,12 @@ func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration)
 	}
 	if err := queries.FailParentsWithDeadRequiredChildren(ctx); err != nil {
 		return nil, fmt.Errorf("fail parent with dead required child: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE sync_jobs parent SET status='queued',available_at=now(),updated_at=now()
+		WHERE parent.status='waiting'
+		AND NOT EXISTS(SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.status NOT IN ('succeeded','dead'))
+		AND NOT EXISTS(SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.required AND child.status='dead')`); err != nil {
+		return nil, fmt.Errorf("promote workflows after lease cleanup: %w", err)
 	}
 	token := uuid.New()
 	row, err := queries.ClaimJob(ctx, dbgen.ClaimJobParams{
@@ -236,7 +264,8 @@ func (q *Queue) Complete(ctx context.Context, lease Lease) error {
 	}
 	if _, err := tx.Exec(ctx, `UPDATE sync_jobs parent SET status='queued', available_at=now(), updated_at=now()
 		WHERE parent.id=(SELECT parent_job_id FROM sync_jobs WHERE id=$1) AND parent.status='waiting'
-		AND NOT EXISTS (SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.required AND child.status<>'succeeded')`, lease.ID); err != nil {
+		AND NOT EXISTS (SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.status NOT IN ('succeeded','dead'))
+		AND NOT EXISTS (SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.required AND child.status='dead')`, lease.ID); err != nil {
 		return fmt.Errorf("promote completed parent: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -282,6 +311,23 @@ func (q *Queue) Fail(ctx context.Context, lease Lease, cause error, retryAt time
 		if _, err := tx.Exec(ctx, `UPDATE sync_jobs parent SET status='dead', last_error='required child stage failed', updated_at=now()
 			WHERE parent.id=(SELECT parent_job_id FROM sync_jobs WHERE id=$1) AND parent.status='waiting' AND (SELECT required FROM sync_jobs WHERE id=$1)`, lease.ID); err != nil {
 			return fmt.Errorf("fail parent workflow: %w", err)
+		}
+		// A required child may kill an optional parent (for example an embedding
+		// child of an optional AI feature stage). Wake that parent's waiting
+		// parent once every sibling is terminal; the optional failure must not
+		// strand the outer workflow.
+		if _, err := tx.Exec(ctx, `UPDATE sync_jobs grandparent SET status='queued',available_at=now(),updated_at=now()
+			WHERE grandparent.id=(SELECT parent.parent_job_id FROM sync_jobs child JOIN sync_jobs parent ON parent.id=child.parent_job_id WHERE child.id=$1 AND NOT parent.required)
+			AND grandparent.status='waiting'
+			AND NOT EXISTS(SELECT 1 FROM sync_jobs sibling WHERE sibling.parent_job_id=grandparent.id AND sibling.status NOT IN ('succeeded','dead'))
+			AND NOT EXISTS(SELECT 1 FROM sync_jobs sibling WHERE sibling.parent_job_id=grandparent.id AND sibling.required AND sibling.status='dead')`, lease.ID); err != nil {
+			return fmt.Errorf("promote grandparent after nested optional failure: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE sync_jobs parent SET status='queued',available_at=now(),updated_at=now()
+			WHERE parent.id=(SELECT parent_job_id FROM sync_jobs WHERE id=$1) AND parent.status='waiting'
+			AND NOT EXISTS(SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.status NOT IN ('succeeded','dead'))
+			AND NOT EXISTS(SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.required AND child.status='dead')`, lease.ID); err != nil {
+			return fmt.Errorf("promote parent after optional failure: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

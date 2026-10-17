@@ -15,6 +15,8 @@ import (
 	"next-game-crush/internal/config"
 	"next-game-crush/internal/httpapi"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/profile"
+	"next-game-crush/internal/recommendations"
 	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
 	syncservice "next-game-crush/internal/sync"
@@ -90,6 +92,37 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("register AI handlers: %w", err)
 	}
 	syncService.SetAIJobPlanner(aiService)
+	profileRepository, err := profile.NewSQLRepository(db, cfg.OpenAIEmbeddingModel)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure profile repository: %w", err)
+	}
+	profileService, err := profile.NewService(profileRepository)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure profile service: %w", err)
+	}
+	profileService.SetQueue(queue)
+	if err := profileService.RegisterHandlers(worker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register profile handlers: %w", err)
+	}
+	recommendationRepository, err := recommendations.NewSQLRepository(db, cfg.OpenAIEmbeddingModel, cfg.OpenAIModel)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure recommendation repository: %w", err)
+	}
+	recommendationService, err := recommendations.NewService(recommendationRepository, profileService, openAIClient)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure recommendation service: %w", err)
+	}
+	recommendationService.SetQueue(queue)
+	if err := recommendationService.RegisterHandlers(worker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register recommendation handlers: %w", err)
+	}
+	syncService.EnableRankingJobs()
 	providerClient := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret}, auth.NewSQLRepository(db), auth.NewHTTPProvider(providerClient, "https://steamcommunity.com/openid/"))
 	if err != nil {
@@ -98,6 +131,8 @@ func New(cfg config.Config) (*App, error) {
 	}
 	deps.Auth = authService
 	deps.Sync = syncService
+	deps.Profile = profileService
+	deps.Recommendations = recommendationService
 	return &App{store: db, worker: worker, server: &http.Server{
 		Addr:              ":8080",
 		Handler:           httpapi.NewRouter(deps),

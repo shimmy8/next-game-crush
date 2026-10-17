@@ -12,9 +12,11 @@ import (
 )
 
 type Dependencies struct {
-	Frontend fs.FS
-	Auth     *auth.Service
-	Sync     SyncService
+	Frontend        fs.FS
+	Auth            *auth.Service
+	Sync            SyncService
+	Profile         ProfileReadService
+	Recommendations RecommendationReadService
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -29,6 +31,13 @@ func NewRouter(deps Dependencies) http.Handler {
 		if deps.Sync != nil {
 			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/sync", startSync(deps.Sync))
 			router.With(deps.Auth.Middleware).Get("/api/sync/{id}", syncStatus(deps.Sync))
+		}
+		if deps.Profile != nil {
+			router.With(deps.Auth.Middleware).Get("/api/profile", getProfile(deps.Profile))
+		}
+		if deps.Recommendations != nil {
+			router.With(deps.Auth.Middleware).Get("/api/calendar", getCalendar(deps.Recommendations))
+			router.With(deps.Auth.Middleware).Get("/api/recommendations/{id}", getRecommendation(deps.Recommendations))
 		}
 	}
 	if deps.Frontend != nil {
