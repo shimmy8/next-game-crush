@@ -32,9 +32,9 @@ export default function RecommendationCard({ item, featured = false, compact = f
           <details className="evidence">
             <summary>Почему вам может понравиться</summary>
             <ul>{item.evidence.map((evidence) => <li key={evidence.id}>{evidence.text}</li>)}</ul>
-            <p className="source-note">Источник объяснения: {item.generatedExplanation ? 'AI, только по сохранённым фактам' : 'детерминированные факторы'}</p>
           </details>
         )}
+        {!compact && <p className="source-note">Источник объяснения: {item.generatedExplanation ? 'AI, только по сохранённым фактам' : 'детерминированные факторы'}</p>}
         {!compact && <div className="reaction-row" aria-label="Действия с рекомендацией">
           <button type="button" disabled title="Будет доступно после подключения обратной связи">Нравится</button>
           <button type="button" disabled title="Будет доступно после подключения обратной связи">Не моё</button>

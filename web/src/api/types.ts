@@ -84,5 +84,6 @@ export type DashboardLoadState =
   | { status: 'loading' }
   | { status: 'ready'; data: DashboardData }
   | { status: 'stale'; data: DashboardData; message: string }
+  | { status: 'unknown'; data: DashboardData; message: string }
   | { status: 'empty'; data: DashboardData }
   | { status: 'error'; message: string }

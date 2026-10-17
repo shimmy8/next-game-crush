@@ -50,9 +50,9 @@ export async function getCalendar(signal?: AbortSignal) {
   return normalizeCalendar(value)
 }
 
-export function startSync(csrfToken: string) {
+export function startSync(csrfToken: string, signal?: AbortSignal) {
   return requestJSON<{ jobId: string }>('/api/sync', {
-    method: 'POST', headers: { 'X-CSRF-Token': csrfToken },
+    method: 'POST', headers: { 'X-CSRF-Token': csrfToken }, signal,
   })
 }
 

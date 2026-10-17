@@ -3,6 +3,7 @@ import type { CalendarResponse, Recommendation } from '../api/types'
 import ReleaseBuckets from '../components/ReleaseBuckets'
 import ReleaseCalendar from '../components/ReleaseCalendar'
 import RecommendationCard from '../components/RecommendationCard'
+import { bucketRelease } from '../calendar/dateBuckets'
 
 type CalendarPageProps = { calendar: CalendarResponse; month?: Date }
 
@@ -21,15 +22,20 @@ export default function CalendarPage({ calendar, month = new Date() }: CalendarP
   const [minimum, setMinimum] = useState(0)
   const [precision, setPrecision] = useState('all')
   const filtered = useMemo(() => filterCalendar(calendar, wishlistOnly, minimum, precision), [calendar, wishlistOnly, minimum, precision])
-  const all = [...filtered.exactDates, ...filtered.month, ...filtered.quarter, ...filtered.year, ...filtered.comingSoon, ...filtered.tba]
+  const exactForMonth = filtered.exactDates.filter((item) => {
+    const bucket = bucketRelease(item.release)
+    if (bucket.kind !== 'exact') return false
+    const [year, monthIndex] = bucket.date.split('-').map(Number)
+    return year === visibleMonth.getUTCFullYear() && monthIndex === visibleMonth.getUTCMonth() + 1
+  }).sort((left, right) => (left.release.exactDate ?? '').localeCompare(right.release.exactDate ?? '') || left.name.localeCompare(right.name, 'ru'))
   const title = new Intl.DateTimeFormat('ru-RU', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(visibleMonth)
   const moveMonth = (delta: number) => setVisibleMonth((current) => new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + delta, 1)))
 
   return (
     <section className="calendar-section" aria-labelledby="calendar-title">
       <header className="section-heading calendar-heading">
-        <div><div className="eyebrow">Календарь релизов</div><div className="calendar-title-row"><h2 id="calendar-title">{title}</h2>{view === 'month' && <div className="month-nav"><button type="button" aria-label="Предыдущий месяц" onClick={() => moveMonth(-1)}>←</button><button type="button" aria-label="Следующий месяц" onClick={() => moveMonth(1)}>→</button></div>}</div></div>
-        <div className="view-switch" aria-label="Вид календаря">
+        <div><div className="eyebrow">Календарь релизов</div><div className="calendar-title-row"><h2 id="calendar-title">{title}</h2><div className="month-nav"><button type="button" aria-label="Предыдущий месяц" onClick={() => moveMonth(-1)}>←</button><button type="button" aria-label="Следующий месяц" onClick={() => moveMonth(1)}>→</button></div></div></div>
+        <div className="view-switch" role="group" aria-label="Вид календаря">
           <button type="button" aria-pressed={view === 'month'} onClick={() => setView('month')}>Месяц</button>
           <button type="button" aria-pressed={view === 'list'} onClick={() => setView('list')}>Список</button>
         </div>
@@ -42,9 +48,9 @@ export default function CalendarPage({ calendar, month = new Date() }: CalendarP
       {view === 'month' ? (
         <><ReleaseCalendar month={visibleMonth} items={filtered.exactDates} /><ReleaseBuckets calendar={filtered} /></>
       ) : (
-        <div className="release-list" data-testid="release-list">
-          {all.length ? all.map((item) => <RecommendationCard item={item} compact key={item.id} />) : <p className="empty-note">По этим фильтрам ничего нет.</p>}
-        </div>
+        <><div className="release-list" data-testid="release-list" aria-label={`Релизы с точной датой: ${title}`}>
+          {exactForMonth.length ? exactForMonth.map((item) => <RecommendationCard item={item} compact key={item.id} />) : <p className="empty-note">В этом месяце точных дат по фильтрам нет.</p>}
+        </div><ReleaseBuckets calendar={filtered} /></>
       )}
     </section>
   )

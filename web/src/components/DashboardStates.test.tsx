@@ -11,6 +11,15 @@ describe('DashboardPage states', () => {
     expect(screen.getByRole('heading', { name: 'Во что влюбиться дальше' })).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent('Не удалось загрузить календарь')
     expect(screen.getByRole('button', { name: 'Повторить' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Ваш следующий фаворит' })).not.toBeInTheDocument()
+    expect(screen.getByText('Ошибка загрузки')).toBeInTheDocument()
+  })
+
+  it('does not render the empty data shell while loading', () => {
+    render(<DashboardPage user={user} onLogout={() => undefined} signingOut={false} initialState={{ status: 'loading' }} />)
+    expect(screen.getByRole('status')).toHaveTextContent('Загружаем профиль и календарь')
+    expect(screen.queryByRole('heading', { name: 'Ваш следующий фаворит' })).not.toBeInTheDocument()
+    expect(screen.getByText('Проверяем данные')).toBeInTheDocument()
   })
 
   it('labels stale data and keeps it visible', () => {
