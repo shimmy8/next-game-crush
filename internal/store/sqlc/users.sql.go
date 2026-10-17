@@ -11,6 +11,56 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const createSession = `-- name: CreateSession :exec
+INSERT INTO sessions (id, user_id, csrf_token, expires_at) VALUES ($1, $2, $3, $4)
+`
+
+type CreateSessionParams struct {
+	ID        pgtype.UUID        `json:"id"`
+	UserID    pgtype.UUID        `json:"user_id"`
+	CsrfToken string             `json:"csrf_token"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+}
+
+func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) error {
+	_, err := q.db.Exec(ctx, createSession,
+		arg.ID,
+		arg.UserID,
+		arg.CsrfToken,
+		arg.ExpiresAt,
+	)
+	return err
+}
+
+const deleteSession = `-- name: DeleteSession :exec
+DELETE FROM sessions WHERE id = $1
+`
+
+func (q *Queries) DeleteSession(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteSession, id)
+	return err
+}
+
+const getSteamAccountBySteamID = `-- name: GetSteamAccountBySteamID :one
+SELECT user_id, steam_id, display_name, avatar_url, source, last_successful_fetch_at, availability, raw_snapshot FROM steam_accounts WHERE steam_id = $1
+`
+
+func (q *Queries) GetSteamAccountBySteamID(ctx context.Context, steamID string) (SteamAccount, error) {
+	row := q.db.QueryRow(ctx, getSteamAccountBySteamID, steamID)
+	var i SteamAccount
+	err := row.Scan(
+		&i.UserID,
+		&i.SteamID,
+		&i.DisplayName,
+		&i.AvatarUrl,
+		&i.Source,
+		&i.LastSuccessfulFetchAt,
+		&i.Availability,
+		&i.RawSnapshot,
+	)
+	return i, err
+}
+
 const getUser = `-- name: GetUser :one
 SELECT id, created_at, updated_at FROM users WHERE id = $1
 `
@@ -19,6 +69,34 @@ func (q *Queries) GetUser(ctx context.Context, id pgtype.UUID) (User, error) {
 	row := q.db.QueryRow(ctx, getUser, id)
 	var i User
 	err := row.Scan(&i.ID, &i.CreatedAt, &i.UpdatedAt)
+	return i, err
+}
+
+const upsertSteamAccount = `-- name: UpsertSteamAccount :one
+INSERT INTO steam_accounts (user_id, steam_id, source, availability)
+VALUES ($1, $2, 'steam', 'unknown')
+ON CONFLICT (steam_id) DO UPDATE SET steam_id = EXCLUDED.steam_id
+RETURNING user_id, steam_id, display_name, avatar_url, source, last_successful_fetch_at, availability, raw_snapshot
+`
+
+type UpsertSteamAccountParams struct {
+	UserID  pgtype.UUID `json:"user_id"`
+	SteamID string      `json:"steam_id"`
+}
+
+func (q *Queries) UpsertSteamAccount(ctx context.Context, arg UpsertSteamAccountParams) (SteamAccount, error) {
+	row := q.db.QueryRow(ctx, upsertSteamAccount, arg.UserID, arg.SteamID)
+	var i SteamAccount
+	err := row.Scan(
+		&i.UserID,
+		&i.SteamID,
+		&i.DisplayName,
+		&i.AvatarUrl,
+		&i.Source,
+		&i.LastSuccessfulFetchAt,
+		&i.Availability,
+		&i.RawSnapshot,
+	)
 	return i, err
 }
 

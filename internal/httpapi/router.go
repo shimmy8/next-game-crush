@@ -8,16 +8,24 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"next-game-crush/internal/auth"
 )
 
 type Dependencies struct {
 	Frontend fs.FS
+	Auth     *auth.Service
 }
 
 func NewRouter(deps Dependencies) http.Handler {
 	router := chi.NewRouter()
 	router.Use(middleware.Recoverer)
 	router.Get("/api/health", health)
+	if deps.Auth != nil {
+		router.Get("/auth/steam", beginSteamLogin(deps.Auth))
+		router.Get("/auth/steam/callback", completeSteamLogin(deps.Auth))
+		router.With(deps.Auth.Middleware).Get("/api/me", me)
+		router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/auth/logout", logout(deps.Auth))
+	}
 	if deps.Frontend != nil {
 		files := http.FileServer(http.FS(deps.Frontend))
 		router.Get("/*", func(w http.ResponseWriter, r *http.Request) {

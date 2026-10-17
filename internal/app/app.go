@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"next-game-crush/internal/auth"
 	"next-game-crush/internal/config"
 	"next-game-crush/internal/httpapi"
 	"next-game-crush/internal/jobs"
@@ -40,6 +41,13 @@ func New(cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	queue := jobs.NewQueue(db)
+	providerClient := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret}, auth.NewSQLRepository(db), auth.NewHTTPProvider(providerClient, "https://steamcommunity.com/openid/"))
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure authentication: %w", err)
+	}
+	deps.Auth = authService
 	return &App{store: db, worker: jobs.NewWorker(queue, workerID), server: &http.Server{
 		Addr:              ":8080",
 		Handler:           httpapi.NewRouter(deps),

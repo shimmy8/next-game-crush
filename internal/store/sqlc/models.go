@@ -110,6 +110,19 @@ type NotificationPreference struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type OpenidLoginState struct {
+	TokenHash  []byte             `json:"token_hash"`
+	ReturnPath string             `json:"return_path"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
+type OpenidResponseNonce struct {
+	NonceHash []byte             `json:"nonce_hash"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 type PreferenceProfile struct {
 	ID                pgtype.UUID        `json:"id"`
 	UserID            pgtype.UUID        `json:"user_id"`
