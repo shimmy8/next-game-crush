@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -35,6 +36,9 @@ type ExplanationCache interface {
 type DeckRefreshPlanner interface {
 	EnqueueDeckRefresh(context.Context, catalog.DeckRefreshTarget) error
 }
+type CatalogRebuildObserver interface {
+	CatalogRebuildFinished(context.Context, uuid.UUID, string, bool) error
+}
 type Repository interface {
 	Candidates(context.Context, uuid.UUID, profile.Profile, int) ([]Candidate, error)
 	RankingInputs(context.Context, uuid.UUID, profile.Profile, int) (RankingInputs, error)
@@ -56,12 +60,16 @@ type Service struct {
 	explanationCache   ExplanationCache
 	explanationModel   string
 	deckRefreshPlanner DeckRefreshPlanner
+	catalogRebuilds    CatalogRebuildObserver
 	eligibility        catalog.CurrentEligibilityReader
 	clock              func() time.Time
 }
 
 func (s *Service) SetQueue(queue *jobs.Queue)                       { s.queue = queue }
 func (s *Service) SetDeckRefreshPlanner(planner DeckRefreshPlanner) { s.deckRefreshPlanner = planner }
+func (s *Service) SetCatalogRebuildObserver(observer CatalogRebuildObserver) {
+	s.catalogRebuilds = observer
+}
 
 func (s *Service) enqueuePublishedDeckRefreshes(ctx context.Context, userID uuid.UUID, rankingVersion int64) error {
 	if s.deckRefreshPlanner == nil {
@@ -660,24 +668,61 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 	if worker == nil {
 		return errors.New("worker is required")
 	}
-	return worker.Register(JobKind, func(ctx context.Context, lease jobs.Lease) error {
-		var p JobPayload
-		if json.Unmarshal(lease.Payload, &p) != nil || p.Version != JobPayloadVersion || p.UserID == uuid.Nil {
-			return errors.New("unsupported recommendations job payload schema")
+	return worker.Register(JobKind, s.handleJob)
+}
+
+func (s *Service) handleJob(ctx context.Context, lease jobs.Lease) error {
+	var p JobPayload
+	if json.Unmarshal(lease.Payload, &p) != nil || p.Version != JobPayloadVersion || p.UserID == uuid.Nil {
+		return errors.New("unsupported recommendations job payload schema")
+	}
+	result, rankingVersion, explanationStats, err := s.rebuild(ctx, p.UserID, stableRebuildRequestKey(lease.IdempotencyKey))
+	if err != nil {
+		if s.catalogRebuilds != nil {
+			if observerErr := s.catalogRebuilds.CatalogRebuildFinished(ctx, p.UserID, lease.IdempotencyKey, false); observerErr != nil {
+				return errors.Join(err, observerErr)
+			}
 		}
-		result, rankingVersion, explanationStats, err := s.rebuild(ctx, p.UserID, lease.IdempotencyKey)
+		return err
+	}
+	if s.catalogRebuilds != nil {
+		if err := s.catalogRebuilds.CatalogRebuildFinished(ctx, p.UserID, lease.IdempotencyKey, true); err != nil {
+			return err
+		}
+	}
+	if s.queue != nil {
+		profileValue, err := s.profiles.Latest(ctx, p.UserID)
 		if err != nil {
 			return err
 		}
-		if s.queue != nil {
-			profileValue, err := s.profiles.Latest(ctx, p.UserID)
-			if err != nil {
-				return err
-			}
-			if err := s.queue.RecordResult(ctx, lease, map[string]any{"profileVersion": profileValue.Version, "rankingVersion": rankingVersion, "algorithmVersion": AlgorithmVersion, "recommendationCount": len(result), "explanations": explanationStats}); err != nil {
-				return err
-			}
+		if err := s.queue.RecordResult(ctx, lease, map[string]any{"profileVersion": profileValue.Version, "rankingVersion": rankingVersion, "algorithmVersion": AlgorithmVersion, "recommendationCount": len(result), "explanations": explanationStats}); err != nil {
+			return err
 		}
-		return nil
-	})
+	}
+	return nil
+}
+
+func stableRebuildRequestKey(key string) string {
+	const prefix = "catalog:recommendations.rebuild:v2:"
+	if !strings.HasPrefix(key, prefix) {
+		return key
+	}
+	retry := strings.LastIndex(key, ":retry:")
+	if retry <= len(prefix) || retry+len(":retry:") >= len(key) {
+		return key
+	}
+	if _, err := strconv.Atoi(key[retry+len(":retry:"):]); err != nil {
+		return key
+	}
+	identity := strings.Split(key[len(prefix):retry], ":")
+	if len(identity) != 2 {
+		return key
+	}
+	if _, err := uuid.Parse(identity[0]); err != nil {
+		return key
+	}
+	if revision, err := strconv.ParseInt(identity[1], 10, 64); err != nil || revision < 1 {
+		return key
+	}
+	return key[:retry]
 }

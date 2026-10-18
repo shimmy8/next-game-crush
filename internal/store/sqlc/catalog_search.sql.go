@@ -817,7 +817,7 @@ func (q *Queries) InsertSearchObservation(ctx context.Context, arg InsertSearchO
 const listDueEligibilityChanges = `-- name: ListDueEligibilityChanges :many
 SELECT steam_app_id, run_revision, observation_ordinal, first_seen_at, last_seen_at, priority, release_text, precision, release_date, release_year, release_month, release_quarter, coming_soon, fingerprint, review_band, review_label, positive_percent, review_total, review_observed_at, last_successful_appdetails_at, next_refresh_at, semantic_content_hash, active, tombstone_reason, retry_generation, retry_attempts, next_retry_at, next_eligibility_at, safe_error, material_run_revision, material_observation_ordinal, material_fingerprint FROM catalog_search_current
 WHERE next_eligibility_at<=$1
-ORDER BY next_eligibility_at,steam_app_id LIMIT $2
+ORDER BY steam_app_id LIMIT $2
 `
 
 type ListDueEligibilityChangesParams struct {
@@ -1800,6 +1800,36 @@ func (q *Queries) ReserveCatalogBudget(ctx context.Context, arg ReserveCatalogBu
 		&i.Used,
 	)
 	return i, err
+}
+
+const resolveDueEligibilityChange = `-- name: ResolveDueEligibilityChange :execrows
+UPDATE catalog_search_current SET active=$1,tombstone_reason=$2,
+    next_eligibility_at=$3
+WHERE steam_app_id=$4 AND next_eligibility_at=$5
+`
+
+type ResolveDueEligibilityChangeParams struct {
+	Active            bool               `json:"active"`
+	TombstoneReason   string             `json:"tombstone_reason"`
+	NextEligibilityAt pgtype.Timestamptz `json:"next_eligibility_at"`
+	SteamAppID        int64              `json:"steam_app_id"`
+	ExpectedAt        pgtype.Timestamptz `json:"expected_at"`
+}
+
+// A published ranking is the fence for advancing a clock deadline. A newer
+// qualification observation wins and makes this compare-and-set a no-op.
+func (q *Queries) ResolveDueEligibilityChange(ctx context.Context, arg ResolveDueEligibilityChangeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resolveDueEligibilityChange,
+		arg.Active,
+		arg.TombstoneReason,
+		arg.NextEligibilityAt,
+		arg.SteamAppID,
+		arg.ExpectedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const searchCatalogNeedsInitial = `-- name: SearchCatalogNeedsInitial :one

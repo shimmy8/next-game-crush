@@ -161,7 +161,7 @@ func (r *SearchRepository) resolveSearchCandidateWithoutStore(ctx context.Contex
 				return false, err
 			}
 			if changed {
-				if err := NewDiscoveryRepository(r.store).MarkCandidatesChanged(ctx, tx, now); err != nil {
+				if err := NewDiscoveryRepository(r.store).MarkCandidateSetDirtyAt(ctx, tx, EligibilityChange{GameID: uuid.UUID(game.ID.Bytes), Kind: EligibilityChangeMembership}, now); err != nil {
 					return false, err
 				}
 			}
@@ -228,7 +228,7 @@ func (r *SearchRepository) resolveSearchCandidateWithoutStore(ctx context.Contex
 					return false, err
 				}
 				if changed {
-					if err := NewDiscoveryRepository(r.store).MarkCandidatesChanged(ctx, tx, now); err != nil {
+					if err := NewDiscoveryRepository(r.store).MarkCandidateSetDirtyAt(ctx, tx, EligibilityChange{GameID: uuid.UUID(game.ID.Bytes), Kind: EligibilityChangeReviewEligibility, NextChangeAt: decision.NextChangeAt}, now); err != nil {
 						return false, err
 					}
 				}
@@ -325,7 +325,7 @@ func (r *DiscoveryRepository) persistSearchQualificationFailure(ctx context.Cont
 					return sourceErr
 				}
 				if changed {
-					if err := r.MarkCandidatesChanged(ctx, tx, now); err != nil {
+					if err := r.MarkCandidateSetDirtyAt(ctx, tx, EligibilityChange{GameID: uuid.UUID(game.ID.Bytes), Kind: EligibilityChangeMembership}, now); err != nil {
 						return err
 					}
 				}
@@ -483,7 +483,11 @@ func (r *DiscoveryRepository) persistSearchQualification(ctx context.Context, le
 			}
 		}
 		if changed {
-			if err := r.MarkCandidatesChanged(ctx, tx, now); err != nil {
+			if err := r.MarkCandidateSetDirtyAt(ctx, tx, EligibilityChange{GameID: gameID, Kind: EligibilityChangeMembership, NextChangeAt: decision.NextChangeAt}, now); err != nil {
+				return err
+			}
+		} else if current.SemanticContentHash != "" && current.SemanticContentHash != semanticHash {
+			if err := r.MarkCandidateSetDirtyAt(ctx, tx, EligibilityChange{GameID: gameID, Kind: EligibilityChangeSemanticContent, NextChangeAt: decision.NextChangeAt}, now); err != nil {
 				return err
 			}
 		}
@@ -493,7 +497,7 @@ func (r *DiscoveryRepository) persistSearchQualification(ctx context.Context, le
 			return sourceErr
 		}
 		if changed {
-			if err := r.MarkCandidatesChanged(ctx, tx, now); err != nil {
+			if err := r.MarkCandidateSetDirtyAt(ctx, tx, EligibilityChange{GameID: uuid.UUID(old.ID.Bytes), Kind: EligibilityChangeMembership}, now); err != nil {
 				return err
 			}
 		}

@@ -59,10 +59,13 @@ func latestOccurrence(schedule cron.Schedule, now time.Time) (time.Time, error) 
 }
 
 func (s *SearchScheduler) EnsureScheduled(ctx context.Context) error {
+	now := s.now().UTC()
+	if err := s.repo.ScheduleDueRebuilds(ctx, s.cfg, now); err != nil {
+		return err
+	}
 	if !s.cfg.Enabled {
 		return nil
 	}
-	now := s.now().UTC()
 	daily, err := latestOccurrence(s.daily, now)
 	if err != nil {
 		return err

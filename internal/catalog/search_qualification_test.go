@@ -1134,6 +1134,13 @@ func TestSearchReviewBandChangesReuseCanonicalWithoutStoreOrDuplicateAI(t *testi
 	details := steam.GameDetails{AppID: 625, Type: "game", Name: "Cached Review Cycle", ShortDescription: "stable semantics",
 		ReleaseDate: steam.ReleaseDate{ComingSoon: false, Raw: "17 Oct, 2026"}}
 	service, metadata, repo, first := searchQualificationFixture(t, observation, details)
+	userID := uuid.New()
+	if _, err := repo.store.Pool.Exec(context.Background(), `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.store.Pool.Exec(context.Background(), `INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, uuid.New(), userID); err != nil {
+		t.Fatal(err)
+	}
 	planner := &searchQualificationPlanner{}
 	service.SetSearchEnrichmentPlanner(planner)
 	if err := service.handleSearchQualification(context.Background(), first); err != nil {
@@ -1142,6 +1149,17 @@ func TestSearchReviewBandChangesReuseCanonicalWithoutStoreOrDuplicateAI(t *testi
 	if err := service.queue.Complete(context.Background(), first); err != nil {
 		t.Fatal(err)
 	}
+	assertDirtyRevision := func(want int64) {
+		t.Helper()
+		var got int64
+		if err := repo.store.Pool.QueryRow(context.Background(), `SELECT dirty_revision FROM catalog_rebuild_state WHERE user_id=$1`, userID).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("dirty revision=%d want=%d", got, want)
+		}
+	}
+	assertDirtyRevision(1)
 	cfg := service.cfg
 	scan, err := NewSearchScanService(repo, &searchStub{}, service.queue, cfg, service.now)
 	if err != nil {
@@ -1163,6 +1181,7 @@ func TestSearchReviewBandChangesReuseCanonicalWithoutStoreOrDuplicateAI(t *testi
 	if active || tombstone != "mixed_or_below" {
 		t.Fatalf("mixed cached state active=%v tombstone=%q", active, tombstone)
 	}
+	assertDirtyRevision(2)
 	positive := observation
 	positive.Review.Total = 150
 	run = searchTestRun(t, repo, cfg, now.Add(2*time.Hour))
@@ -1180,6 +1199,74 @@ func TestSearchReviewBandChangesReuseCanonicalWithoutStoreOrDuplicateAI(t *testi
 	if !active || tombstone != "" || featureJobs != 1 || qualificationJobs != 1 || budgetUsed != 1 || planner.calls != 1 || metadata.deckCalls != 0 {
 		t.Fatalf("cached review state active=%v tombstone=%q feature=%d qualification=%d budget=%d planner=%d deck=%d",
 			active, tombstone, featureJobs, qualificationJobs, budgetUsed, planner.calls, metadata.deckCalls)
+	}
+	assertDirtyRevision(3)
+
+	sameBand := positive
+	sameBand.Review = steam.ReviewSummary{Band: steam.ReviewPositive, Label: "Overwhelmingly Positive", Total: 1000, PositivePercent: intPointerCatalog(99)}
+	run = searchTestRun(t, repo, cfg, now.Add(3*time.Hour))
+	if err := scan.CommitPage(context.Background(), run, steam.FeedRecent, 0, 0, steam.SearchPage{Start: 0, Count: 1, Total: 1, Items: []steam.SearchObservation{sameBand}}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirtyRevision(3)
+	if metadata.calls != 1 || planner.calls != 1 {
+		t.Fatalf("same-band presentation refresh made Store/AI calls: store=%d planner=%d", metadata.calls, planner.calls)
+	}
+
+	// A due Store refresh can reveal semantic content that Search cannot encode.
+	// The Search fingerprint stays identical, but the canonical semantic hash
+	// must create a new ranking revision and one new enrichment root.
+	metadata.details.ShortDescription = "meaningfully changed canonical semantics"
+	if _, err := repo.store.Pool.Exec(context.Background(), `UPDATE catalog_search_current SET next_refresh_at=$2 WHERE steam_app_id=$1`, 625, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.store.Pool.Exec(context.Background(), `UPDATE sync_jobs SET status='succeeded',updated_at=now() WHERE kind='feature.test' AND status='queued'`); err != nil {
+		t.Fatal(err)
+	}
+	var latestRun, latestOrdinal int64
+	var latestRunID uuid.UUID
+	if err := repo.store.Pool.QueryRow(context.Background(), `SELECT c.run_revision,c.observation_ordinal,o.run_id
+		FROM catalog_search_current c JOIN catalog_search_observations o ON o.steam_app_id=c.steam_app_id
+		 AND o.run_revision=c.run_revision AND o.observation_ordinal=c.observation_ordinal
+		WHERE c.steam_app_id=625 LIMIT 1`).Scan(&latestRun, &latestOrdinal, &latestRunID); err != nil {
+		t.Fatal(err)
+	}
+	semanticRevision := CandidateRevision{RunRevision: latestRun, ObservationOrdinal: latestOrdinal}
+	reservation, err := repo.ReserveMetadata(context.Background(), 625, semanticRevision, observation.Fingerprint, service.now())
+	if err != nil || !reservation.Granted {
+		t.Fatalf("semantic reservation=%+v err=%v", reservation, err)
+	}
+	if _, err := repo.store.Pool.Exec(context.Background(), `UPDATE catalog_search_worklist SET status='reserved',
+		material_run_revision=$3,material_observation_ordinal=$4 WHERE run_id=$1 AND steam_app_id=$2`,
+		latestRunID, 625, reservation.Revision.RunRevision, reservation.Revision.ObservationOrdinal); err != nil {
+		t.Fatal(err)
+	}
+	semanticPayload := SearchQualificationPayload{Version: 1, AppID: 625, CandidateRevision: reservation.Revision,
+		ReservationID: reservation.ID, ReservationToken: reservation.FencingToken, Priority: 80}
+	semanticSpec, err := NewSearchQualificationSpec(semanticPayload, uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.queue.Enqueue(context.Background(), semanticSpec); err != nil {
+		t.Fatal(err)
+	}
+	semanticLease, err := service.queue.Claim(context.Background(), jobs.LaneCatalog, "semantic-refresh", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if semanticLease == nil || semanticLease.Kind != SearchQualificationJobKind {
+		t.Fatalf("semantic refresh claimed %+v", semanticLease)
+	}
+	semantic := *semanticLease
+	if err := service.handleSearchQualification(context.Background(), semantic); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.queue.Complete(context.Background(), semantic); err != nil {
+		t.Fatal(err)
+	}
+	assertDirtyRevision(4)
+	if metadata.calls != 2 || planner.calls != 2 {
+		t.Fatalf("semantic Store refresh calls: store=%d planner=%d", metadata.calls, planner.calls)
 	}
 }
 

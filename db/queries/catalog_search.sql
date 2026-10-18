@@ -623,7 +623,14 @@ RETURNING *;
 -- name: ListDueEligibilityChanges :many
 SELECT * FROM catalog_search_current
 WHERE next_eligibility_at<=sqlc.arg(due_at)
-ORDER BY next_eligibility_at,steam_app_id LIMIT sqlc.arg(result_limit);
+ORDER BY steam_app_id LIMIT sqlc.arg(result_limit);
+
+-- A published ranking is the fence for advancing a clock deadline. A newer
+-- qualification observation wins and makes this compare-and-set a no-op.
+-- name: ResolveDueEligibilityChange :execrows
+UPDATE catalog_search_current SET active=sqlc.arg(active),tombstone_reason=sqlc.arg(tombstone_reason),
+    next_eligibility_at=sqlc.narg(next_eligibility_at)
+WHERE steam_app_id=sqlc.arg(steam_app_id) AND next_eligibility_at=sqlc.arg(expected_at);
 
 -- name: GetCatalogWorkflowState :one
 SELECT * FROM catalog_workflow_state WHERE singleton;

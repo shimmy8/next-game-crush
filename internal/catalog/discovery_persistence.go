@@ -48,9 +48,11 @@ func (r *DiscoveryRepository) MarkCandidatesChanged(ctx context.Context, tx pgx.
 	 AND NOT EXISTS(SELECT 1 FROM deleted_user_tombstones d WHERE d.user_id=u.id)
 	 ORDER BY u.id FOR KEY SHARE OF u
 	)
-	 INSERT INTO catalog_rebuild_state(user_id,dirty_revision,dirty_since)
-	 SELECT user_id,1,$1::timestamptz FROM live_users
- ON CONFLICT(user_id) DO UPDATE SET dirty_revision=catalog_rebuild_state.dirty_revision+1,dirty_since=COALESCE(catalog_rebuild_state.dirty_since,EXCLUDED.dirty_since)`, now)
+	 INSERT INTO catalog_rebuild_state(user_id,dirty_revision,dirty_since,first_dirty_at,retry_generation)
+	 SELECT user_id,1,$1::timestamptz,$1::timestamptz,0 FROM live_users
+	 ON CONFLICT(user_id) DO UPDATE SET dirty_revision=catalog_rebuild_state.dirty_revision+1,
+	 dirty_since=COALESCE(catalog_rebuild_state.dirty_since,EXCLUDED.dirty_since),
+	 first_dirty_at=COALESCE(catalog_rebuild_state.first_dirty_at,EXCLUDED.first_dirty_at),retry_generation=0`, now)
 	return err
 }
 func (r *DiscoveryRepository) persistQualification(ctx context.Context, lease jobs.Lease, p QualificationPayload, details steam.GameDetails, result Qualification, deck *deckCompatibilityObservation, now time.Time, planner DiscoveryEnrichmentPlanner) error {

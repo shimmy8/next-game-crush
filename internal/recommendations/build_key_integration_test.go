@@ -10,8 +10,239 @@ import (
 	"github.com/google/uuid"
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/catalog"
+	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/profile"
+	"next-game-crush/internal/steam"
 )
+
+type inertDiscoverySource struct{}
+
+func (inertDiscoverySource) ListChangedGames(context.Context, time.Time, uint32, int) (catalog.DiscoveryPage, error) {
+	return catalog.DiscoveryPage{}, nil
+}
+
+type inertSteamClient struct{}
+
+func (inertSteamClient) PlayerSummary(context.Context, string) (steam.PlayerSummary, error) {
+	return steam.PlayerSummary{}, steam.ErrUnavailable
+}
+func (inertSteamClient) ProbeOwnedGames(context.Context, string) ([]steam.OwnedGame, steam.Availability, error) {
+	return nil, steam.Unavailable, nil
+}
+func (inertSteamClient) OwnedGames(context.Context, string) ([]steam.OwnedGame, steam.Availability, error) {
+	return nil, steam.Unavailable, nil
+}
+func (inertSteamClient) RecentlyPlayed(context.Context, string) ([]steam.RecentGame, steam.Availability, error) {
+	return nil, steam.Unavailable, nil
+}
+func (inertSteamClient) Wishlist(context.Context, string) ([]steam.WishlistItem, steam.Availability, error) {
+	return nil, steam.Unavailable, nil
+}
+func (inertSteamClient) Achievements(context.Context, string, int64) (steam.AchievementSummary, steam.Availability, error) {
+	return steam.AchievementSummary{}, steam.Unavailable, nil
+}
+func (inertSteamClient) AchievementSchema(context.Context, int64) (steam.AchievementSchema, steam.Availability, error) {
+	return steam.AchievementSchema{}, steam.Unavailable, nil
+}
+func (inertSteamClient) GameDetails(context.Context, int64) (steam.GameDetails, error) {
+	return steam.GameDetails{}, steam.ErrUnavailable
+}
+func (inertSteamClient) DeckCompatibility(context.Context, int64) (steam.DeckCompatibility, steam.Availability, error) {
+	return steam.DeckUnknown, steam.Unavailable, nil
+}
+
+type rebuildPublicationObserver struct {
+	t     *testing.T
+	repo  *SQLRepository
+	calls []bool
+	keys  []string
+}
+
+func (o *rebuildPublicationObserver) CatalogRebuildFinished(ctx context.Context, userID uuid.UUID, key string, succeeded bool) error {
+	o.calls = append(o.calls, succeeded)
+	o.keys = append(o.keys, key)
+	if succeeded {
+		var published bool
+		if err := o.repo.store.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recommendation_runs WHERE user_id=$1 AND published AND ranking_version>1)`, userID).Scan(&published); err != nil || !published {
+			o.t.Fatalf("completion preceded publication: published=%v err=%v", published, err)
+		}
+	}
+	return nil
+}
+
+func TestCatalogRebuildObserverRunsAfterPublishFailureAndReplay(t *testing.T) {
+	service, old := historicalRankingFixture(t, false)
+	repo := service.repository.(*SQLRepository)
+	observer := &rebuildPublicationObserver{t: t, repo: repo}
+	service.SetCatalogRebuildObserver(observer)
+	key := "catalog:recommendations.rebuild:v2:" + old.owner.String() + ":1:retry:0"
+	payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, UserID: old.owner})
+	lease := jobs.Lease{ID: uuid.New(), UserID: old.owner, IdempotencyKey: key, Payload: payload}
+	if err := service.handleJob(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.handleJob(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	if len(observer.calls) != 2 || !observer.calls[0] || !observer.calls[1] || observer.keys[1] != key {
+		t.Fatalf("success/replay observer=%v keys=%v", observer.calls, observer.keys)
+	}
+
+	failing, failedOld := historicalRankingFixture(t, true)
+	failingRepo := failing.repository.(failingExplanationRepository).SQLRepository
+	failedObserver := &rebuildPublicationObserver{t: t, repo: failingRepo}
+	failing.SetCatalogRebuildObserver(failedObserver)
+	failedKey := "catalog:recommendations.rebuild:v2:" + failedOld.owner.String() + ":1:retry:0"
+	failedPayload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, UserID: failedOld.owner})
+	if err := failing.handleJob(context.Background(), jobs.Lease{ID: uuid.New(), UserID: failedOld.owner, IdempotencyKey: failedKey, Payload: failedPayload}); err == nil {
+		t.Fatal("missing injected rebuild failure")
+	}
+	if len(failedObserver.calls) != 1 || failedObserver.calls[0] {
+		t.Fatalf("failure observer=%v", failedObserver.calls)
+	}
+	latest, err := failing.Latest(context.Background(), failedOld.owner)
+	if err != nil || len(latest) != 1 || latest[0].ID != failedOld.id || latest[0].RankingVersion != 1 {
+		t.Fatalf("failure replaced the last published ranking: latest=%#v err=%v", latest, err)
+	}
+}
+
+func TestCatalogRetryGenerationReplaysPublishedRankingAndRepairsDeckFanout(t *testing.T) {
+	service, old := historicalRankingFixture(t, false)
+	repo := service.repository.(*SQLRepository)
+	ctx := context.Background()
+	second := insertRankingGame(t, repo.store, 9101, "Second Selected")
+	if _, err := repo.store.Pool.Exec(ctx, `INSERT INTO wishlist_entries(user_id,game_id,source,last_successful_fetch_at) VALUES($1,$2,'test',now())`, old.owner, second); err != nil {
+		t.Fatal(err)
+	}
+	planner := &publicationDeckPlanner{t: t, repo: repo, owner: old.owner, queue: jobs.NewQueue(repo.store), failAt: 2}
+	observer := &rebuildPublicationObserver{t: t, repo: repo}
+	service.SetDeckRefreshPlanner(planner)
+	service.SetCatalogRebuildObserver(observer)
+	payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, UserID: old.owner})
+	root := "catalog:recommendations.rebuild:v2:" + old.owner.String() + ":41"
+	gen0 := jobs.Lease{ID: uuid.New(), UserID: old.owner, IdempotencyKey: root + ":retry:0", Payload: payload}
+	gen1 := jobs.Lease{ID: uuid.New(), UserID: old.owner, IdempotencyKey: root + ":retry:1", Payload: payload}
+	if err := service.handleJob(ctx, gen0); err == nil {
+		t.Fatal("missing injected generation-zero Deck failure")
+	}
+	if err := service.handleJob(ctx, gen1); err != nil {
+		t.Fatalf("generation-one replay: %v", err)
+	}
+	var publishedRuns, rankingVersion, deckJobs int
+	var buildKey string
+	if err := repo.store.Pool.QueryRow(ctx, `SELECT count(*),max(ranking_version),max(build_key) FROM recommendation_runs
+		WHERE user_id=$1 AND algorithm_version=$2 AND published`, old.owner, AlgorithmVersion).Scan(&publishedRuns, &rankingVersion, &buildKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.store.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind=$1`, catalog.DeckRefreshJobKind).Scan(&deckJobs); err != nil {
+		t.Fatal(err)
+	}
+	wantBuildKey := RankingBuildKey(root, AlgorithmVersion, ActiveAdjustmentsDigest(nil))
+	if publishedRuns != 1 || rankingVersion != 2 || buildKey != wantBuildKey || deckJobs != 2 || planner.calls != 4 {
+		t.Fatalf("runs=%d version=%d build=%q want=%q deckJobs=%d calls=%d", publishedRuns, rankingVersion, buildKey, wantBuildKey, deckJobs, planner.calls)
+	}
+	if len(observer.calls) != 2 || observer.calls[0] || !observer.calls[1] || observer.keys[0] != gen0.IdempotencyKey || observer.keys[1] != gen1.IdempotencyKey {
+		t.Fatalf("observer calls=%v keys=%v", observer.calls, observer.keys)
+	}
+}
+
+func TestClockTransitionsChangeRealRankingBeforeRetryPublishes(t *testing.T) {
+	service, old := historicalRankingFixture(t, false)
+	repo := service.repository.(*SQLRepository)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(24 * time.Hour).Add(12 * time.Hour)
+	var expiring uuid.UUID
+	if err := repo.store.Pool.QueryRow(ctx, `SELECT game_id FROM wishlist_entries WHERE user_id=$1`, old.owner).Scan(&expiring); err != nil {
+		t.Fatal(err)
+	}
+	entering := insertRankingGame(t, repo.store, 9101, "Entering Window")
+	if _, err := repo.store.Pool.Exec(ctx, `INSERT INTO wishlist_entries(user_id,game_id,source,last_successful_fetch_at) VALUES($1,$2,'test',$3)`, old.owner, entering, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, game := range []struct {
+		id         uuid.UUID
+		appID      int64
+		date       time.Time
+		comingSoon bool
+		active     bool
+		band       string
+	}{
+		{expiring, 9100, now.AddDate(0, 0, -31), false, true, "positive"},
+		{entering, 9101, now.AddDate(0, 0, 30), true, false, "unrated"},
+	} {
+		snapshot, _ := json.Marshal(steam.GameDetails{AppID: game.appID, Type: "game", Name: "Clock Candidate",
+			ReleaseDate: steam.ReleaseDate{ComingSoon: game.comingSoon, Raw: game.date.Format("2 Jan, 2006")}})
+		if _, err := repo.store.Pool.Exec(ctx, `UPDATE games SET source='steam_store',source_snapshot=$2,last_successful_fetch_at=$3 WHERE id=$1`, game.id, snapshot, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.store.Pool.Exec(ctx, `INSERT INTO game_release_dates(id,game_id,precision,release_date,raw_text,observed_at,source,last_successful_fetch_at)
+			VALUES($1,$2,'day',$3,$4,$5,'steam_store',$5)`, uuid.New(), game.id, game.date, game.date.Format(time.DateOnly), now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.store.Pool.Exec(ctx, `INSERT INTO catalog_entry_sources(game_id,source,active,first_seen_at,last_seen_at)
+			VALUES($1,'steam_discovery',$2,$3,$3) ON CONFLICT(game_id,source) DO UPDATE SET active=EXCLUDED.active,last_seen_at=EXCLUDED.last_seen_at`, game.id, game.active, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.store.Pool.Exec(ctx, `INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,release_text,precision,release_date,
+			coming_soon,review_band,review_label,positive_percent,review_total,last_successful_appdetails_at,active,next_eligibility_at)
+			VALUES($1,1,1,$2,'day',$3,$4,$5,'',90,100,$6,$7,$6)`, game.appID, game.date.Format("2 Jan, 2006"), game.date, game.comingSoon, game.band, now, game.active); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service.eligibility = catalog.NewEligibilityRepository(repo.store)
+	service.clock = func() time.Time { return now }
+	cfg := catalog.DefaultDiscoveryConfig()
+	cfg.Enabled = false
+	queue := jobs.NewQueue(repo.store)
+	discovery, err := catalog.NewDiscoveryService(catalog.NewDiscoveryRepository(repo.store), inertDiscoverySource{}, inertSteamClient{}, queue, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetCatalogRebuildObserver(discovery)
+	planner := &publicationDeckPlanner{t: t, repo: repo, owner: old.owner, queue: queue, failAt: 1}
+	service.SetDeckRefreshPlanner(planner)
+	if err := catalog.NewSearchRepository(repo.store).ScheduleDueRebuilds(ctx, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	loadLease := func(suffix string) jobs.Lease {
+		t.Helper()
+		var lease jobs.Lease
+		if err := repo.store.Pool.QueryRow(ctx, `SELECT id,user_id,idempotency_key,payload FROM sync_jobs
+			WHERE kind='recommendations.rebuild' AND idempotency_key LIKE $1 ORDER BY created_at DESC,id DESC LIMIT 1`, "%"+suffix).
+			Scan(&lease.ID, &lease.UserID, &lease.IdempotencyKey, &lease.Payload); err != nil {
+			t.Fatal(err)
+		}
+		return lease
+	}
+	gen0 := loadLease(":retry:0")
+	if err := service.handleJob(ctx, gen0); err == nil {
+		t.Fatal("missing post-publication Deck failure")
+	}
+	latest, err := service.Latest(ctx, old.owner)
+	if err != nil || len(latest) != 1 || latest[0].GameID != entering || latest[0].RankingVersion != 2 {
+		t.Fatalf("clock-transition ranking=%#v err=%v", latest, err)
+	}
+	if err := catalog.NewSearchRepository(repo.store).ScheduleDueRebuilds(ctx, cfg, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	gen1 := loadLease(":retry:1")
+	if err := service.handleJob(ctx, gen1); err != nil {
+		t.Fatal(err)
+	}
+	var runs, recommendations int
+	var expiredCleared, enteringAdvanced bool
+	if err := repo.store.Pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM recommendation_runs WHERE user_id=$1 AND ranking_version=2 AND published),
+		(SELECT count(*) FROM recommendations WHERE user_id=$1 AND ranking_version=2),
+		(SELECT next_eligibility_at IS NULL FROM catalog_search_current WHERE steam_app_id=9100),
+		(SELECT next_eligibility_at>$2 FROM catalog_search_current WHERE steam_app_id=9101)`, old.owner, now).
+		Scan(&runs, &recommendations, &expiredCleared, &enteringAdvanced); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 1 || recommendations != 1 || !expiredCleared || !enteringAdvanced || stableRebuildRequestKey(gen0.IdempotencyKey) != stableRebuildRequestKey(gen1.IdempotencyKey) {
+		t.Fatalf("runs=%d recommendations=%d expiredCleared=%v enteringAdvanced=%v keys=%q/%q", runs, recommendations, expiredCleared, enteringAdvanced, gen0.IdempotencyKey, gen1.IdempotencyKey)
+	}
+}
 
 func TestRankingV2PublishesWithoutMutatingV1(t *testing.T) {
 	service, old := historicalRankingFixture(t, false)

@@ -20,6 +20,7 @@ type discoveryMetadata struct {
 	deckAvailability steam.Availability
 	deckErr          error
 	deckCalls        int
+	calls            int
 }
 
 type discoveryPlanner struct{ calls int }
@@ -81,6 +82,7 @@ func enqueueQualification(t *testing.T, s *DiscoveryService, app DiscoveredApp, 
 }
 
 func (m *discoveryMetadata) GameDetails(context.Context, int64) (steam.GameDetails, error) {
+	m.calls++
 	return m.details, m.err
 }
 

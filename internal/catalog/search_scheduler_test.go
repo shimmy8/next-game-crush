@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/store"
 )
@@ -267,6 +268,19 @@ func TestSearchOccurrenceWatchdogBackoffAndDisabled(t *testing.T) {
 	}
 	s, db := searchSchedulerFixture(t)
 	s.cfg.Enabled = false
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, uuid.New(), userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,
+		release_text,precision,release_date,coming_soon,review_band,review_label,positive_percent,review_total,active,next_eligibility_at)
+		VALUES(991202,1,1,'17 Sep, 2026','day','2026-09-17',false,'positive','Positive',90,100,true,$1)`, searchClock()); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.EnsureScheduled(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -276,6 +290,12 @@ func TestSearchOccurrenceWatchdogBackoffAndDisabled(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatal("disabled scheduler enqueued runs")
+	}
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind='recommendations.rebuild' AND lane='interactive'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("disabled scheduler rebuild jobs=%d", count)
 	}
 }
 
