@@ -43,7 +43,7 @@ export default function CalendarPage({ calendar, month = new Date(), rankingDiff
       </header>
       <div className="filters" aria-label="Фильтры календаря">
         <label className="check-filter"><input type="checkbox" checked={wishlistOnly} onChange={(event) => setWishlistOnly(event.target.checked)} /> Только желаемое</label>
-        <label>Точность даты<select value={precision} onChange={(event) => setPrecision(event.target.value)}><option value="all">Любая</option><option value="day">Точный день</option><option value="month">Месяц</option><option value="quarter">Квартал</option><option value="year">Год</option><option value="coming_soon">Coming Soon</option><option value="unknown">TBA</option></select></label>
+        <label>Точность даты<select value={precision} onChange={(event) => setPrecision(event.target.value)}><option value="all">Любая</option><option value="day">Точный день</option><option value="month">Месяц</option><option value="quarter">Квартал</option><option value="year">Год</option><option value="coming_soon">Скоро</option><option value="unknown">Дата уточняется</option></select></label>
         <label>Совпадение от {minimum}<input aria-label="Минимальное совпадение" type="range" min="0" max="90" step="10" value={minimum} onChange={(event) => setMinimum(Number(event.target.value))} /></label>
       </div>
       {view === 'month' ? (

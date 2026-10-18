@@ -106,7 +106,7 @@ func (r *SQLRepository) SaveProfile(ctx context.Context, userID uuid.UUID, vecto
 	if err = tx.Commit(ctx); err != nil {
 		return Profile{}, err
 	}
-	return Profile{ID: id, UserID: userID, Version: version, Confidence: vectors.Confidence, EvidenceCount: vectors.Evidence, Positive: vectors.Positive, Negative: vectors.Negative, CreatedAt: created}, nil
+	return WithSummaryState(Profile{ID: id, UserID: userID, Version: version, Confidence: vectors.Confidence, EvidenceCount: vectors.Evidence, Positive: vectors.Positive, Negative: vectors.Negative, CreatedAt: created}), nil
 }
 
 func (r *SQLRepository) LatestProfile(ctx context.Context, userID uuid.UUID) (Profile, error) {
@@ -128,9 +128,6 @@ func (r *SQLRepository) profileVersion(ctx context.Context, userID uuid.UUID, ve
 	}
 	if summary != nil {
 		p.Summary = *summary
-	}
-	if p.Summary == "" {
-		p.Summary = "AI profile summary is unavailable; recommendations use saved deterministic signals."
 	}
 	var values struct {
 		Confidence    float64 `json:"confidence"`
@@ -165,7 +162,7 @@ func (r *SQLRepository) profileVersion(ctx context.Context, userID uuid.UUID, ve
 	if len(p.Negative) == 0 {
 		p.Negative = make([]float32, Dimensions)
 	}
-	return p, nil
+	return WithSummaryState(p), nil
 }
 func finite01(v float64) float64 {
 	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {

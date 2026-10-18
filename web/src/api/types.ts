@@ -26,7 +26,10 @@ export type Evidence = { id: string; text: string }
 export type Recommendation = {
   id: string
   gameId: string
+  steamAppId: number
   name: string
+  coverImageUrl?: string
+  storeUrl: string
   profileVersion: number
   rankingVersion: number
   algorithmVersion: string
@@ -67,6 +70,7 @@ export type PreferenceProfileData = {
   id: string
   version: number
   summary: string
+  summaryStatus: 'ready' | 'unavailable'
   confidence: number
   evidenceCount: number
   createdAt: string
@@ -89,6 +93,26 @@ export type SyncStatus = {
   lastSuccessfulFetchAt?: string
   error?: string
   stages: SyncStage[]
+}
+
+export type SteamVisibility = 'public' | 'private' | 'unknown'
+
+export type PreflightResponse = {
+  canSync: boolean
+  profileVisibility: SteamVisibility
+  gameDetailsVisibility: SteamVisibility
+  reason: 'profile_private' | 'game_details_unavailable' | 'check_failed' | null
+  displayName: string | null
+  avatarUrl: string | null
+}
+
+export type CurrentUser = {
+  authenticated: true
+  steamId: string
+  csrfToken: string
+  expiresAt: string
+  displayName?: string | null
+  avatarUrl?: string | null
 }
 
 export type DashboardData = { profile: PreferenceProfileData | null; calendar: CalendarResponse }

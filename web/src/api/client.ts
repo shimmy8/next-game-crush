@@ -1,9 +1,6 @@
-export type CurrentUser = {
-  authenticated: true
-  steamId: string
-  csrfToken: string
-  expiresAt: string
-}
+import type { CurrentUser, PreflightResponse } from './types'
+
+export type { CurrentUser } from './types'
 
 export async function getCurrentUser(signal?: AbortSignal): Promise<CurrentUser | null> {
   const response = await fetch('/api/me', { credentials: 'same-origin', signal })
@@ -56,8 +53,21 @@ export function startSync(csrfToken: string, signal?: AbortSignal) {
   })
 }
 
+export function preflightSync(csrfToken: string, signal?: AbortSignal) {
+  return requestJSON<PreflightResponse>('/api/sync/preflight', {
+    method: 'POST', headers: { 'X-CSRF-Token': csrfToken }, signal,
+  })
+}
+
 export function getSyncStatus(jobId: string, signal?: AbortSignal) {
   return requestJSON<import('./types').SyncStatus>(`/api/sync/${encodeURIComponent(jobId)}`, { signal })
+}
+
+export async function getCurrentSync(signal?: AbortSignal): Promise<import('./types').SyncStatus | null> {
+  const response = await fetch('/api/sync/current', { credentials: 'same-origin', signal })
+  if (response.status === 204) return null
+  if (!response.ok) throw new Error('Unable to load the current sync')
+  return response.json() as Promise<import('./types').SyncStatus>
 }
 
 export function submitFeedback(recommendationId: string, csrfToken: string, input: import('./types').FeedbackInput, signal?: AbortSignal) {

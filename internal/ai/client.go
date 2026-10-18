@@ -14,11 +14,15 @@ type Client interface {
 // disabled or unavailable. Callers can render it without pretending it is a
 // model-generated explanation.
 func DeterministicExplanation(factors []string) Explanation {
-	text := "Recommended from the saved ranking factors."
-	if len(factors) > 0 {
-		text = "Recommended because of: " + joinHuman(factors) + "."
+	publicFactors := append([]string(nil), factors...)
+	if len(publicFactors) > 3 {
+		publicFactors = publicFactors[:3]
 	}
-	return Explanation{Text: text, Facts: append([]string(nil), factors...), Uncertainty: "AI explanation unavailable", Generated: false}
+	text := "Рекомендуем на основе ваших сохранённых игровых предпочтений."
+	if len(publicFactors) > 0 {
+		text = "Рекомендуем, потому что: " + joinHuman(publicFactors) + "."
+	}
+	return Explanation{Text: text, Facts: publicFactors, Uncertainty: "Объяснение ИИ сейчас недоступно.", Generated: false}
 }
 
 func DeterministicProfileSummary() ProfileSummary {

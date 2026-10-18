@@ -4,6 +4,8 @@ import "context"
 
 // Client is the Steam boundary consumed by synchronization workflows.
 type Client interface {
+	PlayerSummary(context.Context, string) (PlayerSummary, error)
+	ProbeOwnedGames(context.Context, string) ([]OwnedGame, Availability, error)
 	OwnedGames(context.Context, string) ([]OwnedGame, Availability, error)
 	RecentlyPlayed(context.Context, string) ([]RecentGame, Availability, error)
 	Wishlist(context.Context, string) ([]WishlistItem, Availability, error)

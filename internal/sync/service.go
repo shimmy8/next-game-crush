@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -14,12 +15,18 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/observability"
 	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
 	dbgen "next-game-crush/internal/store/sqlc"
 )
 
 const PayloadVersion = 1
+
+var (
+	ErrPreflightBlocked = errors.New("Steam synchronization blocked by privacy preflight")
+	ErrPreflightFailed  = errors.New("Steam privacy preflight failed")
+)
 
 type Payload struct {
 	Version int       `json:"version"`
@@ -45,6 +52,20 @@ type Status struct {
 	Stages                []StageStatus `json:"stages"`
 }
 
+type PreflightResult struct {
+	CanSync               bool             `json:"canSync"`
+	ProfileVisibility     steam.Visibility `json:"profileVisibility"`
+	GameDetailsVisibility steam.Visibility `json:"gameDetailsVisibility"`
+	Reason                *string          `json:"reason"`
+	DisplayName           *string          `json:"displayName"`
+	AvatarURL             *string          `json:"avatarUrl"`
+}
+
+type SteamIdentity struct {
+	DisplayName *string `json:"displayName"`
+	AvatarURL   *string `json:"avatarUrl"`
+}
+
 type Service struct {
 	store       *store.Store
 	queue       *jobs.Queue
@@ -53,6 +74,13 @@ type Service struct {
 	now         func() time.Time
 	aiJobs      AIJobPlanner
 	rankingJobs bool
+	logger      *observability.Logger
+}
+
+type ServiceOption func(*Service)
+
+func WithLogger(logger *observability.Logger) ServiceOption {
+	return func(service *Service) { service.logger = logger }
 }
 
 type AIJobPlanner interface {
@@ -62,16 +90,30 @@ type AIJobPlanner interface {
 func (s *Service) SetAIJobPlanner(planner AIJobPlanner) { s.aiJobs = planner }
 func (s *Service) EnableRankingJobs()                   { s.rankingJobs = true }
 
-func NewService(database *store.Store, queue *jobs.Queue, client steam.Client, catalogService *catalog.Service) (*Service, error) {
+func NewService(database *store.Store, queue *jobs.Queue, client steam.Client, catalogService *catalog.Service, options ...ServiceOption) (*Service, error) {
 	if database == nil || queue == nil || client == nil || catalogService == nil {
 		return nil, errors.New("sync store, queue, Steam client, and catalog service are required")
 	}
-	return &Service{store: database, queue: queue, client: client, catalog: catalogService, now: time.Now}, nil
+	service := &Service{store: database, queue: queue, client: client, catalog: catalogService, now: time.Now, logger: observability.New(nil)}
+	for _, option := range options {
+		option(service)
+	}
+	if service.logger == nil {
+		service.logger = observability.New(nil)
+	}
+	return service, nil
 }
 
 func (s *Service) Start(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
 	if userID == uuid.Nil {
 		return uuid.Nil, errors.New("user ID is required")
+	}
+	preflight, err := s.Preflight(ctx, userID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if !preflight.CanSync {
+		return uuid.Nil, ErrPreflightBlocked
 	}
 	tx, err := s.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -103,6 +145,102 @@ func (s *Service) Start(ctx context.Context, userID uuid.UUID) (uuid.UUID, error
 	}
 	return id, nil
 }
+
+func (s *Service) Preflight(ctx context.Context, userID uuid.UUID) (PreflightResult, error) {
+	if userID == uuid.Nil {
+		return PreflightResult{}, errors.New("user ID is required")
+	}
+	account, err := s.store.Queries.GetSteamAccountForUser(ctx, uuidPG(userID))
+	if err != nil {
+		return PreflightResult{}, fmt.Errorf("load Steam account: %w", err)
+	}
+	result := PreflightResult{
+		ProfileVisibility:     steam.VisibilityUnknown,
+		GameDetailsVisibility: steam.VisibilityUnknown,
+		DisplayName:           nullableTextPointer(account.DisplayName),
+		AvatarURL:             nullableTextPointer(account.AvatarUrl),
+	}
+	summary, err := s.client.PlayerSummary(ctx, account.SteamID)
+	if err != nil {
+		result.Reason = stringPointer("check_failed")
+		return result, ErrPreflightFailed
+	}
+	if err := s.store.Queries.UpdateSteamAccountIdentity(ctx, dbgen.UpdateSteamAccountIdentityParams{
+		DisplayName: text(summary.DisplayName),
+		AvatarUrl:   text(summary.AvatarURL),
+		UserID:      uuidPG(userID),
+	}); err != nil {
+		return result, fmt.Errorf("update Steam account identity: %w", err)
+	}
+	if summary.DisplayName != "" {
+		result.DisplayName = stringPointer(summary.DisplayName)
+	}
+	if summary.AvatarURL != "" {
+		result.AvatarURL = stringPointer(summary.AvatarURL)
+	}
+	result.ProfileVisibility = summary.Visibility
+	if err := s.store.Queries.UpsertUserSourceVisibility(ctx, dbgen.UpsertUserSourceVisibilityParams{
+		UserID: uuidPG(userID), Source: "profile", ResourceKey: "", Visibility: text(string(summary.Visibility)),
+	}); err != nil {
+		return result, fmt.Errorf("save Steam profile visibility: %w", err)
+	}
+	if summary.Visibility == steam.VisibilityPrivate {
+		result.Reason = stringPointer("profile_private")
+		return result, nil
+	}
+	if summary.Visibility != steam.VisibilityPublic {
+		result.ProfileVisibility = steam.VisibilityUnknown
+		result.Reason = stringPointer("check_failed")
+		return result, ErrPreflightFailed
+	}
+	games, availability, ownedErr := s.client.ProbeOwnedGames(ctx, account.SteamID)
+	if ownedErr != nil || availability == steam.RequestFailed || availability == steam.NotModified {
+		result.Reason = stringPointer("check_failed")
+		return result, ErrPreflightFailed
+	}
+	if availability != steam.Available || len(games) == 0 {
+		if err := s.saveVisibility(ctx, userID, "owned_games", steam.VisibilityUnknown); err != nil {
+			return result, err
+		}
+		result.Reason = stringPointer("game_details_unavailable")
+		return result, nil
+	}
+	if err := s.saveVisibility(ctx, userID, "owned_games", steam.VisibilityPublic); err != nil {
+		return result, err
+	}
+	result.GameDetailsVisibility = steam.VisibilityPublic
+	result.CanSync = true
+	return result, nil
+}
+
+func (s *Service) SteamIdentity(ctx context.Context, userID uuid.UUID) (SteamIdentity, error) {
+	if userID == uuid.Nil {
+		return SteamIdentity{}, errors.New("user ID is required")
+	}
+	account, err := s.store.Queries.GetSteamAccountForUser(ctx, uuidPG(userID))
+	if err != nil {
+		return SteamIdentity{}, err
+	}
+	return SteamIdentity{DisplayName: nullableTextPointer(account.DisplayName), AvatarURL: nullableTextPointer(account.AvatarUrl)}, nil
+}
+
+func (s *Service) saveVisibility(ctx context.Context, userID uuid.UUID, source string, visibility steam.Visibility) error {
+	if err := s.store.Queries.UpsertUserSourceVisibility(ctx, dbgen.UpsertUserSourceVisibilityParams{
+		UserID: uuidPG(userID), Source: source, ResourceKey: "", Visibility: text(string(visibility)),
+	}); err != nil {
+		return fmt.Errorf("save Steam source visibility: %w", err)
+	}
+	return nil
+}
+
+func nullableTextPointer(value pgtype.Text) *string {
+	if !value.Valid {
+		return nil
+	}
+	return stringPointer(value.String)
+}
+
+func stringPointer(value string) *string { return &value }
 
 // Run performs the complete workflow synchronously. The worker uses the same
 // idempotent stage methods but schedules catalog and achievements as child jobs.
@@ -251,43 +389,57 @@ func (s *Service) importSteam(ctx context.Context, userID uuid.UUID) error {
 		return fmt.Errorf("load Steam account: %w", err)
 	}
 	steamID := account.SteamID
+	finishOwned := s.beginSource(ctx, "owned_games")
 	owned, ownedAvailability, ownedErr := s.client.OwnedGames(ctx, steamID)
 	if err := s.recordState(ctx, userID, "owned_games", "", ownedAvailability, ownedErr); err != nil {
+		finishOwned(availability(ownedAvailability, ownedErr), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(owned)})
 		return err
 	}
 	if ownedAvailability == steam.Available && ownedErr == nil {
 		if err := s.saveOwned(ctx, userID, owned); err != nil {
+			finishOwned(string(ownedAvailability), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(owned)})
 			return err
 		}
 		snapshot, _ := json.Marshal(owned)
 		if _, err := s.store.Pool.Exec(ctx, `UPDATE steam_accounts SET availability='available',last_successful_fetch_at=$2,raw_snapshot=$3 WHERE user_id=$1`, userID, s.now().UTC(), snapshot); err != nil {
+			finishOwned(string(ownedAvailability), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(owned), available: len(owned)})
 			return fmt.Errorf("save Steam account snapshot: %w", err)
 		}
 	} else {
 		if _, err := s.store.Pool.Exec(ctx, `UPDATE steam_accounts SET availability=$2 WHERE user_id=$1`, userID, availability(ownedAvailability, ownedErr)); err != nil {
+			finishOwned(availability(ownedAvailability, ownedErr), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(owned)})
 			return fmt.Errorf("mark Steam account availability: %w", err)
 		}
 	}
+	finishOwned(availability(ownedAvailability, ownedErr), diagnoseSteamFailure(ownedAvailability, ownedErr), itemCounts(len(owned), ownedAvailability, ownedErr))
 
+	finishRecent := s.beginSource(ctx, "recently_played")
 	recent, recentAvailability, recentErr := s.client.RecentlyPlayed(ctx, steamID)
 	if err := s.recordState(ctx, userID, "recently_played", "", recentAvailability, recentErr); err != nil {
+		finishRecent(availability(recentAvailability, recentErr), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(recent)})
 		return err
 	}
 	if recentAvailability == steam.Available && recentErr == nil {
 		if err := s.saveRecent(ctx, userID, recent); err != nil {
+			finishRecent(string(recentAvailability), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(recent)})
 			return err
 		}
 	}
+	finishRecent(availability(recentAvailability, recentErr), diagnoseSteamFailure(recentAvailability, recentErr), itemCounts(len(recent), recentAvailability, recentErr))
 
+	finishWishlist := s.beginSource(ctx, "wishlist")
 	wishlist, wishlistAvailability, wishlistErr := s.client.Wishlist(ctx, steamID)
 	if err := s.recordState(ctx, userID, "wishlist", "", wishlistAvailability, wishlistErr); err != nil {
+		finishWishlist(availability(wishlistAvailability, wishlistErr), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(wishlist)})
 		return err
 	}
 	if wishlistAvailability == steam.Available && wishlistErr == nil {
 		if err := s.saveWishlist(ctx, userID, wishlist); err != nil {
+			finishWishlist(string(wishlistAvailability), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(wishlist)})
 			return err
 		}
 	}
+	finishWishlist(availability(wishlistAvailability, wishlistErr), diagnoseSteamFailure(wishlistAvailability, wishlistErr), itemCounts(len(wishlist), wishlistAvailability, wishlistErr))
 	return nil
 }
 
@@ -430,37 +582,164 @@ func availability(state steam.Availability, err error) string {
 }
 
 func (s *Service) syncAchievements(ctx context.Context, userID uuid.UUID) error {
+	finish := s.beginSource(ctx, "achievements")
+	counts := sourceCounts{}
 	account, err := s.store.Queries.GetSteamAccountForUser(ctx, uuidPG(userID))
 	if err != nil {
+		finish(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, counts)
 		return err
 	}
 	rows, err := s.store.Queries.ListUserGamesForAchievements(ctx, uuidPG(userID))
 	if err != nil {
+		finish(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, counts)
 		return err
 	}
 	games := make([]UserGame, 0, len(rows))
 	for _, row := range rows {
 		games = append(games, UserGame{AppID: row.SteamAppID, Name: row.Name, PlaytimeMinutes: row.PlaytimeMinutes, RecentMinutes: row.RecentlyPlayedMinutes, LastPlayedAt: row.LastPlayedAt.Time})
 	}
-	for _, appID := range SelectAchievementTargets(games, AchievementTargetLimit) {
+	targets := SelectAchievementTargets(games, AchievementTargetLimit)
+	counts.total = len(targets)
+	availabilityOutcome := steam.Available
+	diagnostic := steamDiagnostic{}
+	for _, appID := range targets {
 		summary, state, sourceErr := s.client.Achievements(ctx, account.SteamID, appID)
 		if err := s.recordState(ctx, userID, "achievements", strconv.FormatInt(appID, 10), state, sourceErr); err != nil {
+			counts.failed++
+			finish(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, counts)
 			return err
 		}
+		if state == steam.NotModified && errors.Is(sourceErr, steam.ErrNotModified) {
+			counts.available++
+			continue
+		}
 		if state != steam.Available || sourceErr != nil {
+			if state == steam.Unavailable {
+				counts.unavailable++
+				if availabilityOutcome == steam.Available {
+					availabilityOutcome = steam.Unavailable
+				}
+			} else {
+				counts.failed++
+				availabilityOutcome = steam.RequestFailed
+			}
+			candidateDiagnostic := diagnoseSteamFailure(state, sourceErr)
+			if state != steam.Unavailable || diagnostic.reason == "" {
+				diagnostic = candidateDiagnostic
+			}
 			continue
 		}
 		game, err := s.store.Queries.GetGameByAppID(ctx, appID)
 		if err != nil {
+			counts.failed++
+			finish(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, counts)
 			return err
 		}
 		raw, _ := json.Marshal(summary)
 		now := s.now().UTC()
 		if err := s.store.Queries.UpsertAchievementSummary(ctx, dbgen.UpsertAchievementSummaryParams{UserID: uuidPG(userID), GameID: game.ID, Achieved: int32(summary.Unlocked), Total: int32(summary.Total), Source: "steam", LastSuccessfulFetchAt: timestamptz(now), RawSnapshot: raw}); err != nil {
+			counts.failed++
+			finish(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, counts)
 			return err
 		}
+		counts.available++
 	}
+	finish(string(availabilityOutcome), diagnostic, counts)
 	return nil
+}
+
+type sourceCounts struct {
+	total       int
+	available   int
+	unavailable int
+	failed      int
+}
+
+func itemCounts(total int, state steam.Availability, err error) sourceCounts {
+	counts := sourceCounts{total: total}
+	if state == steam.Available && err == nil {
+		counts.available = total
+	} else if state == steam.Unavailable {
+		counts.unavailable = total
+	} else if err != nil || state == steam.RequestFailed {
+		counts.failed = total
+	}
+	return counts
+}
+
+func (s *Service) beginSource(ctx context.Context, source string) func(string, steamDiagnostic, sourceCounts) {
+	started := time.Now()
+	correlation := observability.CorrelationFromContext(ctx)
+	s.logger.SyncSource(ctx, observability.SyncSourceEvent{Stage: observability.SourceStarted, Correlation: correlation, Source: source})
+	return func(sourceAvailability string, diagnostic steamDiagnostic, counts sourceCounts) {
+		s.logger.SyncSource(ctx, observability.SyncSourceEvent{
+			Stage: observability.SourceFinished, Correlation: correlation, Source: source,
+			Availability: sourceAvailability, Reason: diagnostic.reason, Duration: time.Since(started),
+			TotalCount: counts.total, AvailableCount: counts.available,
+			UnavailableCount: counts.unavailable, FailedCount: counts.failed,
+			UpstreamStatus: diagnostic.upstreamStatus,
+		})
+	}
+}
+
+type steamDiagnostic struct {
+	reason         observability.Reason
+	upstreamStatus int
+}
+
+func diagnoseSteamFailure(state steam.Availability, err error) steamDiagnostic {
+	if err == nil {
+		switch state {
+		case steam.Available, steam.NotModified:
+			return steamDiagnostic{}
+		case steam.Unavailable:
+			return steamDiagnostic{reason: observability.ReasonUpstreamUnavailable}
+		default:
+			return steamDiagnostic{reason: observability.ReasonInternalError}
+		}
+	}
+	if errors.Is(err, steam.ErrNotModified) && state == steam.NotModified {
+		return steamDiagnostic{}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return steamDiagnostic{reason: observability.ReasonTimeout}
+	}
+	if errors.Is(err, context.Canceled) {
+		return steamDiagnostic{reason: observability.ReasonInternalError}
+	}
+	var requestErr *steam.RequestError
+	if errors.As(err, &requestErr) && requestErr != nil {
+		diagnostic := steamDiagnostic{}
+		if requestErr.StatusCode >= 400 && requestErr.StatusCode <= 599 {
+			diagnostic.upstreamStatus = requestErr.StatusCode
+		}
+		switch requestErr.StatusCode {
+		case http.StatusTooManyRequests:
+			diagnostic.reason = observability.ReasonRateLimited
+		case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+			diagnostic.reason = observability.ReasonTimeout
+		default:
+			switch {
+			case requestErr.StatusCode >= 400 && requestErr.StatusCode <= 499:
+				diagnostic.reason = observability.ReasonUpstreamRejected
+			case requestErr.StatusCode >= 500 && requestErr.StatusCode <= 599:
+				diagnostic.reason = observability.ReasonUpstreamUnavailable
+			}
+		}
+		if diagnostic.reason != "" {
+			return diagnostic
+		}
+		if requestErr.StatusCode == 0 && requestErr.Temporary {
+			return steamDiagnostic{reason: observability.ReasonUpstreamUnavailable}
+		}
+	}
+	if errors.Is(err, steam.ErrInvalidResponse) || errors.Is(err, steam.ErrResponseTooLarge) {
+		return steamDiagnostic{reason: observability.ReasonMalformedResponse}
+	}
+	if errors.Is(err, steam.ErrUnavailable) || state == steam.Unavailable {
+		return steamDiagnostic{reason: observability.ReasonUpstreamUnavailable}
+	}
+	return steamDiagnostic{reason: observability.ReasonInternalError}
 }
 
 func (s *Service) GetStatus(ctx context.Context, userID, jobID uuid.UUID) (Status, error) {
@@ -477,15 +756,8 @@ func (s *Service) GetStatus(ctx context.Context, userID, jobID uuid.UUID) (Statu
 		return Status{}, err
 	}
 	stages := []StageStatus{{Kind: job.Kind, Stage: job.Stage, Status: job.Status, Error: safeError(job.LastError)}}
-	completed, total := 0, 1+len(children)
-	if job.Status == "succeeded" {
-		completed++
-	}
 	for _, child := range children {
 		stages = append(stages, StageStatus{Kind: child.Kind, Stage: child.Stage, Status: child.Status, Error: safeError(child.LastError)})
-		if child.Status == "succeeded" {
-			completed++
-		}
 	}
 	sourceRows, sourceErr := s.store.Pool.Query(ctx, `SELECT source,resource_key,availability,last_successful_fetch_at,error FROM user_source_states WHERE user_id=$1 ORDER BY source,resource_key`, userID)
 	if sourceErr != nil {
@@ -549,7 +821,92 @@ func (s *Service) GetStatus(ctx context.Context, userID, jobID uuid.UUID) (Statu
 			break
 		}
 	}
-	return Status{ID: jobID, Stage: stage, Status: job.Status, Progress: completed * 100 / total, LastSuccessfulFetchAt: last, Error: safeError(job.LastError), Stages: stages}, nil
+	return Status{ID: jobID, Stage: stage, Status: job.Status, Progress: workflowProgress(job, children), LastSuccessfulFetchAt: last, Error: safeError(job.LastError), Stages: stages}, nil
+}
+
+func (s *Service) GetCurrentStatus(ctx context.Context, userID uuid.UUID) (Status, bool, error) {
+	if userID == uuid.Nil {
+		return Status{}, false, errors.New("user ID is required")
+	}
+	job, err := s.store.Queries.FindActiveUserSync(ctx, userID.String())
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Status{}, false, nil
+	}
+	if err != nil {
+		return Status{}, false, fmt.Errorf("find active synchronization: %w", err)
+	}
+	status, err := s.GetStatus(ctx, userID, uuid.UUID(job.ID.Bytes))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Status{}, false, nil
+	}
+	if err != nil {
+		return Status{}, false, err
+	}
+	return status, true, nil
+}
+
+func workflowProgress(root dbgen.SyncJob, children []dbgen.SyncJob) int {
+	if root.Status == "succeeded" {
+		return 100
+	}
+
+	var catalogCreated, achievementsCreated bool
+	var catalogSucceeded, achievementsSucceeded bool
+	var profileCreated, profileSucceeded bool
+	var recommendationsCreated, recommendationsSucceeded bool
+	aiTotal, aiTerminal := 0, 0
+	for _, child := range children {
+		switch child.Stage {
+		case "catalog":
+			catalogCreated = true
+			catalogSucceeded = child.Status == "succeeded"
+		case "achievements":
+			achievementsCreated = true
+			achievementsSucceeded = child.Status == "succeeded"
+		case "ai_features":
+			aiTotal++
+			if child.Status == "succeeded" || child.Status == "dead" {
+				aiTerminal++
+			}
+		case "profile":
+			profileCreated = true
+			profileSucceeded = child.Status == "succeeded"
+		case "recommendations":
+			recommendationsCreated = true
+			recommendationsSucceeded = child.Status == "succeeded"
+		}
+	}
+
+	progress := 0
+	if catalogCreated && achievementsCreated {
+		progress += 20
+	}
+	if catalogSucceeded {
+		progress += 20
+	}
+	if achievementsSucceeded {
+		progress += 20
+	}
+	if profileCreated || recommendationsCreated {
+		progress += 20
+	} else if aiTotal > 0 {
+		// AwaitChildren publishes every planned AI job in one transaction before
+		// any child can run, so aiTotal is stable while this fraction advances.
+		progress += 20 * aiTerminal / aiTotal
+	}
+	if profileSucceeded || recommendationsCreated {
+		progress += 10
+	}
+	if recommendationsSucceeded {
+		progress += 10
+	}
+	if progress < 0 {
+		return 0
+	}
+	if progress > 100 {
+		return 100
+	}
+	return progress
 }
 
 func safeError(value pgtype.Text) string {

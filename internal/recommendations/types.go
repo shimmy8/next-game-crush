@@ -66,7 +66,10 @@ type Evidence struct {
 type Recommendation struct {
 	ID                   uuid.UUID     `json:"id"`
 	GameID               uuid.UUID     `json:"gameId"`
+	SteamAppID           int64         `json:"steamAppId"`
 	Name                 string        `json:"name"`
+	CoverImageURL        string        `json:"coverImageUrl,omitempty"`
+	StoreURL             string        `json:"storeUrl"`
 	ProfileVersion       int64         `json:"profileVersion"`
 	RankingVersion       int64         `json:"rankingVersion"`
 	AlgorithmVersion     string        `json:"algorithmVersion"`

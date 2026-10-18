@@ -17,6 +17,83 @@ import (
 
 const testAPIKey = "fixture-secret-api-key"
 
+func TestPlayerSummaryContracts(t *testing.T) {
+	const steamID = "76561197960287930"
+	t.Run("public matching player", func(t *testing.T) {
+		client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/ISteamUser/GetPlayerSummaries/v2/" || r.URL.Query().Get("key") != testAPIKey || r.URL.Query().Get("steamids") != steamID {
+				t.Fatalf("request URL = %s", r.URL.String())
+			}
+			serveFixture(t, w, "player_summary_public.json")
+		}), HTTPConfig{})
+		summary, err := client.PlayerSummary(context.Background(), steamID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if summary.Visibility != VisibilityPublic || summary.DisplayName != "Player" || summary.AvatarURL != "https://avatars.cloudflare.steamstatic.com/avatar.jpg" {
+			t.Fatalf("summary = %#v", summary)
+		}
+	})
+
+	t.Run("private matching player", func(t *testing.T) {
+		client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			serveFixture(t, w, "player_summary_private.json")
+		}), HTTPConfig{})
+		summary, err := client.PlayerSummary(context.Background(), steamID)
+		if err != nil || summary.Visibility != VisibilityPrivate {
+			t.Fatalf("summary = %#v, err = %v", summary, err)
+		}
+	})
+
+	t.Run("empty avatar is nullable identity", func(t *testing.T) {
+		client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"response":{"players":[{"steamid":"76561197960287930","communityvisibilitystate":3,"personaname":"Player","avatarfull":""}]}}`))
+		}), HTTPConfig{})
+		summary, err := client.PlayerSummary(context.Background(), steamID)
+		if err != nil || summary.Visibility != VisibilityPublic || summary.DisplayName != "Player" || summary.AvatarURL != "" {
+			t.Fatalf("summary = %#v, err = %v", summary, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing player", body: `{"response":{"players":[]}}`},
+		{name: "mismatched player", body: `{"response":{"players":[{"steamid":"76561197960287931","communityvisibilitystate":3,"personaname":"Other","avatarfull":"https://avatars.cloudflare.steamstatic.com/avatar.jpg"}]}}`},
+		{name: "duplicate matching player", body: `{"response":{"players":[{"steamid":"76561197960287930","communityvisibilitystate":3,"personaname":"Player","avatarfull":"https://avatars.cloudflare.steamstatic.com/a.jpg"},{"steamid":"76561197960287930","communityvisibilitystate":3,"personaname":"Player","avatarfull":"https://avatars.cloudflare.steamstatic.com/b.jpg"}]}}`},
+		{name: "unknown visibility", body: `{"response":{"players":[{"steamid":"76561197960287930","communityvisibilitystate":2,"personaname":"Player","avatarfull":"https://avatars.cloudflare.steamstatic.com/avatar.jpg"}]}}`},
+		{name: "malformed JSON", body: `{"response":`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(test.body)) }), HTTPConfig{})
+			if _, err := client.PlayerSummary(context.Background(), steamID); !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateAvatarURL(t *testing.T) {
+	for _, host := range []string{"avatars.steamstatic.com", "avatars.cloudflare.steamstatic.com", "avatars.fastly.steamstatic.com", "avatars.akamai.steamstatic.com"} {
+		raw := "https://" + host + "/avatar.jpg"
+		if got, err := ValidateAvatarURL(raw); err != nil || got != raw {
+			t.Fatalf("ValidateAvatarURL(%q) = %q, %v", raw, got, err)
+		}
+	}
+	for _, raw := range []string{
+		"http://avatars.cloudflare.steamstatic.com/avatar.jpg",
+		"https://user@avatars.cloudflare.steamstatic.com/avatar.jpg",
+		"https://avatars.cloudflare.steamstatic.com:443/avatar.jpg",
+		"https://avatars.cloudflare.steamstatic.com.evil.example/avatar.jpg",
+		"https://evil.example/avatar.jpg",
+	} {
+		if got, err := ValidateAvatarURL(raw); err == nil || got != "" {
+			t.Fatalf("ValidateAvatarURL(%q) = %q, %v", raw, got, err)
+		}
+	}
+}
+
 func TestOwnedGamesPublicAndPrivateContracts(t *testing.T) {
 	t.Run("public", func(t *testing.T) {
 		client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -68,6 +145,43 @@ func TestOwnedGamesPublicAndPrivateContracts(t *testing.T) {
 			t.Fatalf("games = %#v, availability = %q, err = %v", games, availability, err)
 		}
 	})
+}
+
+func TestProbeOwnedGamesDoesNotPublishOrUseCacheValidators(t *testing.T) {
+	const steamID = "76561197960287930"
+	var calls atomic.Int32
+	client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if got := r.Header.Get("If-None-Match"); got != "" {
+			t.Fatalf("call %d If-None-Match = %q, want empty", call, got)
+		}
+		if got := r.Header.Get("If-Modified-Since"); got != "" {
+			t.Fatalf("call %d If-Modified-Since = %q, want empty", call, got)
+		}
+		w.Header().Set("ETag", `"owned-v1"`)
+		w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+		serveFixture(t, w, "owned_games.json")
+	}), HTTPConfig{})
+
+	probed, availability, err := client.ProbeOwnedGames(context.Background(), steamID)
+	if err != nil || availability != Available || len(probed) != 2 {
+		t.Fatalf("probe games = %#v, availability = %q, err = %v", probed, availability, err)
+	}
+	if metadata, ok := client.CacheMetadata(OwnedGamesCacheKey(steamID)); ok {
+		t.Fatalf("probe published cache metadata = %#v", metadata)
+	}
+
+	imported, availability, err := client.OwnedGames(context.Background(), steamID)
+	if err != nil || availability != Available || len(imported) != 2 {
+		t.Fatalf("import games = %#v, availability = %q, err = %v", imported, availability, err)
+	}
+	metadata, ok := client.CacheMetadata(OwnedGamesCacheKey(steamID))
+	if !ok || metadata.ETag != `"owned-v1"` || metadata.LastModified != "Wed, 21 Oct 2015 07:28:00 GMT" {
+		t.Fatalf("import cache metadata = %#v, ok = %v", metadata, ok)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want 2", calls.Load())
+	}
 }
 
 func TestRecentlyPlayedContracts(t *testing.T) {
@@ -187,7 +301,7 @@ func TestGameDetailsContractAndMalformedReleaseDate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if details.AppID != 620 || details.Name != "Portal 2" || !details.ReleaseDate.ComingSoon || details.ReleaseDate.Raw != "Coming soon-ish" {
+		if details.AppID != 620 || details.Name != "Portal 2" || details.HeaderImage != "https://cdn.example/620.jpg" || !details.ReleaseDate.ComingSoon || details.ReleaseDate.Raw != "Coming soon-ish" {
 			t.Fatalf("details = %#v", details)
 		}
 		if len(details.Categories) != 1 || len(details.Genres) != 1 {

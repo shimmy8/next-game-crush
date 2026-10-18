@@ -26,6 +26,7 @@ WITH candidate AS (
         status = 'running', worker_id = $1,
         fencing_token = $2,
         lease_until = now() + $3::interval,
+        last_error = NULL,
         updated_at = now()
     FROM candidate c WHERE j.id = c.id
     RETURNING j.id, j.kind, j.idempotency_key, j.payload, j.status, j.attempts, j.max_attempts, j.available_at, j.worker_id, j.fencing_token, j.lease_until, j.last_error, j.created_at, j.updated_at, j.parent_job_id, j.required, j.stage, j.result, j.user_id
@@ -159,14 +160,15 @@ func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (pgtype.
 
 const failJob = `-- name: FailJob :execrows
 UPDATE sync_jobs SET
-    status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'retryable' END,
-    available_at = $1, last_error = $2,
+    status = CASE WHEN NOT $1::boolean OR attempts >= max_attempts THEN 'dead' ELSE 'retryable' END,
+    available_at = $2, last_error = $3,
     worker_id = NULL, fencing_token = NULL, lease_until = NULL, updated_at = now()
-WHERE id = $3 AND status = 'running' AND worker_id = $4
-  AND fencing_token = $5 AND lease_until > now()
+WHERE id = $4 AND status = 'running' AND worker_id = $5
+  AND fencing_token = $6 AND lease_until > now()
 `
 
 type FailJobParams struct {
+	Retryable    bool               `json:"retryable"`
 	RetryAt      pgtype.Timestamptz `json:"retry_at"`
 	Cause        pgtype.Text        `json:"cause"`
 	ID           pgtype.UUID        `json:"id"`
@@ -176,6 +178,7 @@ type FailJobParams struct {
 
 func (q *Queries) FailJob(ctx context.Context, arg FailJobParams) (int64, error) {
 	result, err := q.db.Exec(ctx, failJob,
+		arg.Retryable,
 		arg.RetryAt,
 		arg.Cause,
 		arg.ID,
@@ -295,6 +298,31 @@ func (q *Queries) GetJobChildren(ctx context.Context, parentJobID pgtype.UUID) (
 		return nil, err
 	}
 	return items, nil
+}
+
+const getJobWorkflowID = `-- name: GetJobWorkflowID :one
+WITH RECURSIVE ancestors AS (
+    SELECT job.id, job.parent_job_id
+    FROM sync_jobs job
+    WHERE job.id = $1
+
+    UNION ALL
+
+    SELECT parent.id, parent.parent_job_id
+    FROM sync_jobs parent
+    JOIN ancestors child ON child.parent_job_id = parent.id
+)
+SELECT ancestors.id
+FROM ancestors
+WHERE ancestors.parent_job_id IS NULL
+LIMIT 1
+`
+
+func (q *Queries) GetJobWorkflowID(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getJobWorkflowID, id)
+	var id_2 pgtype.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const insertJobAttempt = `-- name: InsertJobAttempt :exec

@@ -18,8 +18,44 @@ func setRequiredEnvironment(t *testing.T) {
 		"SESSION_SECRET":         "test-session-secret",
 		"OPENAI_MODEL":           "",
 		"OPENAI_EMBEDDING_MODEL": "",
+		"WORKER_CONCURRENCY":     "",
 	} {
 		t.Setenv(name, value)
+	}
+}
+
+func TestLoadWorkerConcurrency(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		setRequiredEnvironment(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.WorkerConcurrency != 10 {
+			t.Fatalf("WorkerConcurrency = %d, want 10", cfg.WorkerConcurrency)
+		}
+	})
+
+	t.Run("explicit", func(t *testing.T) {
+		setRequiredEnvironment(t)
+		t.Setenv("WORKER_CONCURRENCY", "16")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.WorkerConcurrency != 16 {
+			t.Fatalf("WorkerConcurrency = %d, want 16", cfg.WorkerConcurrency)
+		}
+	})
+
+	for _, value := range []string{"0", "65", "not-a-number"} {
+		t.Run("reject "+value, func(t *testing.T) {
+			setRequiredEnvironment(t)
+			t.Setenv("WORKER_CONCURRENCY", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WORKER_CONCURRENCY") {
+				t.Fatalf("Load() error = %v, want WORKER_CONCURRENCY validation error", err)
+			}
+		})
 	}
 }
 

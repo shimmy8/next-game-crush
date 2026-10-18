@@ -1,29 +1,53 @@
 import type { SyncStatus } from '../api/types'
+import { diagnosticErrorLabel } from '../ui/labels'
+import { deriveSyncPresentation, type StageCounts } from './syncProgressModel'
 
-const STATUS_COPY: Record<string, string> = { queued: 'В очереди', running: 'В работе', waiting: 'Ожидает этапы', retryable: 'Ожидает повтора', succeeded: 'Готово', ready: 'Готово', failed: 'Сбой этапа', dead: 'Сбой этапа' }
+function countsLabel(counts: StageCounts) {
+  const parts = [
+    `Всего ${counts.total}`,
+    `Завершено ${counts.completed}`,
+    `Ожидают ${counts.pending}`,
+    `С ошибкой ${counts.failed}`,
+  ]
+  if (counts.unknown > 0) parts.push(`Статус уточняется: ${counts.unknown}`)
+  return parts.join(' · ')
+}
 
 export default function SyncProgress({ value, requestError }: { value: SyncStatus | null; requestError?: string }) {
   if (!value && !requestError) return null
-  const unavailable = value?.stages?.some((stage) => stage.availability === 'unavailable') ?? false
-  const degraded = ['succeeded', 'ready'].includes(value?.status ?? '') && (value?.stages?.some((stage) => Boolean(stage.error) || ['failed', 'dead'].includes(stage.status) || stage.availability === 'request_failed') ?? false)
-  const incomplete = value ? ['queued', 'running', 'waiting', 'retryable'].includes(value.status) : false
-  const state = requestError ? 'request-failed' : unavailable ? 'unavailable' : ['dead', 'failed'].includes(value?.status ?? '') ? 'failed' : degraded ? 'degraded' : incomplete ? 'incomplete' : 'ready'
-  const headline = {
-    unavailable: 'Источник недоступен',
-    'request-failed': 'Не удалось проверить статус',
-    failed: 'Синхронизация завершилась с ошибкой',
-    degraded: 'Обновлено не полностью',
-    incomplete: 'Синхронизация не завершена',
-    ready: 'Синхронизация завершена',
-  }[state]
+
+  const presentation = deriveSyncPresentation(value, requestError)
+  const progress = value ? Math.max(0, Math.min(100, value.progress)) : null
+  const indeterminate = presentation.state === 'active' && progress === 0
+
   return (
-    <section className={`sync-progress sync-progress--${state}`} role="status" aria-live="polite">
+    <section className={`sync-progress sync-progress--${presentation.state}`} aria-labelledby="sync-progress-title">
       <div className="sync-progress__head">
-        <div><strong>{headline}</strong>{requestError && state === 'request-failed' && <small>{requestError}</small>}{state === 'failed' && value?.error && <small>{value.error}</small>}</div>
-        {value && <span>{Math.max(0, Math.min(100, value.progress))}%</span>}
+        <div className="sync-progress__summary" role="status" aria-live="polite" aria-atomic="true">
+          <strong id="sync-progress-title">{presentation.headline}</strong>
+        </div>
+        {progress !== null && !indeterminate && <span aria-hidden="true">{progress}%</span>}
       </div>
-      {value && <progress max="100" value={value.progress}>{value.progress}%</progress>}
-      {value?.stages?.length ? <ul>{value.stages.map((stage) => <li key={`${stage.kind}-${stage.stage}`}><span>{stage.stage}</span><span>{stage.availability === 'unavailable' ? 'Недоступно' : stage.availability === 'not_modified' ? 'Актуально' : stage.availability === 'request_failed' || stage.error ? 'Сбой этапа' : STATUS_COPY[stage.status] || 'Не завершено'}</span></li>)}</ul> : null}
+      {presentation.warning && <p className="sync-progress__warning">{presentation.warning}</p>}
+      {presentation.state === 'failed' && value?.error && (
+        <p className="sync-progress__error">{diagnosticErrorLabel(value.error)}</p>
+      )}
+      {progress !== null && <progress aria-label="Прогресс синхронизации" max="100" value={indeterminate ? undefined : progress} />}
+      {presentation.rows.length > 0 && (
+        <div className="sync-progress__details" role="region" aria-label="Этапы синхронизации" tabIndex={0}>
+          <ul>
+            {presentation.rows.map((row) => (
+              <li key={row.key}>
+                <span>{row.label}</span>
+                <span className="sync-progress__stage-status">
+                  {row.counts && <span>{countsLabel(row.counts)}</span>}
+                  {row.statusLabel && <span>{row.statusLabel}</span>}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </section>
   )
 }

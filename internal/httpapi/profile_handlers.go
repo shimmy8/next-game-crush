@@ -32,7 +32,7 @@ func getProfile(service ProfileReadService) http.HandlerFunc {
 			http.Error(w, "profile unavailable", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, value)
+		writeJSON(w, profile.WithSummaryState(value))
 	}
 }
 

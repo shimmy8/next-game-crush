@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getCalendar, getProfile, getSyncStatus, startSync } from './client'
-import type { DashboardData, DashboardLoadState, SyncStatus } from './types'
+import { getCalendar, getCurrentSync, getProfile, getSyncStatus, preflightSync, startSync } from './client'
+import type { DashboardData, DashboardLoadState, PreflightResponse, SyncStatus } from './types'
 
 const EMPTY_CALENDAR: DashboardData['calendar'] = { exactDates: [], month: [], quarter: [], year: [], comingSoon: [], tba: [] }
 
@@ -29,6 +29,10 @@ function waitFor(milliseconds: number, signal: AbortSignal) {
     function done() { window.clearTimeout(timer); signal.removeEventListener('abort', done); resolve() }
     signal.addEventListener('abort', done, { once: true })
   })
+}
+
+function isAbortError(error: unknown) {
+  return typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError'
 }
 
 export async function pollSyncJob(jobId: string, options: PollOptions): Promise<SyncStatus | undefined> {
@@ -92,25 +96,63 @@ export function useSync(csrfToken: string, onComplete: () => void) {
   const [sync, setSync] = useState<SyncStatus | null>(null)
   const [starting, setStarting] = useState(false)
   const [requestError, setRequestError] = useState('')
+  const [preflight, setPreflight] = useState<PreflightResponse | null>(null)
+  const [preflightError, setPreflightError] = useState('')
+  const [checking, setChecking] = useState(false)
   const abort = useRef<AbortController | null>(null)
+  const onCompleteRef = useRef(onComplete)
 
-  useEffect(() => () => abort.current?.abort(), [])
+  useEffect(() => {
+    onCompleteRef.current = onComplete
+  }, [onComplete])
+
+  const handleCompletion = useCallback((terminal: SyncStatus | undefined) => {
+    if (terminal?.status === 'succeeded' || terminal?.status === 'ready') onCompleteRef.current()
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    abort.current = controller
+    void (async () => {
+      try {
+        const current = await getCurrentSync(controller.signal)
+        if (controller.signal.aborted || !current) return
+        setSync(current)
+        const terminal = await pollSyncJob(current.id, { signal: controller.signal, onStatus: setSync })
+        handleCompletion(terminal)
+      } catch (error) {
+        if (controller.signal.aborted || isAbortError(error)) return
+        setRequestError('Связь с сервером прервалась')
+      }
+    })()
+    return () => abort.current?.abort()
+  }, [handleCompletion])
 
   const run = useCallback(async () => {
     abort.current?.abort()
     const controller = new AbortController()
     abort.current = controller
-    setStarting(true); setRequestError('')
+    let passedPreflight = false
+    setChecking(true); setStarting(false); setRequestError(''); setPreflightError(''); setPreflight(null)
     try {
+      const checked = await preflightSync(csrfToken, controller.signal)
+      if (controller.signal.aborted) return
+      setPreflight(checked)
+      setChecking(false)
+      if (!checked.canSync) return
+      passedPreflight = true
+      setStarting(true)
       const { jobId } = await startSync(csrfToken, controller.signal)
       const terminal = await pollSyncJob(jobId, { signal: controller.signal, onStatus: setSync })
-      if (terminal?.status === 'succeeded' || terminal?.status === 'ready') onComplete()
-    } catch {
-      if (!controller.signal.aborted) setRequestError('Связь с сервером прервалась')
+      handleCompletion(terminal)
+    } catch (error) {
+      if (controller.signal.aborted || isAbortError(error)) return
+      if (!passedPreflight) setPreflightError('Не удалось проверить доступ к Steam')
+      else setRequestError('Связь с сервером прервалась')
     } finally {
-      if (!controller.signal.aborted) setStarting(false)
+      if (!controller.signal.aborted) { setChecking(false); setStarting(false) }
     }
-  }, [csrfToken, onComplete])
+  }, [csrfToken, handleCompletion])
 
-  return { sync, starting, requestError, run }
+  return { sync, starting, requestError, preflight, preflightError, checking, run }
 }

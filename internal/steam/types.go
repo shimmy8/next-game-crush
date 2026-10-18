@@ -1,9 +1,59 @@
 package steam
 
 import (
+	"errors"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
+
+type Visibility string
+
+const (
+	VisibilityPublic  Visibility = "public"
+	VisibilityPrivate Visibility = "private"
+	VisibilityUnknown Visibility = "unknown"
+)
+
+type PlayerSummary struct {
+	Visibility  Visibility
+	DisplayName string
+	AvatarURL   string
+}
+
+var allowedAvatarHosts = map[string]struct{}{
+	"avatars.steamstatic.com":            {},
+	"avatars.cloudflare.steamstatic.com": {},
+	"avatars.fastly.steamstatic.com":     {},
+	"avatars.akamai.steamstatic.com":     {},
+}
+
+func ValidateAvatarURL(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Port() != "" || parsed.Host != parsed.Hostname() {
+		return "", errors.New("invalid Steam avatar URL")
+	}
+	if _, ok := allowedAvatarHosts[strings.ToLower(parsed.Hostname())]; !ok {
+		return "", errors.New("invalid Steam avatar URL")
+	}
+	return parsed.String(), nil
+}
+
+// ValidateCoverURL accepts only HTTPS assets served from Valve's Steam CDN.
+// The URL is presentation data from a stored upstream snapshot, so callers
+// must treat an invalid value as absent rather than proxying or rendering it.
+func ValidateCoverURL(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Port() != "" || parsed.Host != parsed.Hostname() {
+		return "", errors.New("invalid Steam cover URL")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host != "steamstatic.com" && !strings.HasSuffix(host, ".steamstatic.com") {
+		return "", errors.New("invalid Steam cover URL")
+	}
+	return parsed.String(), nil
+}
 
 // Availability describes whether a Steam data source yielded a trustworthy
 // snapshot. Callers must not replace a previous successful snapshot when the
@@ -26,6 +76,7 @@ const (
 	WishlistOperation       Operation = "wishlist"
 	AchievementsOperation   Operation = "achievements"
 	GameDetailsOperation    Operation = "game_details"
+	PlayerSummaryOperation  Operation = "player_summary"
 )
 
 // CacheKey identifies one cacheable upstream resource. Resource-scoped keys

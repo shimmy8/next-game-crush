@@ -17,6 +17,7 @@ import (
 	pgvector "github.com/pgvector/pgvector-go"
 	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/profile"
+	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
 )
 
@@ -400,7 +401,7 @@ func (r *SQLRepository) PublishRanking(ctx context.Context, userID uuid.UUID, ve
 }
 
 func (r *SQLRepository) Latest(ctx context.Context, userID uuid.UUID) ([]Recommendation, error) {
-	rows, err := r.store.Pool.Query(ctx, `SELECT r.id,r.game_id,g.name,p.version,r.ranking_version,r.algorithm_version,r.score,r.explanation,r.explanation_evidence,r.explanation_generated,r.created_at,rf.factors,rf.weights,
+	rows, err := r.store.Pool.Query(ctx, `SELECT r.id,r.game_id,g.steam_app_id,g.source_snapshot,g.name,p.version,r.ranking_version,r.algorithm_version,r.score,r.explanation,r.explanation_evidence,r.explanation_generated,r.created_at,rf.factors,rf.weights,
 	COALESCE(rd.precision,'unknown'),rd.release_date,rd.raw_text
 	FROM recommendations r JOIN games g ON g.id=r.game_id JOIN preference_profiles p ON p.id=r.profile_id JOIN recommendation_factors rf ON rf.recommendation_id=r.id
 	LEFT JOIN LATERAL(SELECT precision,release_date,raw_text FROM game_release_dates WHERE game_id=g.id ORDER BY observed_at DESC,id DESC LIMIT 1)rd ON true
@@ -421,7 +422,7 @@ func (r *SQLRepository) Latest(ctx context.Context, userID uuid.UUID) ([]Recomme
 	return result, rows.Err()
 }
 func (r *SQLRepository) Get(ctx context.Context, userID, id uuid.UUID) (Recommendation, error) {
-	row := r.store.Pool.QueryRow(ctx, `SELECT r.id,r.game_id,g.name,p.version,r.ranking_version,r.algorithm_version,r.score,r.explanation,r.explanation_evidence,r.explanation_generated,r.created_at,rf.factors,rf.weights,
+	row := r.store.Pool.QueryRow(ctx, `SELECT r.id,r.game_id,g.steam_app_id,g.source_snapshot,g.name,p.version,r.ranking_version,r.algorithm_version,r.score,r.explanation,r.explanation_evidence,r.explanation_generated,r.created_at,rf.factors,rf.weights,
 	COALESCE(rd.precision,'unknown'),rd.release_date,rd.raw_text FROM recommendations r JOIN games g ON g.id=r.game_id JOIN preference_profiles p ON p.id=r.profile_id JOIN recommendation_factors rf ON rf.recommendation_id=r.id
 	LEFT JOIN LATERAL(SELECT precision,release_date,raw_text FROM game_release_dates WHERE game_id=g.id ORDER BY observed_at DESC,id DESC LIMIT 1)rd ON true WHERE r.id=$1 AND r.user_id=$2 AND EXISTS(SELECT 1 FROM recommendation_runs run WHERE run.user_id=r.user_id AND run.ranking_version=r.ranking_version AND run.published)`, id, userID)
 	return scanRecommendation(row)
@@ -435,11 +436,13 @@ func scanRecommendation(row scanner) (Recommendation, error) {
 	var evidence []byte
 	var generated bool
 	var factors, weights []byte
+	var snapshot []byte
 	var releaseDate pgtype.Date
 	var raw pgtype.Text
-	if err := row.Scan(&r.ID, &r.GameID, &r.Name, &r.ProfileVersion, &r.RankingVersion, &r.AlgorithmVersion, &r.Score, &explanation, &evidence, &generated, &r.CreatedAt, &factors, &weights, &r.Release.Precision, &releaseDate, &raw); err != nil {
+	if err := row.Scan(&r.ID, &r.GameID, &r.SteamAppID, &snapshot, &r.Name, &r.ProfileVersion, &r.RankingVersion, &r.AlgorithmVersion, &r.Score, &explanation, &evidence, &generated, &r.CreatedAt, &factors, &weights, &r.Release.Precision, &releaseDate, &raw); err != nil {
 		return Recommendation{}, err
 	}
+	r.CoverImageURL, r.StoreURL = steamPresentation(r.SteamAppID, snapshot)
 	_ = json.Unmarshal(factors, &r.Factors)
 	_ = json.Unmarshal(weights, &r.Weights)
 	r.Confidence = r.Factors.Confidence
@@ -455,6 +458,22 @@ func scanRecommendation(row scanner) (Recommendation, error) {
 		r.Release.Raw = raw.String
 	}
 	return r, nil
+}
+
+func steamPresentation(appID int64, snapshot []byte) (string, string) {
+	if appID <= 0 {
+		return "", ""
+	}
+	storeURL := fmt.Sprintf("https://store.steampowered.com/app/%d/", appID)
+	var details steam.GameDetails
+	if len(snapshot) == 0 || json.Unmarshal(snapshot, &details) != nil {
+		return "", storeURL
+	}
+	coverURL, err := steam.ValidateCoverURL(details.HeaderImage)
+	if err != nil {
+		return "", storeURL
+	}
+	return coverURL, storeURL
 }
 func nullableText(value string) any {
 	if value == "" {

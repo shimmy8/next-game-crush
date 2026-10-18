@@ -49,6 +49,41 @@ func TestRankingReadEndpointsRequireAuthenticationAndUseSessionOwner(t *testing.
 	}
 }
 
+func TestProfileResponseExposesSummaryAvailability(t *testing.T) {
+	for _, test := range []struct {
+		name, summary, status string
+	}{
+		{name: "unavailable", status: "unavailable"},
+		{name: "ready", summary: "Любит вдумчивые кооперативные игры.", status: "ready"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authService, sessions := handlerService(t, "http://localhost:8080")
+			session := sessions.addSession()
+			profiles := &fakeProfileReader{value: profile.Profile{ID: uuid.New(), Version: 3, Summary: test.summary}}
+			router := NewRouter(Dependencies{Auth: authService, Profile: profiles})
+			req := httptest.NewRequest(http.MethodGet, "/api/profile", nil)
+			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, req)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var got struct {
+				Summary       string `json:"summary"`
+				SummaryStatus string `json:"summaryStatus"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Summary != test.summary || got.SummaryStatus != test.status {
+				t.Fatalf("profile summary = %q/%q, want %q/%q", got.Summary, got.SummaryStatus, test.summary, test.status)
+			}
+		})
+	}
+}
+
 type fakeProfileReader struct {
 	value  profile.Profile
 	userID uuid.UUID

@@ -14,7 +14,7 @@ import (
 const (
 	openIDNamespace    = "http://specs.openid.net/auth/2.0"
 	identifierSelect   = "http://specs.openid.net/auth/2.0/identifier_select"
-	defaultProviderURL = "https://steamcommunity.com/openid/"
+	defaultProviderURL = "https://steamcommunity.com/openid/login"
 )
 
 var ErrProviderRejected = errors.New("OpenID provider rejected the assertion")
@@ -45,23 +45,29 @@ func (p *HTTPProvider) Verify(ctx context.Context, assertion url.Values) error {
 	values.Set("openid.mode", "check_authentication")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, strings.NewReader(values.Encode()))
 	if err != nil {
-		return fmt.Errorf("build OpenID verification request: %w", err)
+		return failure(fmt.Errorf("build OpenID verification request: %w", err), "provider_verification", "transport_failure", true)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("verify OpenID assertion: %w", err)
+		reason := "transport_failure"
+		if errors.Is(err, context.DeadlineExceeded) {
+			reason = "timeout"
+		} else if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+			reason = "timeout"
+		}
+		return failure(fmt.Errorf("verify OpenID assertion: %w", err), "provider_verification", reason, true)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return ErrProviderRejected
+		return failure(ErrProviderRejected, "provider_verification", "rejected", false)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, (8<<10)+1))
 	if err != nil {
-		return fmt.Errorf("read OpenID verification response: %w", err)
+		return failure(fmt.Errorf("read OpenID verification response: %w", err), "provider_verification", "transport_failure", true)
 	}
 	if len(body) > 8<<10 {
-		return ErrProviderRejected
+		return failure(ErrProviderRejected, "provider_verification", "invalid_response", false)
 	}
 	validValues := 0
 	for _, line := range strings.Split(string(body), "\n") {
@@ -69,12 +75,12 @@ func (p *HTTPProvider) Verify(ctx context.Context, assertion url.Values) error {
 		if ok && key == "is_valid" {
 			validValues++
 			if value != "true" {
-				return ErrProviderRejected
+				return failure(ErrProviderRejected, "provider_verification", "rejected", false)
 			}
 		}
 	}
 	if validValues == 1 {
 		return nil
 	}
-	return ErrProviderRejected
+	return failure(ErrProviderRejected, "provider_verification", "invalid_response", false)
 }

@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
+
+const maxWorkerConcurrency = 64
 
 // OpenAICapability reports whether credentials are configured for AI calls.
 type OpenAICapability struct {
@@ -31,6 +34,7 @@ type Config struct {
 	SteamStoreBaseURL    string
 	OpenAIBaseURL        string
 	HTTPAddr             string
+	WorkerConcurrency    int
 }
 
 func Load() (Config, error) {
@@ -51,9 +55,18 @@ func Load() (Config, error) {
 		SteamStoreBaseURL:    strings.TrimSpace(os.Getenv("STEAM_STORE_BASE_URL")),
 		OpenAIBaseURL:        strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
 		HTTPAddr:             envOrDefault("HTTP_ADDR", ":8080"),
+		WorkerConcurrency:    10,
 	}
 	cfg.OpenAI = OpenAICapability{Enabled: cfg.OpenAIAPIKey != ""}
 	var problems []string
+	if raw := strings.TrimSpace(os.Getenv("WORKER_CONCURRENCY")); raw != "" {
+		concurrency, err := strconv.Atoi(raw)
+		if err != nil || concurrency < 1 || concurrency > maxWorkerConcurrency {
+			problems = append(problems, fmt.Sprintf("WORKER_CONCURRENCY must be an integer between 1 and %d", maxWorkerConcurrency))
+		} else {
+			cfg.WorkerConcurrency = concurrency
+		}
+	}
 	for _, required := range []struct{ name, value string }{
 		{"ALLOWED_STEAM_ID", cfg.AllowedSteamID},
 		{"STEAM_WEB_API_KEY", cfg.SteamWebAPIKey},

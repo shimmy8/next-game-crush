@@ -7,12 +7,48 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 )
 
 func main() {
+	var steamPrivacy atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
-	mux.HandleFunc("/IPlayerService/GetOwnedGames/v1/", jsonHandler(map[string]any{"response": map[string]any{"game_count": 1, "games": []any{map[string]any{"appid": 10, "name": "Fixture Classic", "playtime_forever": 1200, "playtime_2weeks": 60, "rtime_last_played": 1792195200}}}}))
+	mux.HandleFunc("/__test/steam-privacy", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		switch r.URL.Query().Get("mode") {
+		case "public":
+			steamPrivacy.Store(0)
+		case "private":
+			steamPrivacy.Store(1)
+		case "ambiguous":
+			steamPrivacy.Store(2)
+		default:
+			http.Error(w, "unknown fixture mode", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/ISteamUser/GetPlayerSummaries/v2/", func(w http.ResponseWriter, r *http.Request) {
+		visibility := 3
+		if steamPrivacy.Load() == 1 {
+			visibility = 1
+		}
+		writeJSON(w, map[string]any{"response": map[string]any{"players": []any{map[string]any{
+			"steamid": r.URL.Query().Get("steamids"), "communityvisibilitystate": visibility,
+			"personaname": "Fixture Player", "avatarfull": "https://avatars.cloudflare.steamstatic.com/fixture-avatar.jpg",
+		}}}})
+	})
+	mux.HandleFunc("/IPlayerService/GetOwnedGames/v1/", func(w http.ResponseWriter, _ *http.Request) {
+		if steamPrivacy.Load() == 2 {
+			writeJSON(w, map[string]any{"response": map[string]any{"game_count": 0, "games": []any{}}})
+			return
+		}
+		writeJSON(w, map[string]any{"response": map[string]any{"game_count": 1, "games": []any{map[string]any{"appid": 10, "name": "Fixture Classic", "playtime_forever": 1200, "playtime_2weeks": 60, "rtime_last_played": 1792195200}}}})
+	})
 	mux.HandleFunc("/IPlayerService/GetRecentlyPlayedGames/v1/", jsonHandler(map[string]any{"response": map[string]any{"total_count": 1, "games": []any{map[string]any{"appid": 10, "name": "Fixture Classic", "playtime_forever": 1200, "playtime_2weeks": 60, "rtime_last_played": 1792195200}}}}))
 	mux.HandleFunc("/IWishlistService/GetWishlist/v1/", jsonHandler(map[string]any{"response": map[string]any{"items": []any{map[string]any{"appid": 20, "priority": 1, "date_added": 1792195200}}}}))
 	mux.HandleFunc("/ISteamUserStats/GetPlayerAchievements/v1/", jsonHandler(map[string]any{"playerstats": map[string]any{"gameName": "Fixture Classic", "success": true, "achievements": []any{map[string]any{"achieved": 1, "unlocktime": 1700000000}, map[string]any{"achieved": 0, "unlocktime": 0}}}}))

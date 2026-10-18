@@ -2,6 +2,7 @@ package recommendations
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -117,6 +118,91 @@ func TestRebuildRetrievesSemanticAndWishlistCandidatesAndPersistsFactors(t *test
 	if err != nil || len(latest) != 2 || latest[0].RankingVersion != 2 || len(latest[0].Evidence) == 0 || latest[0].Evidence[0].Text == "" {
 		t.Fatalf("latest=%#v err=%v", latest, err)
 	}
+}
+
+func TestLatestAndGetExposeSteamPresentation(t *testing.T) {
+	db := openRankingStore(t)
+	ctx := context.Background()
+	userID, profileID, gameID, recommendationID, runID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	now := time.Now().UTC()
+	factors, _ := json.Marshal(Factors{Wishlist: 1, TagAffinity: 0.5, Confidence: 0.75})
+	weights, _ := json.Marshal(DefaultWeights())
+	legacyEvidence := []byte(`[{"id":"score","text":"deterministic score 75.000"},{"id":"factors","text":"{\"wishlist\":1}"},{"id":"release-window","text":"coming_soon:To be announced"}]`)
+	statements := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO users(id) VALUES($1)`, []any{userID}},
+		{`INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at,source_snapshot) VALUES($1,620,'Portal 2','steam_store',$2,$3)`, []any{gameID, now, []byte(`{"HeaderImage":"https://cdn.cloudflare.steamstatic.com/steam/apps/620/header.jpg"}`)}},
+		{`INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata) VALUES($1,$2,1,'{}')`, []any{profileID, userID}},
+		{`INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key,published) VALUES($1,$2,$3,1,$4,'presentation-test',true)`, []any{runID, userID, profileID, AlgorithmVersion}},
+		{`INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,ranking_version,score,explanation,explanation_evidence,explanation_generated) VALUES($1,$2,$3,$4,$5,1,75,$6,$7,false)`, []any{recommendationID, userID, gameID, profileID, AlgorithmVersion, `Recommended because of: deterministic score 75.000, {"wishlist":1}, coming_soon:To be announced.`, legacyEvidence}},
+		{`INSERT INTO recommendation_factors(recommendation_id,factors,weights) VALUES($1,$2,$3)`, []any{recommendationID, factors, weights}},
+	}
+	for _, statement := range statements {
+		if _, err := db.Pool.Exec(ctx, statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	repo, err := NewSQLRepository(db, "embed", "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, err := repo.Latest(ctx, userID)
+	if err != nil || len(latest) != 1 {
+		t.Fatalf("Latest = %#v, %v", latest, err)
+	}
+	assertSteamPresentation(t, latest[0])
+	got, err := repo.Get(ctx, userID, recommendationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSteamPresentation(t, got)
+
+	profileRepo, err := profile.NewSQLRepository(db, "embed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := profile.NewService(profileRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(repo, profiles, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	safeLatest, err := service.Latest(ctx, userID)
+	if err != nil || len(safeLatest) != 1 {
+		t.Fatalf("safe Latest = %#v, %v", safeLatest, err)
+	}
+	assertSafeLegacyPresentation(t, safeLatest[0])
+	safeGet, err := service.Get(ctx, userID, recommendationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSafeLegacyPresentation(t, safeGet)
+}
+
+func assertSteamPresentation(t *testing.T, got Recommendation) {
+	t.Helper()
+	if got.SteamAppID != 620 || got.CoverImageURL != "https://cdn.cloudflare.steamstatic.com/steam/apps/620/header.jpg" || got.StoreURL != "https://store.steampowered.com/app/620/" {
+		t.Fatalf("steam presentation = %#v", got)
+	}
+}
+
+func assertSafeLegacyPresentation(t *testing.T, got Recommendation) {
+	t.Helper()
+	public := strings.ToLower(got.Explanation)
+	for _, forbidden := range []string{"deterministic score", "{", "wishlist\"", "coming_soon", "to be announced"} {
+		if strings.Contains(public, forbidden) {
+			t.Fatalf("safe explanation leaks %q: %q", forbidden, got.Explanation)
+		}
+	}
+	if len(got.Evidence) == 0 || len(got.Evidence) > 3 || got.GeneratedExplanation {
+		t.Fatalf("safe evidence = %#v generated=%v", got.Evidence, got.GeneratedExplanation)
+	}
+	assertSteamPresentation(t, got)
 }
 
 func insertRankingGame(t *testing.T, db *store.Store, appID int64, name string) uuid.UUID {

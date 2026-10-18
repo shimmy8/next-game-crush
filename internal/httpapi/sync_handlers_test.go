@@ -1,16 +1,116 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/auth"
+	"next-game-crush/internal/observability"
 	syncservice "next-game-crush/internal/sync"
 )
+
+func TestSyncRequestLogAcceptedUsesGeneratedCorrelation(t *testing.T) {
+	authService, repo := handlerService(t, "http://localhost:8080")
+	session := repo.addSession()
+	jobID := uuid.New()
+	var logs bytes.Buffer
+	router := NewRouter(Dependencies{Auth: authService, Sync: &fakeSyncService{jobID: jobID}, Observability: observability.New(slog.New(slog.NewJSONHandler(&logs, nil)))})
+	req := httptest.NewRequest(http.MethodPost, "/api/sync", nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	req.Header.Set("X-CSRF-Token", session.CSRFToken)
+	req.Header.Set("X-Request-ID", "hostile-request-id-canary")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	records := decodeLogRecords(t, logs.String())
+	if len(records) != 1 {
+		t.Fatalf("records=%#v", records)
+	}
+	record := records[0]
+	if record["event"] != "sync_request" || record["outcome"] != "accepted" || record["workflow_id"] != jobID.String() || record["http_status"] != float64(http.StatusAccepted) {
+		t.Fatalf("record=%#v", record)
+	}
+	allowed := map[string]bool{"time": true, "level": true, "msg": true, "event": true, "outcome": true, "request_id": true, "workflow_id": true, "http_status": true, "duration_ms": true}
+	for key := range record {
+		if !allowed[key] {
+			t.Fatalf("unexpected sync_request field %q in %#v", key, record)
+		}
+	}
+	requestID, _ := record["request_id"].(string)
+	if requestID == "" || requestID != recorder.Header().Get("X-Request-ID") || requestID == "hostile-request-id-canary" {
+		t.Fatalf("request ID=%q response=%q", requestID, recorder.Header().Get("X-Request-ID"))
+	}
+	if strings.Contains(logs.String(), "hostile-request-id-canary") || strings.Contains(logs.String(), session.UserID.String()) {
+		t.Fatalf("sensitive value leaked: %s", logs.String())
+	}
+}
+
+func TestSyncRequestLogFailuresAreBounded(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		err    error
+		status int
+		reason string
+	}{
+		{name: "blocked", err: fmt.Errorf("%w: private-canary", syncservice.ErrPreflightBlocked), status: http.StatusConflict, reason: "upstream_unavailable"},
+		{name: "upstream", err: fmt.Errorf("%w: upstream-canary", syncservice.ErrPreflightFailed), status: http.StatusBadGateway, reason: "upstream_unavailable"},
+		{name: "internal", err: errors.New("database-canary"), status: http.StatusInternalServerError, reason: "internal_error"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authService, repo := handlerService(t, "http://localhost:8080")
+			session := repo.addSession()
+			var logs bytes.Buffer
+			router := NewRouter(Dependencies{Auth: authService, Sync: &fakeSyncService{startErr: test.err}, Observability: observability.New(slog.New(slog.NewJSONHandler(&logs, nil)))})
+			req := httptest.NewRequest(http.MethodPost, "/api/sync", nil)
+			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+			req.Header.Set("X-CSRF-Token", session.CSRFToken)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+			if recorder.Code != test.status {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			records := decodeLogRecords(t, logs.String())
+			if len(records) != 1 || records[0]["outcome"] != "failed" || records[0]["http_status"] != float64(test.status) || records[0]["reason"] != test.reason {
+				t.Fatalf("records=%#v", records)
+			}
+			if _, ok := records[0]["workflow_id"]; ok {
+				t.Fatalf("failed event has workflow ID: %#v", records[0])
+			}
+			if strings.Contains(logs.String(), "canary") {
+				t.Fatalf("raw error leaked: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestSyncRequestLogNotEmittedBeforeAuthAndCSRF(t *testing.T) {
+	authService, repo := handlerService(t, "http://localhost:8080")
+	session := repo.addSession()
+	var logs bytes.Buffer
+	router := NewRouter(Dependencies{Auth: authService, Sync: &fakeSyncService{jobID: uuid.New()}, Observability: observability.New(slog.New(slog.NewJSONHandler(&logs, nil)))})
+	requests := []*http.Request{
+		httptest.NewRequest(http.MethodPost, "/api/sync", nil),
+		httptest.NewRequest(http.MethodPost, "/api/sync", nil),
+	}
+	requests[1].AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	for _, req := range requests {
+		router.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	if strings.Contains(logs.String(), `"event":"sync_request"`) {
+		t.Fatalf("pre-handler rejection emitted sync event: %s", logs.String())
+	}
+}
 
 func TestSyncEndpointsRequireAuthenticationAndCSRF(t *testing.T) {
 	authService, repo := handlerService(t, "http://localhost:8080")
@@ -63,16 +163,197 @@ func TestSyncStatusRequiresOwnerSession(t *testing.T) {
 	}
 }
 
+func TestCurrentSyncContract(t *testing.T) {
+	authService, repo := handlerService(t, "http://localhost:8080")
+	session := repo.addSession()
+	jobID := uuid.New()
+	fake := &fakeSyncService{currentStatus: syncservice.Status{ID: jobID, Stage: "catalog", Status: "running", Progress: 40}, currentFound: true}
+	router := NewRouter(Dependencies{Auth: authService, Sync: fake})
+
+	t.Run("authenticated active sync", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/sync/current", nil)
+		req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var got syncservice.Status
+		if err := json.NewDecoder(recorder.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != jobID || got.Progress != 40 || fake.currentUser != session.UserID {
+			t.Fatalf("status=%#v current user=%s", got, fake.currentUser)
+		}
+	})
+
+	t.Run("no active sync", func(t *testing.T) {
+		fake.currentFound = false
+		req := httptest.NewRequest(http.MethodGet, "/api/sync/current", nil)
+		req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusNoContent || recorder.Body.Len() != 0 {
+			t.Fatalf("status=%d body=%q", recorder.Code, recorder.Body.String())
+		}
+	})
+
+	t.Run("authentication required", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/sync/current", nil))
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+	})
+}
+
+func TestSyncPreflightContract(t *testing.T) {
+	authService, repo := handlerService(t, "http://localhost:8080")
+	session := repo.addSession()
+	displayName, avatarURL := "Player", "https://avatars.cloudflare.steamstatic.com/avatar.jpg"
+	fake := &fakeSyncService{preflight: syncservice.PreflightResult{
+		CanSync: true, ProfileVisibility: "public", GameDetailsVisibility: "public", DisplayName: &displayName, AvatarURL: &avatarURL,
+	}}
+	router := NewRouter(Dependencies{Auth: authService, Sync: fake})
+
+	for _, test := range []struct {
+		name       string
+		withCookie bool
+		withCSRF   bool
+		status     int
+	}{
+		{name: "unauthenticated", status: http.StatusUnauthorized},
+		{name: "missing csrf", withCookie: true, status: http.StatusForbidden},
+		{name: "success", withCookie: true, withCSRF: true, status: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/sync/preflight", nil)
+			if test.withCookie {
+				req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+			}
+			if test.withCSRF {
+				req.Header.Set("X-CSRF-Token", session.CSRFToken)
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+			if recorder.Code != test.status {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if test.status == http.StatusOK {
+				var got syncservice.PreflightResult
+				if err := json.NewDecoder(recorder.Body).Decode(&got); err != nil || !got.CanSync || got.ProfileVisibility != "public" || got.GameDetailsVisibility != "public" || got.Reason != nil || got.DisplayName == nil || *got.DisplayName != displayName {
+					t.Fatalf("response = %#v, err = %v", got, err)
+				}
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name        string
+		result      syncservice.PreflightResult
+		wantProfile string
+		wantGames   string
+		wantReason  string
+	}{
+		{name: "private profile", result: syncservice.PreflightResult{ProfileVisibility: "private", GameDetailsVisibility: "unknown", Reason: stringTestPointer("profile_private")}, wantProfile: "private", wantGames: "unknown", wantReason: "profile_private"},
+		{name: "ambiguous game details", result: syncservice.PreflightResult{ProfileVisibility: "public", GameDetailsVisibility: "unknown", Reason: stringTestPointer("game_details_unavailable")}, wantProfile: "public", wantGames: "unknown", wantReason: "game_details_unavailable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake.preflight = test.result
+			req := httptest.NewRequest(http.MethodPost, "/api/sync/preflight", nil)
+			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+			req.Header.Set("X-CSRF-Token", session.CSRFToken)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+			var got syncservice.PreflightResult
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if err := json.NewDecoder(recorder.Body).Decode(&got); err != nil || got.CanSync || string(got.ProfileVisibility) != test.wantProfile || string(got.GameDetailsVisibility) != test.wantGames || got.Reason == nil || *got.Reason != test.wantReason {
+				t.Fatalf("response = %#v, err = %v", got, err)
+			}
+		})
+	}
+}
+
+func stringTestPointer(value string) *string { return &value }
+
+func TestSyncPreflightFailuresAreBounded(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		err    error
+		status int
+		reason string
+	}{
+		{name: "upstream", err: fmt.Errorf("%w: canary-private-id payload", syncservice.ErrPreflightFailed), status: http.StatusBadGateway, reason: "check_failed"},
+		{name: "persistence", err: errors.New("canary-database-error"), status: http.StatusInternalServerError, reason: "internal_error"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authService, repo := handlerService(t, "http://localhost:8080")
+			session := repo.addSession()
+			var logs bytes.Buffer
+			fake := &fakeSyncService{preflightErr: test.err}
+			router := NewRouter(Dependencies{Auth: authService, Sync: fake, Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
+			req := httptest.NewRequest(http.MethodPost, "/api/sync/preflight", nil)
+			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+			req.Header.Set("X-CSRF-Token", session.CSRFToken)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+			if recorder.Code != test.status {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			var body struct {
+				Reason string `json:"reason"`
+			}
+			if err := json.NewDecoder(recorder.Body).Decode(&body); err != nil || body.Reason != test.reason {
+				t.Fatalf("body = %#v, err = %v", body, err)
+			}
+			if strings.Contains(recorder.Body.String(), "canary") || strings.Contains(logs.String(), "canary") {
+				t.Fatalf("response/logs leaked canary: %s / %s", recorder.Body.String(), logs.String())
+			}
+		})
+	}
+}
+
+func TestDirectSyncStartMapsBlockedPreflight(t *testing.T) {
+	authService, repo := handlerService(t, "http://localhost:8080")
+	session := repo.addSession()
+	fake := &fakeSyncService{startErr: syncservice.ErrPreflightBlocked}
+	router := NewRouter(Dependencies{Auth: authService, Sync: fake})
+	req := httptest.NewRequest(http.MethodPost, "/api/sync", nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	req.Header.Set("X-CSRF-Token", session.CSRFToken)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 type fakeSyncService struct {
-	jobID      uuid.UUID
-	status     syncservice.Status
-	statusUser uuid.UUID
+	jobID         uuid.UUID
+	status        syncservice.Status
+	statusUser    uuid.UUID
+	currentStatus syncservice.Status
+	currentFound  bool
+	currentErr    error
+	currentUser   uuid.UUID
+	preflight     syncservice.PreflightResult
+	preflightErr  error
+	startErr      error
 }
 
 func (f *fakeSyncService) Start(_ context.Context, _ uuid.UUID) (uuid.UUID, error) {
-	return f.jobID, nil
+	return f.jobID, f.startErr
+}
+func (f *fakeSyncService) Preflight(_ context.Context, _ uuid.UUID) (syncservice.PreflightResult, error) {
+	return f.preflight, f.preflightErr
 }
 func (f *fakeSyncService) GetStatus(_ context.Context, userID, _ uuid.UUID) (syncservice.Status, error) {
 	f.statusUser = userID
 	return f.status, nil
+}
+func (f *fakeSyncService) GetCurrentStatus(_ context.Context, userID uuid.UUID) (syncservice.Status, bool, error) {
+	f.currentUser = userID
+	return f.currentStatus, f.currentFound, f.currentErr
 }

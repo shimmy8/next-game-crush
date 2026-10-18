@@ -301,6 +301,7 @@ type UserSourceState struct {
 	LastAttemptAt         pgtype.Timestamptz `json:"last_attempt_at"`
 	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
 	Error                 pgtype.Text        `json:"error"`
+	Visibility            pgtype.Text        `json:"visibility"`
 }
 
 type WishlistEntry struct {

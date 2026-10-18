@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +33,10 @@ func TestExtractGameFeaturesUsesStrictResponsesSchema(t *testing.T) {
 	client := newTestClient(t, server)
 	features, err := client.ExtractGameFeatures(context.Background(), GameEvidence{
 		EvidenceKey: "game-opaque", Name: "Portal 2",
-		Evidence: []EvidenceItem{{Key: "ev-title", Value: "Portal 2"}},
+		Evidence: []EvidenceItem{
+			{Key: " ev-title ", Value: "Portal 2"},
+			{Key: "ev-description", Value: "schema-value-canary"},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -47,9 +52,50 @@ func TestExtractGameFeaturesUsesStrictResponsesSchema(t *testing.T) {
 	if format["name"] != "game_features_v1" || format["schema"] == nil {
 		t.Fatalf("format = %#v", format)
 	}
+	schema := format["schema"].(map[string]any)
+	properties := schema["properties"].(map[string]any)
+	evidenceKeys := properties["evidence_keys"].(map[string]any)
+	items := evidenceKeys["items"].(map[string]any)
+	if got := items["enum"]; !reflect.DeepEqual(got, []any{"ev-description", "ev-title"}) {
+		t.Fatalf("evidence key enum = %#v", got)
+	}
+	if evidenceKeys["minItems"] != float64(1) || evidenceKeys["maxItems"] != float64(50) {
+		t.Fatalf("evidence key constraints = %#v", evidenceKeys)
+	}
+	if _, unsupported := evidenceKeys["uniqueItems"]; unsupported {
+		t.Fatalf("evidence key schema contains unsupported uniqueItems: %#v", evidenceKeys)
+	}
+	encodedSchema, _ := json.Marshal(schema)
+	if strings.Contains(string(encodedSchema), "schema-value-canary") || strings.Contains(string(encodedSchema), "Portal 2") {
+		t.Fatalf("evidence value leaked into schema: %s", encodedSchema)
+	}
 	encoded, _ := json.Marshal(request["input"])
 	if strings.Contains(string(encoded), "steam_id") || strings.Contains(string(encoded), "api_key") {
 		t.Fatalf("sensitive field leaked: %s", encoded)
+	}
+}
+
+func TestClassifiedOutputErrorsExposeOnlySafeReasons(t *testing.T) {
+	tests := []struct {
+		name, want string
+		err        error
+	}{
+		{name: "invalid evidence", err: fmt.Errorf("request context: %w", ErrInvalidEvidence), want: "invalid_evidence"},
+		{name: "invalid output", err: fmt.Errorf("request context: %w", ErrInvalidOutput), want: "invalid_output"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var classified interface{ SafeReason() string }
+			if !errors.As(test.err, &classified) {
+				t.Fatalf("error %v does not expose SafeReason", test.err)
+			}
+			if got := classified.SafeReason(); got != test.want {
+				t.Fatalf("SafeReason() = %q, want %q", got, test.want)
+			}
+			if strings.Contains(classified.SafeReason(), "request context") {
+				t.Fatalf("SafeReason leaked error context: %q", classified.SafeReason())
+			}
+		})
 	}
 }
 
@@ -119,7 +165,8 @@ func TestEmbedRequestsAndRequiresExactly1536Dimensions(t *testing.T) {
 }
 
 func TestProfileExplanationAndFeedbackStructuredOperations(t *testing.T) {
-	profileServer := responseServer(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"summary\":\"Likes puzzle games\",\"preferences\":[\"puzzles\"],\"avoidances\":[],\"uncertainty\":\"small sample\",\"evidence_keys\":[\"signal-1\"]}"}]}]}`)
+	profileText := strings.Repeat("я", 400)
+	profileServer := responseServer(fmt.Sprintf(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"summary\":\"%s\",\"preferences\":[\"puzzles\"],\"avoidances\":[],\"uncertainty\":\"small sample\",\"evidence_keys\":[\"signal-1\"]}"}]}]}`, profileText))
 	profileClient := newTestClient(t, profileServer)
 	profile, err := profileClient.BuildProfileSummary(context.Background(), ProfileEvidence{EvidenceKey: "profile", Evidence: []EvidenceItem{{Key: "signal-1", Value: "Portal; high playtime"}}})
 	profileServer.Close()
@@ -141,6 +188,79 @@ func TestProfileExplanationAndFeedbackStructuredOperations(t *testing.T) {
 	feedbackServer.Close()
 	if err != nil || classification.Actionable {
 		t.Fatalf("classification=%#v error=%v", classification, err)
+	}
+}
+
+func TestProfileSummaryUsesUnicodeLengthBoundaries(t *testing.T) {
+	allowed := map[string]struct{}{"signal-1": {}}
+	for _, test := range []struct {
+		name    string
+		length  int
+		wantErr bool
+	}{
+		{name: "below lower bound", length: 319, wantErr: true},
+		{name: "lower bound", length: 320},
+		{name: "upper bound", length: 720},
+		{name: "above upper bound", length: 721, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output := ProfileSummary{Summary: strings.Repeat("я", test.length), Preferences: []string{}, Avoidances: []string{}, EvidenceKeys: []string{"signal-1"}}
+			_, err := normalizeAndValidateProfileOutput(output, allowed)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, wantErr = %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestProfileSummaryNormalizesOptionalArraysWithoutFailing(t *testing.T) {
+	output, err := normalizeAndValidateProfileOutput(ProfileSummary{
+		Summary: strings.Repeat("я", 400),
+		Preferences: []string{
+			"  головоломки  ",
+			"",
+			"головоломки",
+			strings.Repeat("я", 144),
+			strings.Repeat("я", 145),
+		},
+		Avoidances:   nil,
+		Uncertainty:  "  мало данных  ",
+		EvidenceKeys: []string{"signal-1"},
+	}, map[string]struct{}{"signal-1": {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPreferences := []string{"головоломки", strings.Repeat("я", 144)}
+	if !reflect.DeepEqual(output.Preferences, wantPreferences) {
+		t.Fatalf("preferences = %#v, want %#v", output.Preferences, wantPreferences)
+	}
+	if output.Avoidances == nil || len(output.Avoidances) != 0 {
+		t.Fatalf("avoidances = %#v", output.Avoidances)
+	}
+	if output.Uncertainty != "мало данных" {
+		t.Fatalf("uncertainty = %q", output.Uncertainty)
+	}
+}
+
+func TestProfileSummaryStillRejectsUnknownEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		keys []string
+	}{
+		{name: "unknown", keys: []string{"made-up"}},
+		{name: "duplicate", keys: []string{"signal-1", "signal-1"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := normalizeAndValidateProfileOutput(ProfileSummary{
+				Summary:      strings.Repeat("я", 400),
+				Preferences:  []string{},
+				Avoidances:   []string{},
+				EvidenceKeys: test.keys,
+			}, map[string]struct{}{"signal-1": {}})
+			if !errors.Is(err, ErrInvalidEvidence) {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }
 
@@ -233,6 +353,77 @@ func TestSecretsAreRedactedFromModelInputAndHTTPErrorsDoNotEchoBodies(t *testing
 	_, err = errorClient.Embed(context.Background(), []string{"safe"})
 	if !errors.Is(err, ErrHTTP) || strings.Contains(err.Error(), "sk-super-secret") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestHTTPErrorExposesSafeRetryMetadata(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		retryAfter string
+		retryable  bool
+		wantDelay  time.Duration
+	}{
+		{name: "request timeout", status: http.StatusRequestTimeout, retryable: true},
+		{name: "rate limited", status: http.StatusTooManyRequests, retryAfter: "7", retryable: true, wantDelay: 7 * time.Second},
+		{name: "service unavailable", status: http.StatusServiceUnavailable, retryAfter: "11", retryable: true, wantDelay: 11 * time.Second},
+		{name: "server failure", status: http.StatusInternalServerError, retryable: true},
+		{name: "bad request", status: http.StatusBadRequest},
+		{name: "unauthorized", status: http.StatusUnauthorized},
+		{name: "forbidden", status: http.StatusForbidden},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if test.retryAfter != "" {
+					w.Header().Set("Retry-After", test.retryAfter)
+				}
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(`{"error":"sk-body-canary"}`))
+			}))
+			defer server.Close()
+
+			client := newTestClient(t, server)
+			_, err := client.Embed(context.Background(), []string{"safe"})
+			var requestErr *RequestError
+			if !errors.Is(err, ErrHTTP) || !errors.As(err, &requestErr) {
+				t.Fatalf("error = %T %v", err, err)
+			}
+			if requestErr.StatusCode != test.status || requestErr.Retryable() != test.retryable || requestErr.RetryDelay() != test.wantDelay {
+				t.Fatalf("request error = %#v, retryable=%v delay=%s", requestErr, requestErr.Retryable(), requestErr.RetryDelay())
+			}
+			if strings.Contains(err.Error(), "sk-body-canary") {
+				t.Fatalf("response body leaked in %q", err.Error())
+			}
+		})
+	}
+}
+
+func TestHTTPErrorParsesRetryAfterDate(t *testing.T) {
+	retryAt := time.Now().Add(10 * time.Second).UTC().Truncate(time.Second)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", retryAt.Format(http.TimeFormat))
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server)
+	_, err := client.Embed(context.Background(), []string{"safe"})
+	var requestErr *RequestError
+	if !errors.As(err, &requestErr) {
+		t.Fatalf("error = %T %v", err, err)
+	}
+	if delay := requestErr.RetryDelay(); delay < 8*time.Second || delay > 10*time.Second {
+		t.Fatalf("RetryDelay() = %s", delay)
+	}
+}
+
+func TestStructuredOutputFailuresAreNonRetryable(t *testing.T) {
+	for _, err := range []error{ErrInvalidOutput, ErrInvalidEvidence, ErrRefusal} {
+		disposition, ok := err.(interface{ Retryable() bool })
+		if !ok || disposition.Retryable() {
+			t.Fatalf("error %v retry disposition = %v, %v", err, disposition, ok)
+		}
 	}
 }
 

@@ -12,3 +12,5 @@ coverage/
 web/test-results/
 web/playwright-report/
 .DS_Store
+next-game-crush
+catalog_seed.json

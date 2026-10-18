@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -77,12 +79,42 @@ func TestNonFiniteEmbeddingIsNeverPersisted(t *testing.T) {
 	}
 }
 
+func TestProfileSummaryIsNormalizedBeforePersistence(t *testing.T) {
+	repository := &fakeRepository{profileEvidence: ProfileEvidence{EvidenceKey: "profile", Evidence: []EvidenceItem{{Key: "signal-1", Value: "puzzles"}}}}
+	client := &fakeClient{profileSummary: ProfileSummary{
+		Summary:      "  " + strings.Repeat("я", 400) + "  ",
+		Preferences:  []string{" puzzles ", "", "puzzles", strings.Repeat("я", 145)},
+		Avoidances:   nil,
+		Uncertainty:  "  мало данных  ",
+		EvidenceKeys: []string{"signal-1"},
+	}}
+	service, _ := NewService(repository, client, "gpt-6-luna", "text-embedding-3-small")
+	if err := service.processProfileSummary(context.Background(), uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if !repository.savedProfileSummary {
+		t.Fatal("profile summary was not persisted")
+	}
+	if repository.profileSummary.Summary != strings.Repeat("я", 400) {
+		t.Fatalf("summary was not trimmed before persistence")
+	}
+	if !reflect.DeepEqual(repository.profileSummary.Preferences, []string{"puzzles"}) {
+		t.Fatalf("preferences = %#v", repository.profileSummary.Preferences)
+	}
+	if repository.profileSummary.Avoidances == nil || repository.profileSummary.Uncertainty != "мало данных" {
+		t.Fatalf("profile summary = %#v", repository.profileSummary)
+	}
+}
+
 type fakeRepository struct {
-	game           StoredGameEvidence
-	gameIDs        []uuid.UUID
-	cachedFeatures bool
-	savedFeatures  bool
-	savedEmbedding bool
+	game                StoredGameEvidence
+	gameIDs             []uuid.UUID
+	profileEvidence     ProfileEvidence
+	cachedFeatures      bool
+	savedFeatures       bool
+	savedEmbedding      bool
+	savedProfileSummary bool
+	profileSummary      ProfileSummary
 }
 
 func (f *fakeRepository) ListGameIDs(context.Context, uuid.UUID) ([]uuid.UUID, error) {
@@ -107,20 +139,24 @@ func (f *fakeRepository) SaveGameEmbedding(context.Context, uuid.UUID, string, s
 	return nil
 }
 func (f *fakeRepository) LoadProfileEvidence(context.Context, uuid.UUID) (ProfileEvidence, error) {
-	return ProfileEvidence{}, nil
+	return f.profileEvidence, nil
 }
 func (f *fakeRepository) HasProfileSummary(context.Context, uuid.UUID, string, string) (bool, error) {
 	return false, nil
 }
-func (f *fakeRepository) SaveProfileSummary(context.Context, uuid.UUID, string, string, ProfileSummary) error {
+
+func (f *fakeRepository) SaveProfileSummary(_ context.Context, _ uuid.UUID, _, _ string, value ProfileSummary) error {
+	f.savedProfileSummary = true
+	f.profileSummary = value
 	return nil
 }
 
 type fakeClient struct {
-	featureErr   error
-	featureCalls int
-	features     GameFeatures
-	vectors      [][]float32
+	featureErr     error
+	featureCalls   int
+	features       GameFeatures
+	vectors        [][]float32
+	profileSummary ProfileSummary
 }
 
 func (f *fakeClient) ExtractGameFeatures(context.Context, GameEvidence) (GameFeatures, error) {
@@ -128,7 +164,7 @@ func (f *fakeClient) ExtractGameFeatures(context.Context, GameEvidence) (GameFea
 	return f.features, f.featureErr
 }
 func (f *fakeClient) SummarizeProfile(context.Context, ProfileEvidence) (ProfileSummary, error) {
-	return ProfileSummary{}, nil
+	return f.profileSummary, nil
 }
 func (f *fakeClient) ExplainRecommendation(context.Context, RecommendationEvidence) (Explanation, error) {
 	return Explanation{}, nil

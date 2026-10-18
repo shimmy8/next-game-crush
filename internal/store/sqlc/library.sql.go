@@ -72,6 +72,24 @@ func (q *Queries) ListUserGamesForAchievements(ctx context.Context, userID pgtyp
 	return items, nil
 }
 
+const updateSteamAccountIdentity = `-- name: UpdateSteamAccountIdentity :exec
+UPDATE steam_accounts SET
+    display_name = COALESCE($1, display_name),
+    avatar_url = COALESCE($2, avatar_url)
+WHERE user_id = $3
+`
+
+type UpdateSteamAccountIdentityParams struct {
+	DisplayName pgtype.Text `json:"display_name"`
+	AvatarUrl   pgtype.Text `json:"avatar_url"`
+	UserID      pgtype.UUID `json:"user_id"`
+}
+
+func (q *Queries) UpdateSteamAccountIdentity(ctx context.Context, arg UpdateSteamAccountIdentityParams) error {
+	_, err := q.db.Exec(ctx, updateSteamAccountIdentity, arg.DisplayName, arg.AvatarUrl, arg.UserID)
+	return err
+}
+
 const upsertAchievementSummary = `-- name: UpsertAchievementSummary :exec
 INSERT INTO achievement_summaries (user_id, game_id, achieved, total, source, last_successful_fetch_at, raw_snapshot)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -135,6 +153,30 @@ func (q *Queries) UpsertUserSourceState(ctx context.Context, arg UpsertUserSourc
 		arg.LastAttemptAt,
 		arg.LastSuccessfulFetchAt,
 		arg.Error,
+	)
+	return err
+}
+
+const upsertUserSourceVisibility = `-- name: UpsertUserSourceVisibility :exec
+INSERT INTO user_source_states (user_id, source, resource_key, availability, last_attempt_at, visibility)
+VALUES ($1, $2, $3, 'unknown', now(), $4)
+ON CONFLICT (user_id, source, resource_key) DO UPDATE SET
+    visibility = EXCLUDED.visibility
+`
+
+type UpsertUserSourceVisibilityParams struct {
+	UserID      pgtype.UUID `json:"user_id"`
+	Source      string      `json:"source"`
+	ResourceKey string      `json:"resource_key"`
+	Visibility  pgtype.Text `json:"visibility"`
+}
+
+func (q *Queries) UpsertUserSourceVisibility(ctx context.Context, arg UpsertUserSourceVisibilityParams) error {
+	_, err := q.db.Exec(ctx, upsertUserSourceVisibility,
+		arg.UserID,
+		arg.Source,
+		arg.ResourceKey,
+		arg.Visibility,
 	)
 	return err
 }

@@ -14,7 +14,9 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -65,7 +67,11 @@ func (client *OpenAI) ExtractGameFeatures(ctx context.Context, input GameEvidenc
 	if err != nil {
 		return output, err
 	}
-	err = client.structured(ctx, "game_features_v1", featureInstructions, FeaturePromptVersion, gameFeaturesSchema(), normalized, &output)
+	allowedKeys := make([]string, len(normalized.Evidence))
+	for i, item := range normalized.Evidence {
+		allowedKeys[i] = item.Key
+	}
+	err = client.structured(ctx, "game_features_v1", featureInstructions, FeaturePromptVersion, gameFeaturesSchema(allowedKeys), normalized, &output)
 	if err != nil {
 		return GameFeatures{}, err
 	}
@@ -84,11 +90,12 @@ func (client *OpenAI) SummarizeProfile(ctx context.Context, input ProfileEvidenc
 	if err != nil {
 		return output, err
 	}
-	err = client.structured(ctx, "profile_summary_v1", profileInstructions, ProfilePromptVersion, profileSummarySchema(), normalized, &output)
+	err = client.structured(ctx, "profile_summary_v2", profileInstructions, ProfilePromptVersion, profileSummarySchema(), normalized, &output)
 	if err != nil {
 		return ProfileSummary{}, err
 	}
-	if err := validateProfileOutput(output, allowed); err != nil {
+	output, err = normalizeAndValidateProfileOutput(output, allowed)
+	if err != nil {
 		return ProfileSummary{}, err
 	}
 	return output, nil
@@ -230,7 +237,11 @@ func (client *OpenAI) post(ctx context.Context, path string, payload any, destin
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
-		return fmt.Errorf("%w: status %d", ErrHTTP, response.StatusCode)
+		return &RequestError{
+			StatusCode: response.StatusCode,
+			RetryAfter: parseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
+			Temporary:  retryableHTTPStatus(response.StatusCode),
+		}
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 8<<20))
 	if err := decoder.Decode(destination); err != nil {
@@ -240,6 +251,29 @@ func (client *OpenAI) post(ctx context.Context, path string, payload any, destin
 		return fmt.Errorf("%w: trailing response JSON", ErrInvalidOutput)
 	}
 	return nil
+}
+
+func retryableHTTPStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		const maxDurationSeconds = int64((time.Duration(1<<63 - 1)) / time.Second)
+		if seconds <= 0 || seconds > maxDurationSeconds {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	retryAt, err := http.ParseTime(value)
+	if err != nil || !retryAt.After(now) {
+		return 0
+	}
+	return retryAt.Sub(now)
 }
 
 type responseEnvelope struct {
@@ -426,14 +460,39 @@ func validateFeatureOutput(output GameFeatures) error {
 	return validateStringArrays(20, output.Themes, output.Mechanics, output.Modes, output.Tone)
 }
 
-func validateProfileOutput(output ProfileSummary, allowed map[string]struct{}) error {
-	if strings.TrimSpace(output.Summary) == "" || len(output.Summary) > 4000 || len(output.Uncertainty) > 2000 {
-		return fmt.Errorf("%w: invalid profile text", ErrInvalidOutput)
+func normalizeAndValidateProfileOutput(output ProfileSummary, allowed map[string]struct{}) (ProfileSummary, error) {
+	output.Summary = strings.TrimSpace(output.Summary)
+	output.Uncertainty = strings.TrimSpace(output.Uncertainty)
+	summaryLength := utf8.RuneCountInString(output.Summary)
+	if !utf8.ValidString(output.Summary) || summaryLength < 320 || summaryLength > 720 || !utf8.ValidString(output.Uncertainty) || utf8.RuneCountInString(output.Uncertainty) > 2000 {
+		return ProfileSummary{}, fmt.Errorf("%w: invalid profile text", ErrInvalidOutput)
 	}
-	if err := validateStringArrays(30, output.Preferences, output.Avoidances); err != nil {
-		return err
+	output.Preferences = normalizeProfileValues(output.Preferences, 30, 144)
+	output.Avoidances = normalizeProfileValues(output.Avoidances, 30, 144)
+	if err := validateCitations(output.EvidenceKeys, allowed); err != nil {
+		return ProfileSummary{}, err
 	}
-	return validateCitations(output.EvidenceKeys, allowed)
+	return output, nil
+}
+
+func normalizeProfileValues(values []string, maxItems, maxRunes int) []string {
+	normalized := make([]string, 0, min(len(values), maxItems))
+	seen := make(map[string]struct{}, min(len(values), maxItems))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || !utf8.ValidString(value) || utf8.RuneCountInString(value) > maxRunes {
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+		if len(normalized) == maxItems {
+			break
+		}
+	}
+	return normalized
 }
 
 func validateExplanationOutput(output Explanation, allowed map[string]struct{}) error {
@@ -509,8 +568,10 @@ func stringSchema() map[string]any { return map[string]any{"type": "string"} }
 func objectSchema(properties map[string]any, required ...string) map[string]any {
 	return map[string]any{"type": "object", "properties": properties, "required": required, "additionalProperties": false}
 }
-func gameFeaturesSchema() map[string]any {
-	return objectSchema(map[string]any{"themes": arraySchema(stringSchema(), 20), "mechanics": arraySchema(stringSchema(), 20), "modes": arraySchema(stringSchema(), 20), "tone": arraySchema(stringSchema(), 20), "evidence_keys": arraySchema(stringSchema(), 50)}, "themes", "mechanics", "modes", "tone", "evidence_keys")
+func gameFeaturesSchema(allowedKeys []string) map[string]any {
+	evidenceKeys := arraySchema(map[string]any{"type": "string", "enum": append([]string(nil), allowedKeys...)}, 50)
+	evidenceKeys["minItems"] = 1
+	return objectSchema(map[string]any{"themes": arraySchema(stringSchema(), 20), "mechanics": arraySchema(stringSchema(), 20), "modes": arraySchema(stringSchema(), 20), "tone": arraySchema(stringSchema(), 20), "evidence_keys": evidenceKeys}, "themes", "mechanics", "modes", "tone", "evidence_keys")
 }
 func profileSummarySchema() map[string]any {
 	return objectSchema(map[string]any{"summary": stringSchema(), "preferences": arraySchema(stringSchema(), 30), "avoidances": arraySchema(stringSchema(), 30), "uncertainty": stringSchema(), "evidence_keys": arraySchema(stringSchema(), 100)}, "summary", "preferences", "avoidances", "uncertainty", "evidence_keys")

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,16 +18,34 @@ const (
 	JobPayloadVersion = 1
 )
 
+type SummaryStatus string
+
+const (
+	SummaryReady       SummaryStatus = "ready"
+	SummaryUnavailable SummaryStatus = "unavailable"
+)
+
 type Profile struct {
-	ID            uuid.UUID `json:"id"`
-	UserID        uuid.UUID `json:"-"`
-	Version       int64     `json:"version"`
-	Summary       string    `json:"summary"`
-	Confidence    float64   `json:"confidence"`
-	EvidenceCount int       `json:"evidenceCount"`
-	Positive      []float32 `json:"-"`
-	Negative      []float32 `json:"-"`
-	CreatedAt     time.Time `json:"createdAt"`
+	ID            uuid.UUID     `json:"id"`
+	UserID        uuid.UUID     `json:"-"`
+	Version       int64         `json:"version"`
+	Summary       string        `json:"summary"`
+	SummaryStatus SummaryStatus `json:"summaryStatus"`
+	Confidence    float64       `json:"confidence"`
+	EvidenceCount int           `json:"evidenceCount"`
+	Positive      []float32     `json:"-"`
+	Negative      []float32     `json:"-"`
+	CreatedAt     time.Time     `json:"createdAt"`
+}
+
+func WithSummaryState(value Profile) Profile {
+	if strings.TrimSpace(value.Summary) == "" {
+		value.Summary = ""
+		value.SummaryStatus = SummaryUnavailable
+		return value
+	}
+	value.SummaryStatus = SummaryReady
+	return value
 }
 
 type Repository interface {

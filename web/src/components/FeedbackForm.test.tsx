@@ -26,6 +26,8 @@ describe('FeedbackForm', () => {
     expect(screen.getByText(/Убрано: 1/)).toBeInTheDocument()
     expect(screen.getByText(/Переставлено: 1/)).toBeInTheDocument()
 		expect(screen.getByText(/40% · сохранён без влияния/)).toBeInTheDocument()
+		expect(screen.getByText(/Сигнал: Сеттинг/)).toBeInTheDocument()
+		expect(screen.queryByText(/Сигнал: setting/)).not.toBeInTheDocument()
 		expect(readDiff).toHaveBeenCalledWith(4, 'job-1', expect.anything())
 		expect(submit).toHaveBeenCalledWith('rec-1', 'csrf', expect.objectContaining({ action: 'like', reason: 'setting', freeText: 'Хочу больше таких миров' }), expect.anything())
   })

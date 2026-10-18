@@ -20,8 +20,9 @@ import (
 var (
 	ErrInvalidState    = errors.New("invalid or expired login state")
 	ErrReplay          = errors.New("replayed OpenID assertion")
+	ErrUserCancelled   = errors.New("OpenID authentication cancelled")
 	ErrUnauthenticated = errors.New("authentication required")
-	steamClaimPattern  = regexp.MustCompile(`^http://steamcommunity\.com/openid/id/([0-9]{17})$`)
+	steamIDPattern     = regexp.MustCompile(`^[0-9]{17}$`)
 )
 
 type Config struct {
@@ -74,7 +75,7 @@ func New(cfg Config, repository Repository, provider Provider) (*Service, error)
 	if err != nil || (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" || baseURL.User != nil || baseURL.Path != "" && baseURL.Path != "/" || baseURL.RawQuery != "" || baseURL.Fragment != "" {
 		return nil, errors.New("APP_BASE_URL must be an origin without a path, query, or fragment")
 	}
-	if cfg.AllowedSteamID == "" || !regexp.MustCompile(`^[0-9]{17}$`).MatchString(cfg.AllowedSteamID) {
+	if cfg.AllowedSteamID == "" || !steamIDPattern.MatchString(cfg.AllowedSteamID) {
 		return nil, errors.New("ALLOWED_STEAM_ID must be a 17-digit SteamID")
 	}
 	if cfg.SessionSecret == "" {
@@ -103,17 +104,17 @@ func (s *Service) Begin(returnPath string) (string, error) {
 	}
 	parsed, err := url.Parse(returnPath)
 	if err != nil || !strings.HasPrefix(returnPath, "/") || strings.HasPrefix(returnPath, "//") || strings.HasPrefix(parsed.Path, "//") || strings.Contains(returnPath, "\\") || strings.ContainsAny(returnPath, "\r\n\x00") || parsed.IsAbs() || parsed.Host != "" {
-		return "", errors.New("return path must be local")
+		return "", failure(errors.New("return path must be local"), "begin_request", "invalid_return_path", false)
 	}
 	state, err := randomToken(32)
 	if err != nil {
-		return "", err
+		return "", failure(err, "login_state", "entropy_failure", true)
 	}
 	now := s.now()
 	saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.repository.SaveLoginState(saveCtx, LoginState{Token: state, ReturnPath: returnPath, ExpiresAt: now.Add(10 * time.Minute)}); err != nil {
-		return "", fmt.Errorf("save login state: %w", err)
+		return "", failure(fmt.Errorf("save login state: %w", err), "login_state", "storage_failure", true)
 	}
 	returnTo := s.callbackURL(state)
 	values := url.Values{
@@ -125,19 +126,25 @@ func (s *Service) Begin(returnPath string) (string, error) {
 }
 
 func (s *Service) Complete(ctx context.Context, callback url.Values) (Session, error) {
+	if len(callback["openid.mode"]) == 1 && callback.Get("openid.mode") == "cancel" {
+		return Session{}, failure(ErrUserCancelled, "assertion_shape", "user_cancelled", false)
+	}
 	for _, field := range []string{"state", "openid.ns", "openid.mode", "openid.op_endpoint", "openid.return_to", "openid.response_nonce", "openid.claimed_id", "openid.identity", "openid.assoc_handle", "openid.signed", "openid.sig"} {
 		if len(callback[field]) != 1 {
-			return Session{}, errors.New("OpenID assertion has missing or duplicate fields")
+			return Session{}, failure(errors.New("OpenID assertion has missing or duplicate fields"), "assertion_shape", "missing_or_duplicate_fields", false)
 		}
 	}
 	stateToken := callback.Get("state")
 	state, err := s.repository.GetLoginState(ctx, stateToken, s.now())
 	if err != nil {
-		return Session{}, ErrInvalidState
+		if errors.Is(err, ErrInvalidState) {
+			return Session{}, failure(ErrInvalidState, "login_state", "invalid_or_expired", false)
+		}
+		return Session{}, failure(err, "login_state", "storage_failure", true)
 	}
 	expectedReturnTo := s.callbackURL(stateToken)
 	if callback.Get("openid.ns") != openIDNamespace || callback.Get("openid.mode") != "id_res" || callback.Get("openid.op_endpoint") != s.providerURL || callback.Get("openid.return_to") != expectedReturnTo {
-		return Session{}, errors.New("invalid OpenID assertion metadata")
+		return Session{}, failure(errors.New("invalid OpenID assertion metadata"), "metadata", "invalid", false)
 	}
 	signed := map[string]bool{}
 	for _, field := range strings.Split(callback.Get("openid.signed"), ",") {
@@ -145,50 +152,98 @@ func (s *Service) Complete(ctx context.Context, callback url.Values) (Session, e
 	}
 	for _, field := range []string{"op_endpoint", "claimed_id", "identity", "return_to", "response_nonce", "assoc_handle"} {
 		if !signed[field] {
-			return Session{}, errors.New("OpenID assertion omitted required signed fields")
+			return Session{}, failure(errors.New("OpenID assertion omitted required signed fields"), "signed_fields", "required_fields_missing", false)
 		}
 	}
 	claimed := callback.Get("openid.claimed_id")
 	if callback.Get("openid.identity") != claimed {
-		return Session{}, errors.New("OpenID claimed identity mismatch")
+		return Session{}, failure(errors.New("OpenID claimed identity mismatch"), "identity", "mismatch", false)
 	}
-	match := steamClaimPattern.FindStringSubmatch(claimed)
-	if len(match) != 2 {
-		return Session{}, errors.New("invalid Steam claimed ID")
+	steamID, ok := parseSteamClaimedID(claimed)
+	if !ok {
+		return Session{}, failure(errors.New("invalid Steam claimed ID"), "identity", "invalid_claim_format", false)
 	}
-	if subtle.ConstantTimeCompare([]byte(match[1]), []byte(s.allowedSteamID)) != 1 {
-		return Session{}, errors.New("SteamID is not allowlisted")
+	if subtle.ConstantTimeCompare([]byte(steamID), []byte(s.allowedSteamID)) != 1 {
+		return Session{}, failure(errors.New("SteamID is not allowlisted"), "identity", "not_allowlisted", false)
 	}
 	nonce := callback.Get("openid.response_nonce")
 	z := strings.IndexByte(nonce, 'Z')
 	if z < 0 {
-		return Session{}, errors.New("invalid OpenID response nonce")
+		return Session{}, failure(errors.New("invalid OpenID response nonce"), "nonce", "invalid_format", false)
 	}
 	nonceTime, err := time.Parse(time.RFC3339Nano, nonce[:z+1])
 	if err != nil || nonceTime.Before(s.now().Add(-10*time.Minute)) || nonceTime.After(s.now().Add(2*time.Minute)) {
-		return Session{}, errors.New("expired OpenID response nonce")
+		return Session{}, failure(errors.New("expired OpenID response nonce"), "nonce", "outside_time_window", false)
 	}
 	if err := s.provider.Verify(ctx, callback); err != nil {
-		return Session{}, err
+		diagnostic := Diagnose(err)
+		if diagnostic.Stage != "internal" {
+			return Session{}, err
+		}
+		if errors.Is(err, ErrProviderRejected) {
+			return Session{}, failure(err, "provider_verification", "rejected", false)
+		}
+		return Session{}, failure(err, "provider_verification", "transport_failure", true)
 	}
 	csrf, err := randomToken(32)
 	if err != nil {
-		return Session{}, err
+		return Session{}, failure(err, "session_finalize", "entropy_failure", true)
 	}
 	cookieToken, err := randomToken(32)
 	if err != nil {
-		return Session{}, err
+		return Session{}, failure(err, "session_finalize", "entropy_failure", true)
 	}
-	session := Session{ID: s.sessionID(cookieToken), Token: cookieToken, SteamID: match[1], CSRFToken: csrf, ExpiresAt: s.now().Add(7 * 24 * time.Hour), ReturnPath: state.ReturnPath}
+	session := Session{ID: s.sessionID(cookieToken), Token: cookieToken, SteamID: steamID, CSRFToken: csrf, ExpiresAt: s.now().Add(7 * 24 * time.Hour), ReturnPath: state.ReturnPath}
 	var oldSessionID *uuid.UUID
 	if old, ok := ctx.Value(rotationContextKey{}).(uuid.UUID); ok {
 		oldSessionID = &old
 	}
-	_, session, err = s.repository.FinishLogin(ctx, stateToken, nonce, s.now().Add(24*time.Hour), match[1], session, oldSessionID)
+	_, session, err = s.repository.FinishLogin(ctx, stateToken, nonce, s.now().Add(24*time.Hour), steamID, session, oldSessionID)
 	if err != nil {
-		return Session{}, err
+		switch {
+		case errors.Is(err, ErrInvalidState):
+			return Session{}, failure(err, "session_finalize", "state_expired", false)
+		case errors.Is(err, ErrReplay):
+			return Session{}, failure(err, "session_finalize", "replay", false)
+		case errors.Is(err, ErrUnauthenticated):
+			return Session{}, failure(err, "session_finalize", "session_rotation_invalid", false)
+		default:
+			return Session{}, failure(err, "session_finalize", "storage_failure", true)
+		}
 	}
 	return session, nil
+}
+
+func parseSteamClaimedID(raw string) (string, bool) {
+	claimed, err := url.Parse(raw)
+	if err != nil || claimed.Opaque != "" || claimed.User != nil {
+		return "", false
+	}
+	if !strings.EqualFold(claimed.Scheme, "http") && !strings.EqualFold(claimed.Scheme, "https") {
+		return "", false
+	}
+	// Comparing Host rather than only Hostname rejects explicit ports, trailing
+	// dots, and other authority variations while retaining DNS case folding.
+	if !strings.EqualFold(claimed.Host, "steamcommunity.com") {
+		return "", false
+	}
+	if claimed.RawQuery != "" || claimed.ForceQuery || claimed.Fragment != "" || claimed.RawFragment != "" || strings.Contains(raw, "#") {
+		return "", false
+	}
+	// Steam's identity path is ASCII and canonical. Reject all alternate
+	// percent-encoded spellings before inspecting the decoded path.
+	if claimed.RawPath != "" {
+		return "", false
+	}
+	const prefix = "/openid/id/"
+	if !strings.HasPrefix(claimed.Path, prefix) {
+		return "", false
+	}
+	steamID := strings.TrimPrefix(claimed.Path, prefix)
+	if !steamIDPattern.MatchString(steamID) {
+		return "", false
+	}
+	return steamID, true
 }
 
 func (s *Service) Authenticate(ctx context.Context, cookie string) (Session, error) {

@@ -12,14 +12,33 @@ test('complete fixture-authenticated product loop', async ({ page, request }) =>
 
   const me = await page.request.get(`${api}/api/me`)
   const user = await me.json() as { csrfToken: string }
-  const start = await page.request.post(`${api}/api/sync`, { headers: { 'X-CSRF-Token': user.csrfToken } })
-  expect(start.status()).toBe(202)
-  const first = await start.json() as { jobId: string }
+  expect((await request.post('http://127.0.0.1:18090/__test/steam-privacy?mode=private')).status()).toBe(204)
+  const syncRequests: string[] = []
+  page.on('request', (value) => {
+    if (value.url().includes('/api/sync')) syncRequests.push(new URL(value.url()).pathname)
+  })
+  await page.getByRole('button', { name: 'Синхронизировать' }).click()
+  await expect(page.getByText('Профиль Steam закрыт')).toBeVisible()
+  const blockedJobs = await (await page.request.get(`${api}/api/jobs`)).json() as Array<{ kind: string }>
+  expect(blockedJobs.filter((job) => job.kind === 'steam.sync')).toHaveLength(0)
+
+  expect((await request.post('http://127.0.0.1:18090/__test/steam-privacy?mode=public')).status()).toBe(204)
+  await page.getByRole('button', { name: 'Проверить снова' }).click()
+  await expect(page.getByText('Fixture Player')).toBeVisible()
+  await expect(page.getByText('Вы любите исследование и понятные системы.').first()).toBeVisible({ timeout: 90_000 })
+  const successfulPreflight = syncRequests.lastIndexOf('/api/sync/preflight')
+  const browserStart = syncRequests.lastIndexOf('/api/sync')
+  expect(successfulPreflight).toBeGreaterThanOrEqual(0)
+  expect(browserStart).toBeGreaterThan(successfulPreflight)
+
+  const jobs = await (await page.request.get(`${api}/api/jobs`)).json() as Array<{ id: string; kind: string }>
+  const first = jobs.find((job) => job.kind === 'steam.sync')
+  expect(first).toBeTruthy()
   await expect.poll(async () => {
-    const status = await page.request.get(`${api}/api/sync/${first.jobId}`)
+    const status = await page.request.get(`${api}/api/sync/${first!.id}`)
     return (await status.json() as { status: string }).status
   }, { timeout: 90_000 }).toBe('succeeded')
-  const firstStatus = await (await page.request.get(`${api}/api/sync/${first.jobId}`)).json() as { stages: Array<{ kind: string; stage: string; status: string }> }
+  const firstStatus = await (await page.request.get(`${api}/api/sync/${first!.id}`)).json() as { stages: Array<{ kind: string; stage: string; status: string }> }
   expect(firstStatus.stages.some((stage) => /achievement/i.test(`${stage.kind} ${stage.stage}`) && stage.status === 'succeeded')).toBeTruthy()
   const firstCalendar = await (await page.request.get(`${api}/api/calendar`)).json() as Record<string, Array<{ id: string; gameId: string }> | null>
 
@@ -30,10 +49,9 @@ test('complete fixture-authenticated product loop', async ({ page, request }) =>
     return (await status.json() as { status: string }).status
   }, { timeout: 90_000 }).toBe('succeeded')
   await page.reload()
-  await expect(page.getByText('Вы любите исследование и понятные системы.').first()).toBeVisible({ timeout: 30_000 })
   await expect(page.getByText('В этом месяце')).toBeVisible()
   await expect(page.getByText('В квартале')).toBeVisible()
-  await expect(page.getByText('Coming Soon').first()).toBeVisible()
+  await expect(page.getByText('Скоро').first()).toBeVisible()
 
   const calendar = await page.request.get(`${api}/api/calendar`)
   const buckets = await calendar.json() as Record<string, Array<{ id: string; gameId: string }> | null>

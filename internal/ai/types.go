@@ -1,19 +1,54 @@
 package ai
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 const EmbeddingDimensions = 1536
 
 var (
 	ErrCapabilityDisabled error = CapabilityDisabledError{}
 	ErrInvalidInput             = errors.New("invalid AI input")
-	ErrInvalidEvidence          = errors.New("AI output cites unknown evidence")
-	ErrInvalidOutput            = errors.New("invalid structured AI output")
+	ErrInvalidEvidence    error = classifiedError{message: "AI output cites unknown evidence", reason: "invalid_evidence"}
+	ErrInvalidOutput      error = classifiedError{message: "invalid structured AI output", reason: "invalid_output"}
 	ErrInvalidEmbedding         = errors.New("invalid embedding response")
-	ErrRefusal                  = errors.New("OpenAI refused the request")
+	ErrRefusal            error = classifiedError{message: "OpenAI refused the request", reason: "refusal"}
 	ErrIncomplete               = errors.New("OpenAI response was incomplete")
 	ErrHTTP                     = errors.New("OpenAI HTTP request failed")
 )
+
+type classifiedError struct {
+	message string
+	reason  string
+}
+
+func (err classifiedError) Error() string      { return err.message }
+func (err classifiedError) SafeReason() string { return err.reason }
+func (err classifiedError) Retryable() bool    { return false }
+
+// RequestError exposes only the bounded metadata needed by the job queue to
+// schedule a retry. OpenAI response bodies are deliberately excluded because
+// they can contain sensitive request context.
+type RequestError struct {
+	StatusCode int
+	RetryAfter time.Duration
+	Temporary  bool
+}
+
+func (err *RequestError) Error() string {
+	return fmt.Sprintf("OpenAI HTTP request failed with status %d", err.StatusCode)
+}
+
+func (err *RequestError) Is(target error) bool { return target == ErrHTTP }
+func (err *RequestError) Retryable() bool      { return err != nil && err.Temporary }
+func (err *RequestError) RetryDelay() time.Duration {
+	if err == nil || err.RetryAfter < 0 {
+		return 0
+	}
+	return err.RetryAfter
+}
 
 type CapabilityDisabledError struct{}
 

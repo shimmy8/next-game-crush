@@ -2,7 +2,7 @@ import type { CalendarResponse, Recommendation } from '../api/types'
 import { releaseLabel } from './RecommendationCard'
 
 const bucketInfo: Array<[keyof Omit<CalendarResponse, 'exactDates'>, string]> = [
-  ['month', 'Месяц'], ['quarter', 'Квартал'], ['year', 'Год'], ['comingSoon', 'Coming Soon'], ['tba', 'TBA'],
+  ['month', 'Месяц'], ['quarter', 'Квартал'], ['year', 'Год'], ['comingSoon', 'Скоро'], ['tba', 'Дата уточняется'],
 ]
 
 export default function ReleaseBuckets({ calendar }: { calendar: CalendarResponse }) {

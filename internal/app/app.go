@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"next-game-crush/internal/httpapi"
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/notifications"
+	"next-game-crush/internal/observability"
 	"next-game-crush/internal/profile"
 	"next-game-crush/internal/recommendations"
 	"next-game-crush/internal/steam"
@@ -31,7 +33,9 @@ type App struct {
 }
 
 func New(cfg config.Config) (*App, error) {
-	deps := httpapi.Dependencies{}
+	rawLogger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	eventLogger := observability.New(rawLogger)
+	deps := httpapi.Dependencies{Logger: rawLogger, Observability: eventLogger}
 	if _, err := os.Stat("web/dist/index.html"); err == nil {
 		deps.Frontend = os.DirFS("web/dist")
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -64,12 +68,12 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
-	syncService, err := syncservice.NewService(db, queue, steamClient, catalogService)
+	syncService, err := syncservice.NewService(db, queue, steamClient, catalogService, syncservice.WithLogger(eventLogger))
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
-	worker := jobs.NewWorker(queue, workerID)
+	worker := jobs.NewWorker(queue, workerID, jobs.WithLogger(eventLogger), jobs.WithConcurrency(cfg.WorkerConcurrency))
 	if err := syncService.RegisterHandlers(worker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register synchronization handlers: %w", err)
@@ -78,7 +82,7 @@ func New(cfg config.Config) (*App, error) {
 		APIKey: cfg.OpenAIAPIKey, Model: cfg.OpenAIModel,
 		EmbeddingModel: cfg.OpenAIEmbeddingModel,
 		BaseURL:        cfg.OpenAIBaseURL,
-		HTTPClient:     &http.Client{Timeout: 30 * time.Second},
+		HTTPClient:     &http.Client{Timeout: 60 * time.Second},
 	})
 	if err != nil {
 		db.Close()
@@ -164,14 +168,14 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("register notification handlers: %w", err)
 	}
 	syncService.EnableRankingJobs()
-	providerClient := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret, FixtureAuth: cfg.FixtureAuth}, auth.NewSQLRepository(db), auth.NewHTTPProvider(providerClient, "https://steamcommunity.com/openid/"))
+	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret, FixtureAuth: cfg.FixtureAuth}, auth.NewSQLRepository(db), nil)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure authentication: %w", err)
 	}
 	deps.Auth = authService
 	deps.Sync = syncService
+	deps.Identity = syncService
 	deps.Profile = profileService
 	deps.Recommendations = recommendationService
 	deps.Feedback = feedbackService

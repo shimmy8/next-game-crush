@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,7 +15,72 @@ import (
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/auth"
+	syncservice "next-game-crush/internal/sync"
 )
+
+func TestMeIncludesSteamIdentity(t *testing.T) {
+	authService, repo := handlerService(t, "http://localhost:8080")
+	session := repo.addSession()
+	displayName, avatarURL := "Player", "https://avatars.cloudflare.steamstatic.com/avatar.jpg"
+	identity := &fakeIdentityReadService{identity: syncservice.SteamIdentity{DisplayName: &displayName, AvatarURL: &avatarURL}}
+	router := NewRouter(Dependencies{Auth: authService, Identity: identity})
+	req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Authenticated bool      `json:"authenticated"`
+		SteamID       string    `json:"steamId"`
+		CSRFToken     string    `json:"csrfToken"`
+		ExpiresAt     time.Time `json:"expiresAt"`
+		DisplayName   *string   `json:"displayName"`
+		AvatarURL     *string   `json:"avatarUrl"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Authenticated || body.SteamID != session.SteamID || body.CSRFToken != session.CSRFToken || body.ExpiresAt.IsZero() || body.DisplayName == nil || *body.DisplayName != displayName || body.AvatarURL == nil || *body.AvatarURL != avatarURL {
+		t.Fatalf("body = %#v", body)
+	}
+}
+
+func TestMeIdentityNullableAndFailure(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		reader *fakeIdentityReadService
+		status int
+	}{
+		{name: "nullable", reader: &fakeIdentityReadService{}, status: http.StatusOK},
+		{name: "failure", reader: &fakeIdentityReadService{err: errors.New("identity failed")}, status: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authService, repo := handlerService(t, "http://localhost:8080")
+			session := repo.addSession()
+			req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+			recorder := httptest.NewRecorder()
+			NewRouter(Dependencies{Auth: authService, Identity: test.reader}).ServeHTTP(recorder, req)
+			if recorder.Code != test.status {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), `"authenticated":true`) || !strings.Contains(recorder.Body.String(), `"displayName":null`) || !strings.Contains(recorder.Body.String(), `"avatarUrl":null`) {
+				t.Fatalf("body = %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+type fakeIdentityReadService struct {
+	identity syncservice.SteamIdentity
+	err      error
+}
+
+func (f *fakeIdentityReadService) SteamIdentity(context.Context, uuid.UUID) (syncservice.SteamIdentity, error) {
+	return f.identity, f.err
+}
 
 func TestSessionCookieIsHTTPOnlySameSite(t *testing.T) {
 	service, repo := handlerService(t, "http://localhost:8080")
@@ -32,6 +99,30 @@ func TestHTTPSCookieIsSecure(t *testing.T) {
 	service.SetSessionCookie(recorder, repo.addSession())
 	if !recorder.Result().Cookies()[0].Secure {
 		t.Fatal("HTTPS cookie is not Secure")
+	}
+}
+
+func TestSteamLoginRedirectTargetsSteamOPEndpoint(t *testing.T) {
+	service, _ := handlerService(t, "http://localhost:8080")
+	recorder := httptest.NewRecorder()
+	NewRouter(Dependencies{Auth: service}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/auth/steam", nil))
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusSeeOther)
+	}
+	providerURL, err := url.Parse(recorder.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if providerURL.Scheme != "https" || providerURL.Host != "steamcommunity.com" || providerURL.Path != "/openid/login" {
+		t.Fatalf("Location = %q", providerURL.String())
+	}
+	returnTo, err := url.Parse(providerURL.Query().Get("openid.return_to"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookies := recorder.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "ngc_login_state" || cookies[0].Value == "" || cookies[0].Value != returnTo.Query().Get("state") {
+		t.Fatalf("state cookie = %#v, return_to = %q", cookies, returnTo.String())
 	}
 }
 
@@ -141,7 +232,7 @@ func (acceptProvider) Verify(context.Context, url.Values) error { return nil }
 func handlerService(t *testing.T, baseURL string) (*auth.Service, *handlerRepo) {
 	t.Helper()
 	repo := &handlerRepo{sessions: map[uuid.UUID]auth.Session{}}
-	service, err := auth.New(auth.Config{AppBaseURL: baseURL, AllowedSteamID: "76561197960287930", SessionSecret: strings.Repeat("s", 32), ProviderURL: "https://steamcommunity.com/openid/"}, repo, acceptProvider{})
+	service, err := auth.New(auth.Config{AppBaseURL: baseURL, AllowedSteamID: "76561197960287930", SessionSecret: strings.Repeat("s", 32)}, repo, acceptProvider{})
 	if err != nil {
 		t.Fatal(err)
 	}

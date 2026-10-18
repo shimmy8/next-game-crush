@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { getRankingDiff, submitFeedback } from '../api/client'
 import type { FeedbackAccepted, FeedbackInput, RankingDiff } from '../api/types'
+import { taxonomyLabel } from '../ui/labels'
 
 type Props = {
   recommendationId: string
@@ -99,7 +100,7 @@ export default function FeedbackForm({ recommendationId, rankingVersion, csrfTok
     void send({ action, reason: reason || undefined, freeText: freeText.trim() || undefined, idempotencyKey: idempotencyKey.current })
   }
 
-	if (saved) return <div className="feedback-status" aria-live="polite"><strong>{savedAction === 'remind_me' ? 'Напоминание сохранено' : 'Отзыв сохранён'}</strong>{pending && <span>{savedAction === 'remind_me' ? 'Подтверждаем напоминание…' : 'Пересобираем рекомендации…'}</span>}{diff && savedAction !== 'remind_me' && <><span>Добавлено: {diff.added.length} · Убрано: {diff.removed.length} · Переставлено: {diff.reordered.length}</span>{diff.classification && <span>Сигнал: {diff.classification.taxonomy}, уверенность {Math.round(diff.classification.confidence * 100)}%{diff.classification.actionable ? ' · учтён' : ' · сохранён без влияния на профиль'}</span>}</>}{error && <><span role="alert">{error}</span><button type="button" onClick={retryStatus}>Повторить проверку</button></>}</div>
+	if (saved) return <div className="feedback-status" aria-live="polite"><strong>{savedAction === 'remind_me' ? 'Напоминание сохранено' : 'Отзыв сохранён'}</strong>{pending && <span>{savedAction === 'remind_me' ? 'Подтверждаем напоминание…' : 'Пересобираем рекомендации…'}</span>}{diff && savedAction !== 'remind_me' && <><span>Добавлено: {diff.added.length} · Убрано: {diff.removed.length} · Переставлено: {diff.reordered.length}</span>{diff.classification && <span>Сигнал: {taxonomyLabel(diff.classification.taxonomy)}, уверенность {Math.round(diff.classification.confidence * 100)}%{diff.classification.actionable ? ' · учтён' : ' · сохранён без влияния на профиль'}</span>}</>}{error && <><span role="alert">{error}</span><button type="button" onClick={retryStatus}>Повторить проверку</button></>}</div>
 
   return <div className="feedback-form">
     <div className="reaction-row" aria-label="Действия с рекомендацией">

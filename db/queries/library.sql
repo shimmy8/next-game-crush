@@ -1,6 +1,18 @@
 -- name: GetSteamAccountForUser :one
 SELECT * FROM steam_accounts WHERE user_id = $1;
 
+-- name: UpdateSteamAccountIdentity :exec
+UPDATE steam_accounts SET
+    display_name = COALESCE(sqlc.narg(display_name), display_name),
+    avatar_url = COALESCE(sqlc.narg(avatar_url), avatar_url)
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: UpsertUserSourceVisibility :exec
+INSERT INTO user_source_states (user_id, source, resource_key, availability, last_attempt_at, visibility)
+VALUES (sqlc.arg(user_id), sqlc.arg(source), sqlc.arg(resource_key), 'unknown', now(), sqlc.arg(visibility))
+ON CONFLICT (user_id, source, resource_key) DO UPDATE SET
+    visibility = EXCLUDED.visibility;
+
 -- name: ListUserGamesForAchievements :many
 SELECT g.steam_app_id, g.name, ug.playtime_minutes, ug.recently_played_minutes, ug.last_played_at
 FROM user_games ug JOIN games g ON g.id = ug.game_id

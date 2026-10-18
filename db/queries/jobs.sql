@@ -19,11 +19,29 @@ WITH candidate AS (
         status = 'running', worker_id = sqlc.arg(worker_id),
         fencing_token = sqlc.arg(fencing_token),
         lease_until = now() + sqlc.arg(lease_duration)::interval,
+        last_error = NULL,
         updated_at = now()
     FROM candidate c WHERE j.id = c.id
     RETURNING j.*
 )
 SELECT * FROM claimed;
+
+-- name: GetJobWorkflowID :one
+WITH RECURSIVE ancestors AS (
+    SELECT job.id, job.parent_job_id
+    FROM sync_jobs job
+    WHERE job.id = $1
+
+    UNION ALL
+
+    SELECT parent.id, parent.parent_job_id
+    FROM sync_jobs parent
+    JOIN ancestors child ON child.parent_job_id = parent.id
+)
+SELECT ancestors.id
+FROM ancestors
+WHERE ancestors.parent_job_id IS NULL
+LIMIT 1;
 
 -- name: InsertJobAttempt :exec
 INSERT INTO job_attempts (id, job_id, attempt, worker_id, fencing_token, started_at, status)
@@ -64,7 +82,7 @@ WHERE job_id = $1 AND worker_id = $2 AND fencing_token = $3 AND status = 'runnin
 
 -- name: FailJob :execrows
 UPDATE sync_jobs SET
-    status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'retryable' END,
+    status = CASE WHEN NOT sqlc.arg(retryable)::boolean OR attempts >= max_attempts THEN 'dead' ELSE 'retryable' END,
     available_at = sqlc.arg(retry_at), last_error = sqlc.arg(cause),
     worker_id = NULL, fencing_token = NULL, lease_until = NULL, updated_at = now()
 WHERE id = sqlc.arg(id) AND status = 'running' AND worker_id = sqlc.arg(worker_id)

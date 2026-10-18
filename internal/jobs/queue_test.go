@@ -15,6 +15,11 @@ import (
 	"next-game-crush/internal/store"
 )
 
+type permanentTestError struct{}
+
+func (permanentTestError) Error() string   { return "permanent" }
+func (permanentTestError) Retryable() bool { return false }
+
 func TestEnqueueIsIdempotent(t *testing.T) {
 	queue, _ := openTestQueue(t)
 	spec := Spec{Kind: "sync", IdempotencyKey: "sync:user:1", Payload: []byte(`{"user":"1"}`), MaxAttempts: 3}
@@ -47,6 +52,228 @@ func TestClaimSkipsLeasedJob(t *testing.T) {
 	}
 	if second != nil {
 		t.Fatalf("second worker claimed leased job: %#v", second)
+	}
+}
+
+func TestFailureOutcomeDistinguishesRetryDeadAndLeaseLoss(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	id, err := queue.Enqueue(ctx, Spec{Kind: "steam.sync", IdempotencyKey: "failure-outcome", MaxAttempts: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := queue.Claim(ctx, "worker", time.Minute)
+	if err != nil || first == nil {
+		t.Fatalf("first claim=%#v err=%v", first, err)
+	}
+	outcome, err := queue.Fail(ctx, *first, errors.New("retry canary"), time.Now())
+	if err != nil || outcome != FailureRetryScheduled {
+		t.Fatalf("first failure outcome=%q err=%v", outcome, err)
+	}
+	if _, err := db.Pool.Exec(ctx, "UPDATE sync_jobs SET available_at=now() WHERE id=$1", id); err != nil {
+		t.Fatal(err)
+	}
+	second, err := queue.Claim(ctx, "worker", time.Minute)
+	if err != nil || second == nil {
+		t.Fatalf("second claim=%#v err=%v", second, err)
+	}
+	stale := *second
+	stale.FencingToken = uuid.New()
+	outcome, err = queue.Fail(ctx, stale, errors.New("stale canary"), time.Now())
+	if !errors.Is(err, ErrLeaseLost) || outcome != "" {
+		t.Fatalf("stale failure outcome=%q err=%v", outcome, err)
+	}
+	outcome, err = queue.Fail(ctx, *second, errors.New("dead canary"), time.Now())
+	if err != nil || outcome != FailureDead {
+		t.Fatalf("final failure outcome=%q err=%v", outcome, err)
+	}
+}
+
+func TestPermanentFailureDeadLettersOnFirstAttempt(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	id, err := queue.Enqueue(ctx, Spec{Kind: "ai.features", IdempotencyKey: "permanent-first-attempt", MaxAttempts: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := queue.Claim(ctx, "worker", time.Minute)
+	if err != nil || lease == nil {
+		t.Fatalf("claim=%#v err=%v", lease, err)
+	}
+	outcome, err := queue.Fail(ctx, *lease, permanentTestError{}, time.Now().Add(time.Hour))
+	if err != nil || outcome != FailureDead {
+		t.Fatalf("outcome=%q err=%v", outcome, err)
+	}
+	var status string
+	var attempts int
+	if err := db.Pool.QueryRow(ctx, "SELECT status,attempts FROM sync_jobs WHERE id=$1", id).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "dead" || attempts != 1 {
+		t.Fatalf("status=%q attempts=%d, want dead/1", status, attempts)
+	}
+}
+
+func TestClaimClearsCurrentErrorAndPreservesAttemptHistory(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	id, err := queue.Enqueue(ctx, Spec{Kind: "steam.sync", IdempotencyKey: "claim-clears-error", MaxAttempts: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := queue.Claim(ctx, "worker-a", time.Minute)
+	if err != nil || first == nil {
+		t.Fatalf("first claim=%#v err=%v", first, err)
+	}
+	if _, err := queue.Fail(ctx, *first, errors.New("first failure"), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, "UPDATE sync_jobs SET available_at=now() WHERE id=$1", id); err != nil {
+		t.Fatal(err)
+	}
+	second, err := queue.Claim(ctx, "worker-b", time.Minute)
+	if err != nil || second == nil {
+		t.Fatalf("second claim=%#v err=%v", second, err)
+	}
+	var currentErrorCleared bool
+	if err := db.Pool.QueryRow(ctx, "SELECT last_error IS NULL FROM sync_jobs WHERE id=$1", id).Scan(&currentErrorCleared); err != nil {
+		t.Fatal(err)
+	}
+	if !currentErrorCleared {
+		t.Fatal("claimed job retained the previous attempt error")
+	}
+	if _, err := queue.Fail(ctx, *second, errors.New("second failure"), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var currentError string
+	if err := db.Pool.QueryRow(ctx, "SELECT last_error FROM sync_jobs WHERE id=$1", id).Scan(&currentError); err != nil {
+		t.Fatal(err)
+	}
+	if currentError != "second failure" {
+		t.Fatalf("current error=%q, want second failure", currentError)
+	}
+
+	rows, err := db.Pool.Query(ctx, "SELECT attempt, error FROM job_attempts WHERE job_id=$1 ORDER BY attempt", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var attemptErrors []string
+	for rows.Next() {
+		var attempt int
+		var attemptError string
+		if err := rows.Scan(&attempt, &attemptError); err != nil {
+			t.Fatal(err)
+		}
+		if attempt != len(attemptErrors)+1 {
+			t.Fatalf("attempt number=%d, want %d", attempt, len(attemptErrors)+1)
+		}
+		attemptErrors = append(attemptErrors, attemptError)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(attemptErrors) != 2 || attemptErrors[0] != "first failure" || attemptErrors[1] != "second failure" {
+		t.Fatalf("attempt errors=%q, want [first failure second failure]", attemptErrors)
+	}
+}
+
+func TestLeaseCarriesRootWorkflowAndStoredMetadata(t *testing.T) {
+	queue, _ := openTestQueue(t)
+	ctx := context.Background()
+	_, err := queue.Enqueue(ctx, Spec{Kind: "steam.sync", IdempotencyKey: "workflow-root", Stage: "steam"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := queue.Claim(ctx, "worker", time.Minute)
+	if err != nil || root == nil {
+		t.Fatalf("root=%#v err=%v", root, err)
+	}
+	if root.WorkflowID != root.ID || root.ParentJobID != uuid.Nil || !root.Required || root.Stage != "steam" {
+		t.Fatalf("root metadata=%#v", root)
+	}
+	ready, err := queue.AwaitChildren(ctx, *root, []Spec{{Kind: "ai.features", IdempotencyKey: "workflow-child", Optional: true, Stage: "ai_features"}})
+	if err != nil || ready {
+		t.Fatalf("child scheduling ready=%v err=%v", ready, err)
+	}
+	child, err := queue.Claim(ctx, "worker", time.Minute)
+	if err != nil || child == nil {
+		t.Fatalf("child=%#v err=%v", child, err)
+	}
+	if child.WorkflowID != root.ID || child.ParentJobID != root.ID || child.Required || child.Stage != "ai_features" {
+		t.Fatalf("child metadata=%#v", child)
+	}
+	ready, err = queue.AwaitChildren(ctx, *child, []Spec{{Kind: "ai.embedding", IdempotencyKey: "workflow-grandchild", Required: true, Stage: "ai_embedding"}})
+	if err != nil || ready {
+		t.Fatalf("grandchild scheduling ready=%v err=%v", ready, err)
+	}
+	grandchild, err := queue.Claim(ctx, "worker", time.Minute)
+	if err != nil || grandchild == nil {
+		t.Fatalf("grandchild=%#v err=%v", grandchild, err)
+	}
+	if grandchild.WorkflowID != root.ID || grandchild.ParentJobID != child.ID || !grandchild.Required || grandchild.Stage != "ai_embedding" {
+		t.Fatalf("grandchild metadata=%#v", grandchild)
+	}
+}
+
+func TestAwaitChildrenPublishesCompleteBatchAtomically(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	if _, err := queue.Enqueue(ctx, Spec{Kind: "steam.sync", IdempotencyKey: "atomic-batch-root", Stage: "steam"}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := queue.Claim(ctx, "worker", time.Minute)
+	if err != nil || root == nil {
+		t.Fatalf("root=%#v err=%v", root, err)
+	}
+
+	_, err = queue.AwaitChildren(ctx, *root, []Spec{
+		{Kind: "ai.features", IdempotencyKey: "atomic-batch-valid", Stage: "ai_features"},
+		{Kind: "ai.features", IdempotencyKey: "atomic-batch-invalid", Stage: "ai_features", MaxAttempts: -1},
+	})
+	if err == nil {
+		t.Fatal("AwaitChildren accepted an invalid partial batch")
+	}
+	var childCount int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE parent_job_id=$1`, root.ID).Scan(&childCount); err != nil {
+		t.Fatal(err)
+	}
+	if childCount != 0 {
+		t.Fatalf("failed batch published %d children, want 0", childCount)
+	}
+	var rootStatus string
+	if err := db.Pool.QueryRow(ctx, `SELECT status FROM sync_jobs WHERE id=$1`, root.ID).Scan(&rootStatus); err != nil {
+		t.Fatal(err)
+	}
+	if rootStatus != "running" {
+		t.Fatalf("root status after rolled-back batch = %q, want running", rootStatus)
+	}
+
+	ready, err := queue.AwaitChildren(ctx, *root, []Spec{
+		{Kind: "ai.features", IdempotencyKey: "atomic-batch-one", Stage: "ai_features"},
+		{Kind: "ai.features", IdempotencyKey: "atomic-batch-two", Stage: "ai_features"},
+	})
+	if err != nil || ready {
+		t.Fatalf("AwaitChildren ready=%v err=%v", ready, err)
+	}
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE parent_job_id=$1 AND stage='ai_features'`, root.ID).Scan(&childCount); err != nil {
+		t.Fatal(err)
+	}
+	if childCount != 2 {
+		t.Fatalf("published AI batch has %d children, want 2", childCount)
+	}
+	first, err := queue.Claim(ctx, "ai-worker", time.Minute)
+	if err != nil || first == nil {
+		t.Fatalf("first AI claim=%#v err=%v", first, err)
+	}
+	if first.ParentJobID != root.ID || first.Stage != "ai_features" {
+		t.Fatalf("first AI claim=%#v", first)
+	}
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE parent_job_id=$1 AND stage='ai_features'`, root.ID).Scan(&childCount); err != nil {
+		t.Fatal(err)
+	}
+	if childCount != 2 {
+		t.Fatalf("first AI child ran before complete batch was visible: count=%d", childCount)
 	}
 }
 
@@ -89,7 +316,7 @@ func TestNestedRequiredFailurePromotesGrandparentWhenParentIsOptional(t *testing
 		t.Fatalf("embedding wait ready=%v err=%v", ready, err)
 	}
 	embedding, _ := queue.Claim(ctx, "worker", time.Minute)
-	if err := queue.Fail(ctx, *embedding, errors.New("embedding failed"), time.Now()); err != nil {
+	if _, err := queue.Fail(ctx, *embedding, errors.New("embedding failed"), time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	var rootStatus, featureStatus string
@@ -208,7 +435,7 @@ func TestStaleLeaseCannotCompleteOrFail(t *testing.T) {
 	if err := queue.Complete(context.Background(), *stale); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("stale Complete error = %v, want ErrLeaseLost", err)
 	}
-	if err := queue.Fail(context.Background(), *stale, errors.New("late"), time.Now()); !errors.Is(err, ErrLeaseLost) {
+	if _, err := queue.Fail(context.Background(), *stale, errors.New("late"), time.Now()); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("stale Fail error = %v, want ErrLeaseLost", err)
 	}
 	if err := queue.Renew(context.Background(), *stale, time.Minute); !errors.Is(err, ErrLeaseLost) {
@@ -227,7 +454,7 @@ func TestRetryBackoffAndAttemptExhaustion(t *testing.T) {
 		t.Fatal(err)
 	}
 	retryAt := time.Now().Add(2 * time.Second)
-	if err := queue.Fail(context.Background(), *first, errors.New("temporary"), retryAt); err != nil {
+	if _, err := queue.Fail(context.Background(), *first, errors.New("temporary"), retryAt); err != nil {
 		t.Fatal(err)
 	}
 	claim, err := queue.Claim(context.Background(), "worker", time.Minute)
@@ -244,7 +471,7 @@ func TestRetryBackoffAndAttemptExhaustion(t *testing.T) {
 	if err != nil || second == nil {
 		t.Fatalf("second claim = %#v, %v", second, err)
 	}
-	if err := queue.Fail(context.Background(), *second, errors.New("permanent"), time.Now()); err != nil {
+	if _, err := queue.Fail(context.Background(), *second, errors.New("permanent"), time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	var status string
@@ -321,7 +548,7 @@ func TestDeferredParentPreservesItsFinalAttemptForCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.Fail(context.Background(), *first, errors.New("temporary"), time.Now()); err != nil {
+	if _, err := queue.Fail(context.Background(), *first, errors.New("temporary"), time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	second, err := queue.Claim(context.Background(), "worker", time.Minute)

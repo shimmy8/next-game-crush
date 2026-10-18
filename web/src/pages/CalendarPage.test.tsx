@@ -4,7 +4,7 @@ import CalendarPage from './CalendarPage'
 import type { CalendarResponse } from '../api/types'
 
 const exact = {
-  id: 'r-day', gameId: 'g-day', name: 'Night Signal', profileVersion: 2, rankingVersion: 3,
+  id: 'r-day', gameId: 'g-day', steamAppId: 480, name: 'Night Signal', storeUrl: 'https://store.steampowered.com/app/480/', profileVersion: 2, rankingVersion: 3,
   algorithmVersion: 'ranking-v1', score: 91, confidence: 0.88,
   factors: { wishlist: 1, positiveSimilarity: 0.8, tagAffinity: 0.7 },
   weights: {}, release: { precision: 'day', exactDate: '2026-10-24', raw: '24 October 2026' },
@@ -62,5 +62,18 @@ describe('CalendarPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Следующий месяц' }))
     expect(screen.getByRole('heading', { name: /ноябрь 2026/ })).toBeInTheDocument()
     expect(screen.getByTestId('release-list')).toHaveTextContent('November Call')
+  })
+
+  it('shows imprecise release categories in Russian', () => {
+    render(<CalendarPage calendar={{
+      ...calendar,
+      comingSoon: [{ ...exact, id: 'r-soon', gameId: 'g-soon', name: 'Soon Game', release: { precision: 'coming_soon', raw: 'Coming Soon' } }],
+      tba: [{ ...exact, id: 'r-tba', gameId: 'g-tba', name: 'Unknown Game', release: { precision: 'unknown', raw: 'TBA' } }],
+    }} month={new Date('2026-10-01T12:00:00Z')} />)
+
+    expect(screen.getByTestId('release-bucket-comingSoon')).toHaveTextContent('Скоро')
+    expect(screen.getByTestId('release-bucket-tba')).toHaveTextContent('Дата уточняется')
+    expect(screen.getByLabelText('Точность даты')).toHaveTextContent('Скоро')
+    expect(screen.getByLabelText('Точность даты')).toHaveTextContent('Дата уточняется')
   })
 })

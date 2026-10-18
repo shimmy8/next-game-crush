@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"path"
 	"strings"
@@ -9,12 +10,16 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"next-game-crush/internal/auth"
+	"next-game-crush/internal/observability"
 )
 
 type Dependencies struct {
 	Frontend        fs.FS
+	Logger          *slog.Logger
+	Observability   *observability.Logger
 	Auth            *auth.Service
 	Sync            SyncService
+	Identity        IdentityReadService
 	Profile         ProfileReadService
 	Recommendations RecommendationReadService
 	Feedback        FeedbackService
@@ -23,17 +28,28 @@ type Dependencies struct {
 }
 
 func NewRouter(deps Dependencies) http.Handler {
+	if deps.Logger == nil {
+		deps.Logger = slog.New(slog.DiscardHandler)
+	}
+	if deps.Observability == nil {
+		deps.Observability = observability.New(nil)
+	}
 	router := chi.NewRouter()
+	router.Use(requestIDMiddleware)
 	router.Use(middleware.Recoverer)
 	router.Get("/api/health", health(deps.Data))
 	if deps.Auth != nil {
-		if deps.Auth.FixtureEnabled() { router.Post("/auth/fixture", fixtureLogin(deps.Auth)) }
-		router.Get("/auth/steam", beginSteamLogin(deps.Auth))
-		router.Get("/auth/steam/callback", completeSteamLogin(deps.Auth))
-		router.With(deps.Auth.Middleware).Get("/api/me", me)
+		if deps.Auth.FixtureEnabled() {
+			router.Post("/auth/fixture", fixtureLogin(deps.Auth))
+		}
+		router.Get("/auth/steam", beginSteamLogin(deps.Auth, deps.Logger))
+		router.Get("/auth/steam/callback", completeSteamLogin(deps.Auth, deps.Logger))
+		router.With(deps.Auth.Middleware).Get("/api/me", me(deps.Identity))
 		router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/auth/logout", logout(deps.Auth))
 		if deps.Sync != nil {
-			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/sync", startSync(deps.Sync))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/sync/preflight", syncPreflight(deps.Sync))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/sync", startSync(deps.Sync, deps.Observability))
+			router.With(deps.Auth.Middleware).Get("/api/sync/current", currentSyncStatus(deps.Sync))
 			router.With(deps.Auth.Middleware).Get("/api/sync/{id}", syncStatus(deps.Sync))
 		}
 		if deps.Profile != nil {

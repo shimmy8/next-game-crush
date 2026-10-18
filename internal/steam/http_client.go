@@ -182,6 +182,64 @@ func (c *HTTPClient) CacheMetadata(key CacheKey) (CacheMetadata, bool) {
 	return metadata, ok
 }
 
+func (c *HTTPClient) PlayerSummary(ctx context.Context, steamID string) (PlayerSummary, error) {
+	cacheKey := CacheKey{Operation: PlayerSummaryOperation, Resource: steamID}
+	values := url.Values{"key": {c.apiKey}, "steamids": {steamID}, "format": {"json"}}
+	response, _, err := c.get(ctx, cacheKey, c.webBase, "/ISteamUser/GetPlayerSummaries/v2/", values)
+	if err != nil {
+		return PlayerSummary{}, err
+	}
+	var payload struct {
+		Response struct {
+			Players []struct {
+				SteamID                  string `json:"steamid"`
+				CommunityVisibilityState int    `json:"communityvisibilitystate"`
+				DisplayName              string `json:"personaname"`
+				AvatarURL                string `json:"avatarfull"`
+			} `json:"players"`
+		} `json:"response"`
+	}
+	if err := decode(response.body, &payload, PlayerSummaryOperation); err != nil {
+		return PlayerSummary{}, err
+	}
+	var matching *struct {
+		SteamID                  string `json:"steamid"`
+		CommunityVisibilityState int    `json:"communityvisibilitystate"`
+		DisplayName              string `json:"personaname"`
+		AvatarURL                string `json:"avatarfull"`
+	}
+	for i := range payload.Response.Players {
+		if payload.Response.Players[i].SteamID != steamID {
+			continue
+		}
+		if matching != nil {
+			return PlayerSummary{}, invalidResponse(PlayerSummaryOperation)
+		}
+		matching = &payload.Response.Players[i]
+	}
+	if matching == nil {
+		return PlayerSummary{}, invalidResponse(PlayerSummaryOperation)
+	}
+	visibility := VisibilityUnknown
+	switch matching.CommunityVisibilityState {
+	case 3:
+		visibility = VisibilityPublic
+	case 1:
+		visibility = VisibilityPrivate
+	default:
+		return PlayerSummary{}, invalidResponse(PlayerSummaryOperation)
+	}
+	displayName := strings.TrimSpace(matching.DisplayName)
+	avatarURL := ""
+	if strings.TrimSpace(matching.AvatarURL) != "" {
+		avatarURL, err = ValidateAvatarURL(matching.AvatarURL)
+	}
+	if displayName == "" || err != nil {
+		return PlayerSummary{}, invalidResponse(PlayerSummaryOperation)
+	}
+	return PlayerSummary{Visibility: visibility, DisplayName: displayName, AvatarURL: avatarURL}, nil
+}
+
 func (c *HTTPClient) OwnedGames(ctx context.Context, steamID string) ([]OwnedGame, Availability, error) {
 	cacheKey := OwnedGamesCacheKey(steamID)
 	values := url.Values{"key": {c.apiKey}, "steamid": {steamID}, "include_appinfo": {"1"}, "include_played_free_games": {"1"}, "format": {"json"}}
@@ -189,6 +247,28 @@ func (c *HTTPClient) OwnedGames(ctx context.Context, steamID string) ([]OwnedGam
 	if err != nil {
 		return nil, availability, err
 	}
+	games, availability, err := parseOwnedGames(response.body)
+	if err != nil || availability != Available {
+		return games, availability, err
+	}
+	c.recordMetadata(cacheKey, response.header, false)
+	return games, Available, nil
+}
+
+// ProbeOwnedGames checks owned-games access without consuming or publishing
+// cache validators. Preflight callers do not persist the returned body, so a
+// probe must not make the following import conditional on that discarded body.
+func (c *HTTPClient) ProbeOwnedGames(ctx context.Context, steamID string) ([]OwnedGame, Availability, error) {
+	cacheKey := OwnedGamesCacheKey(steamID)
+	values := url.Values{"key": {c.apiKey}, "steamid": {steamID}, "include_appinfo": {"1"}, "include_played_free_games": {"1"}, "format": {"json"}}
+	response, availability, err := c.getWithoutCache(ctx, cacheKey, c.webBase, "/IPlayerService/GetOwnedGames/v1/", values)
+	if err != nil {
+		return nil, availability, err
+	}
+	return parseOwnedGames(response.body)
+}
+
+func parseOwnedGames(body []byte) ([]OwnedGame, Availability, error) {
 	var payload struct {
 		Response struct {
 			GameCount *int `json:"game_count"`
@@ -204,14 +284,13 @@ func (c *HTTPClient) OwnedGames(ctx context.Context, steamID string) ([]OwnedGam
 			} `json:"games"`
 		} `json:"response"`
 	}
-	if err := decode(response.body, &payload, OwnedGamesOperation); err != nil {
+	if err := decode(body, &payload, OwnedGamesOperation); err != nil {
 		return nil, RequestFailed, err
 	}
 	if payload.Response.GameCount == nil {
 		return nil, Unavailable, nil
 	}
 	if *payload.Response.GameCount == 0 && payload.Response.Games == nil {
-		c.recordMetadata(cacheKey, response.header, false)
 		return []OwnedGame{}, Available, nil
 	}
 	if payload.Response.Games == nil || *payload.Response.GameCount < 0 || *payload.Response.GameCount != len(*payload.Response.Games) {
@@ -224,7 +303,6 @@ func (c *HTTPClient) OwnedGames(ctx context.Context, steamID string) ([]OwnedGam
 		}
 		games = append(games, OwnedGame{AppID: game.AppID, Name: game.Name, PlaytimeForever: game.PlaytimeForever, PlaytimeWindows: game.PlaytimeWindows, PlaytimeMac: game.PlaytimeMac, PlaytimeLinux: game.PlaytimeLinux, IconHash: game.IconHash, LastPlayedAt: unixTime(game.LastPlayed)})
 	}
-	c.recordMetadata(cacheKey, response.header, false)
 	return games, Available, nil
 }
 
@@ -420,6 +498,14 @@ type httpResponse struct {
 }
 
 func (c *HTTPClient) get(ctx context.Context, cacheKey CacheKey, base *url.URL, requestPath string, values url.Values) (httpResponse, Availability, error) {
+	return c.getWithCache(ctx, cacheKey, base, requestPath, values, true)
+}
+
+func (c *HTTPClient) getWithoutCache(ctx context.Context, cacheKey CacheKey, base *url.URL, requestPath string, values url.Values) (httpResponse, Availability, error) {
+	return c.getWithCache(ctx, cacheKey, base, requestPath, values, false)
+}
+
+func (c *HTTPClient) getWithCache(ctx context.Context, cacheKey CacheKey, base *url.URL, requestPath string, values url.Values, useCache bool) (httpResponse, Availability, error) {
 	operation := cacheKey.Operation
 	operationCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()
@@ -440,10 +526,12 @@ func (c *HTTPClient) get(ctx context.Context, cacheKey CacheKey, base *url.URL, 
 		if err := c.waitForRateLimit(operationCtx); err != nil {
 			return httpResponse{}, RequestFailed, &RequestError{Operation: operation, Temporary: true, cause: err}
 		}
-		response, requestErr := c.getOnce(operationCtx, cacheKey, base, requestPath, values)
+		response, requestErr := c.getOnce(operationCtx, cacheKey, base, requestPath, values, useCache)
 		if requestErr == nil {
 			if response.statusCode == http.StatusNotModified {
-				c.recordMetadata(cacheKey, response.header, true)
+				if useCache {
+					c.recordMetadata(cacheKey, response.header, true)
+				}
 				return httpResponse{}, NotModified, ErrNotModified
 			}
 			return httpResponse{body: response.body, header: response.header}, Available, nil
@@ -462,7 +550,7 @@ type rawResponse struct {
 	statusCode int
 }
 
-func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.URL, requestPath string, values url.Values) (rawResponse, *RequestError) {
+func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.URL, requestPath string, values url.Values, useCache bool) (rawResponse, *RequestError) {
 	operation := cacheKey.Operation
 	select {
 	case c.semaphore <- struct{}{}:
@@ -481,7 +569,7 @@ func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.U
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "next-game-crush/1")
-	if validator, ok := c.cacheValidator(cacheKey); ok {
+	if validator, ok := c.cacheValidator(cacheKey); useCache && ok {
 		if validator.ETag != "" {
 			req.Header.Set("If-None-Match", validator.ETag)
 		}

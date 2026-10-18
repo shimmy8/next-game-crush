@@ -33,7 +33,11 @@ type Spec struct {
 
 type Lease struct {
 	ID             uuid.UUID
+	ParentJobID    uuid.UUID
+	WorkflowID     uuid.UUID
 	Kind           string
+	Required       bool
+	Stage          string
 	IdempotencyKey string
 	Payload        json.RawMessage
 	Attempts       int
@@ -42,6 +46,17 @@ type Lease struct {
 	FencingToken   uuid.UUID
 	LeaseUntil     time.Time
 }
+
+type FailureOutcome string
+
+type retryDisposition interface {
+	Retryable() bool
+}
+
+const (
+	FailureRetryScheduled FailureOutcome = "retry_scheduled"
+	FailureDead           FailureOutcome = "dead"
+)
 
 type Queue struct {
 	store *store.Store
@@ -214,6 +229,18 @@ func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration)
 	if err != nil {
 		return nil, err
 	}
+	workflowIDValue, err := queries.GetJobWorkflowID(ctx, row.ID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve job workflow: %w", err)
+	}
+	workflowID, err := uuidFromPG(workflowIDValue)
+	if err != nil {
+		return nil, fmt.Errorf("resolve job workflow: %w", err)
+	}
+	parentJobID := uuid.Nil
+	if row.ParentJobID.Valid {
+		parentJobID = uuid.UUID(row.ParentJobID.Bytes)
+	}
 	if err := queries.InsertJobAttempt(ctx, dbgen.InsertJobAttemptParams{
 		ID: uuidToPG(uuid.New()), ID_2: row.ID, WorkerID: textToPG(workerID), FencingToken: uuidToPG(token),
 	}); err != nil {
@@ -223,7 +250,8 @@ func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration)
 		return nil, fmt.Errorf("commit claim: %w", err)
 	}
 	return &Lease{
-		ID: jobID, Kind: row.Kind, IdempotencyKey: row.IdempotencyKey,
+		ID: jobID, ParentJobID: parentJobID, WorkflowID: workflowID,
+		Kind: row.Kind, Required: row.Required, Stage: row.Stage, IdempotencyKey: row.IdempotencyKey,
 		Payload: row.Payload, Attempts: int(row.Attempts), MaxAttempts: int(row.MaxAttempts),
 		WorkerID: workerID, FencingToken: token, LeaseUntil: row.LeaseUntil.Time,
 	}, nil
@@ -276,43 +304,48 @@ func (q *Queue) Complete(ctx context.Context, lease Lease) error {
 	return nil
 }
 
-func (q *Queue) Fail(ctx context.Context, lease Lease, cause error, retryAt time.Time) error {
+func (q *Queue) Fail(ctx context.Context, lease Lease, cause error, retryAt time.Time) (FailureOutcome, error) {
 	if cause == nil {
-		return errors.New("failure cause is required")
+		return "", errors.New("failure cause is required")
 	}
 	if retryAt.IsZero() {
 		retryAt = time.Now()
 	}
 	tx, err := q.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin failure: %w", err)
+		return "", fmt.Errorf("begin failure: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	queries := q.store.Queries.WithTx(tx)
+	retryable := true
+	var disposition retryDisposition
+	if errors.As(cause, &disposition) {
+		retryable = disposition.Retryable()
+	}
 	rows, err := queries.FailJob(ctx, dbgen.FailJobParams{
 		RetryAt: timeToPG(retryAt), Cause: textToPG(cause.Error()), ID: uuidToPG(lease.ID),
-		WorkerID: textToPG(lease.WorkerID), FencingToken: uuidToPG(lease.FencingToken),
+		WorkerID: textToPG(lease.WorkerID), FencingToken: uuidToPG(lease.FencingToken), Retryable: retryable,
 	})
 	if err != nil {
-		return fmt.Errorf("fail job: %w", err)
+		return "", fmt.Errorf("fail job: %w", err)
 	}
 	if err := requireOwnership(rows); err != nil {
-		return err
+		return "", err
 	}
 	status := "retryable"
-	if lease.Attempts >= lease.MaxAttempts {
+	if !retryable || lease.Attempts >= lease.MaxAttempts {
 		status = "dead"
 	}
 	if err := queries.FinishFailedAttempt(ctx, dbgen.FinishFailedAttemptParams{
 		JobID: uuidToPG(lease.ID), WorkerID: lease.WorkerID, FencingToken: uuidToPG(lease.FencingToken),
 		Status: status, Error: textToPG(cause.Error()),
 	}); err != nil {
-		return fmt.Errorf("finish failed attempt: %w", err)
+		return "", fmt.Errorf("finish failed attempt: %w", err)
 	}
 	if status == "dead" {
 		if _, err := tx.Exec(ctx, `UPDATE sync_jobs parent SET status='dead', last_error='required child stage failed', updated_at=now()
 			WHERE parent.id=(SELECT parent_job_id FROM sync_jobs WHERE id=$1) AND parent.status='waiting' AND (SELECT required FROM sync_jobs WHERE id=$1)`, lease.ID); err != nil {
-			return fmt.Errorf("fail parent workflow: %w", err)
+			return "", fmt.Errorf("fail parent workflow: %w", err)
 		}
 		// A required child may kill an optional parent (for example an embedding
 		// child of an optional AI feature stage). Wake that parent's waiting
@@ -323,19 +356,22 @@ func (q *Queue) Fail(ctx context.Context, lease Lease, cause error, retryAt time
 			AND grandparent.status='waiting'
 			AND NOT EXISTS(SELECT 1 FROM sync_jobs sibling WHERE sibling.parent_job_id=grandparent.id AND sibling.status NOT IN ('succeeded','dead'))
 			AND NOT EXISTS(SELECT 1 FROM sync_jobs sibling WHERE sibling.parent_job_id=grandparent.id AND sibling.required AND sibling.status='dead')`, lease.ID); err != nil {
-			return fmt.Errorf("promote grandparent after nested optional failure: %w", err)
+			return "", fmt.Errorf("promote grandparent after nested optional failure: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE sync_jobs parent SET status='queued',available_at=now(),updated_at=now()
 			WHERE parent.id=(SELECT parent_job_id FROM sync_jobs WHERE id=$1) AND parent.status='waiting'
 			AND NOT EXISTS(SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.status NOT IN ('succeeded','dead'))
 			AND NOT EXISTS(SELECT 1 FROM sync_jobs child WHERE child.parent_job_id=parent.id AND child.required AND child.status='dead')`, lease.ID); err != nil {
-			return fmt.Errorf("promote parent after optional failure: %w", err)
+			return "", fmt.Errorf("promote parent after optional failure: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit failure: %w", err)
+		return "", fmt.Errorf("commit failure: %w", err)
 	}
-	return nil
+	if status == "dead" {
+		return FailureDead, nil
+	}
+	return FailureRetryScheduled, nil
 }
 
 func requireOwnership(rows int64) error {

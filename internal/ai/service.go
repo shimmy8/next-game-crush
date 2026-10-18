@@ -239,7 +239,8 @@ func (service *Service) processProfileSummary(ctx context.Context, profileID uui
 	for _, item := range evidence.Evidence {
 		allowed[item.Key] = struct{}{}
 	}
-	if err := validateProfileOutput(output, allowed); err != nil {
+	output, err = normalizeAndValidateProfileOutput(output, allowed)
+	if err != nil {
 		return err
 	}
 	return service.repository.SaveProfileSummary(ctx, profileID, service.model, hash, output)
