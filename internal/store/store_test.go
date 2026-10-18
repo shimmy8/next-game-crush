@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func TestMigrateCreatesRequiredTables(t *testing.T) {
+func TestSchemaTablesExist(t *testing.T) {
 	db := openTestStore(t)
 	rows, err := db.Pool.Query(context.Background(), `
 		SELECT table_name FROM information_schema.tables
@@ -40,6 +40,9 @@ func TestMigrateCreatesRequiredTables(t *testing.T) {
 		"recommendations", "recommendation_factors", "feedback_events",
 		"feedback_classifications", "notification_preferences", "email_deliveries",
 		"sync_jobs", "job_attempts",
+		"game_achievement_definitions", "user_achievement_unlocks",
+		"achievement_semantic_classification_generations", "achievement_semantic_classifications",
+		"user_game_completion_evidence", "user_game_completion_projections",
 	}
 	for _, name := range required {
 		if !got[name] {

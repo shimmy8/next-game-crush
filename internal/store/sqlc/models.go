@@ -9,6 +9,36 @@ import (
 	pgvector_go "github.com/pgvector/pgvector-go"
 )
 
+type AchievementSemanticClassification struct {
+	ID                    pgtype.UUID        `json:"id"`
+	GenerationID          pgtype.UUID        `json:"generation_id"`
+	GameID                pgtype.UUID        `json:"game_id"`
+	ApiName               string             `json:"api_name"`
+	DefinitionContentHash string             `json:"definition_content_hash"`
+	Class                 string             `json:"class"`
+	Model                 string             `json:"model"`
+	PromptVersion         string             `json:"prompt_version"`
+	SchemaVersion         string             `json:"schema_version"`
+	InputContentHash      string             `json:"input_content_hash"`
+	ClassificationSource  string             `json:"classification_source"`
+	LexicalRuleVersion    string             `json:"lexical_rule_version"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+}
+
+type AchievementSemanticClassificationGeneration struct {
+	ID                 pgtype.UUID        `json:"id"`
+	GameID             pgtype.UUID        `json:"game_id"`
+	Model              string             `json:"model"`
+	PromptVersion      string             `json:"prompt_version"`
+	SchemaVersion      string             `json:"schema_version"`
+	DefinitionSetHash  string             `json:"definition_set_hash"`
+	LexicalRuleVersion string             `json:"lexical_rule_version"`
+	Status             string             `json:"status"`
+	ActivatedAt        pgtype.Timestamptz `json:"activated_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
 type AchievementSummary struct {
 	UserID                pgtype.UUID        `json:"user_id"`
 	GameID                pgtype.UUID        `json:"game_id"`
@@ -17,6 +47,7 @@ type AchievementSummary struct {
 	Source                string             `json:"source"`
 	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
 	RawSnapshot           []byte             `json:"raw_snapshot"`
+	SnapshotGeneration    int64              `json:"snapshot_generation"`
 }
 
 type CatalogEntry struct {
@@ -117,6 +148,19 @@ type Game struct {
 	Availability          string             `json:"availability"`
 	LastAttemptAt         pgtype.Timestamptz `json:"last_attempt_at"`
 	ContentHash           pgtype.Text        `json:"content_hash"`
+}
+
+type GameAchievementDefinition struct {
+	ID                    pgtype.UUID        `json:"id"`
+	GameID                pgtype.UUID        `json:"game_id"`
+	ApiName               string             `json:"api_name"`
+	DisplayName           pgtype.Text        `json:"display_name"`
+	Description           pgtype.Text        `json:"description"`
+	MetadataSource        string             `json:"metadata_source"`
+	DefinitionContentHash string             `json:"definition_content_hash"`
+	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
 }
 
 type GameEmbedding struct {
@@ -283,6 +327,21 @@ type User struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type UserAchievementUnlock struct {
+	UserID                pgtype.UUID        `json:"user_id"`
+	GameID                pgtype.UUID        `json:"game_id"`
+	ApiName               string             `json:"api_name"`
+	PresentInLatest       bool               `json:"present_in_latest"`
+	AchievedInLatest      bool               `json:"achieved_in_latest"`
+	EverAchieved          bool               `json:"ever_achieved"`
+	UnlockedAt            pgtype.Timestamptz `json:"unlocked_at"`
+	SnapshotGeneration    int64              `json:"snapshot_generation"`
+	Source                string             `json:"source"`
+	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+}
+
 type UserGame struct {
 	UserID                pgtype.UUID        `json:"user_id"`
 	GameID                pgtype.UUID        `json:"game_id"`
@@ -291,6 +350,32 @@ type UserGame struct {
 	Source                string             `json:"source"`
 	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
 	LastPlayedAt          pgtype.Timestamptz `json:"last_played_at"`
+}
+
+type UserGameCompletionEvidence struct {
+	ID                       pgtype.UUID        `json:"id"`
+	UserID                   pgtype.UUID        `json:"user_id"`
+	GameID                   pgtype.UUID        `json:"game_id"`
+	Kind                     string             `json:"kind"`
+	ApiName                  pgtype.Text        `json:"api_name"`
+	DefinitionContentHash    pgtype.Text        `json:"definition_content_hash"`
+	SemanticClassificationID pgtype.UUID        `json:"semantic_classification_id"`
+	UnlockedAt               pgtype.Timestamptz `json:"unlocked_at"`
+	ObservedAt               pgtype.Timestamptz `json:"observed_at"`
+	AlgorithmVersion         string             `json:"algorithm_version"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+}
+
+type UserGameCompletionProjection struct {
+	UserID              pgtype.UUID        `json:"user_id"`
+	GameID              pgtype.UUID        `json:"game_id"`
+	EndingCount         int32              `json:"ending_count"`
+	HundredPercentBasis bool               `json:"hundred_percent_basis"`
+	Weight              float64            `json:"weight"`
+	CompletionAt        pgtype.Timestamptz `json:"completion_at"`
+	Basis               string             `json:"basis"`
+	AlgorithmVersion    string             `json:"algorithm_version"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
 }
 
 type UserSourceState struct {
