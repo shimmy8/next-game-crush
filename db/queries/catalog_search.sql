@@ -4,6 +4,34 @@ VALUES($1,$2,$3,$4)
 ON CONFLICT(schedule_name,occurrence_at) DO UPDATE SET schedule_name=EXCLUDED.schedule_name
 RETURNING *;
 
+-- name: SearchRunJobExists :one
+SELECT EXISTS(SELECT 1 FROM sync_jobs WHERE idempotency_key=$1)::boolean;
+
+-- name: SearchCatalogNeedsInitial :one
+SELECT (NOT EXISTS(SELECT 1 FROM catalog_search_runs
+    WHERE status IN ('queued','running','complete') OR last_successful_at IS NOT NULL)
+    AND NOT EXISTS(SELECT 1 FROM catalog_search_memberships WHERE active))::boolean AS needs_initial;
+
+-- The workflow singleton lock serializes coordinators; the row lock also fences
+-- future page/run completion transactions using the same logical occurrence.
+-- name: ListTerminalSearchRuns :many
+SELECT r.*,j.updated_at AS job_updated_at FROM catalog_search_runs r
+JOIN sync_jobs j ON j.idempotency_key='catalog.search.run:v1:'||r.schedule_name||':'||
+    extract(epoch FROM r.occurrence_at)::bigint::text||':retry:'||r.retry_generation::text
+WHERE j.status='dead' AND r.status IN ('queued','running','failed','partial')
+ORDER BY r.run_revision FOR UPDATE OF r;
+
+-- name: MarkSearchRunFailed :exec
+UPDATE catalog_search_runs SET status='failed',safe_error='retry_exhausted',next_retry_at=$2
+WHERE id=$1 AND status IN ('queued','running','failed','partial');
+
+-- name: AdvanceSearchRunGeneration :one
+UPDATE catalog_search_runs SET retry_generation=retry_generation+1,status='queued',next_retry_at=NULL,
+    safe_error='',completed_at=NULL
+WHERE id=sqlc.arg(id) AND retry_generation=sqlc.arg(retry_generation)
+    AND status='failed' AND next_retry_at<=sqlc.arg(due_at)
+RETURNING *;
+
 -- name: AllocateObservationOrdinal :one
 UPDATE catalog_search_runs SET observation_ordinal=observation_ordinal+1
 WHERE id=$1 RETURNING observation_ordinal;

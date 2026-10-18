@@ -66,6 +66,44 @@ func (q *Queries) AcquireStoreReservation(ctx context.Context, arg AcquireStoreR
 	return i, err
 }
 
+const advanceSearchRunGeneration = `-- name: AdvanceSearchRunGeneration :one
+UPDATE catalog_search_runs SET retry_generation=retry_generation+1,status='queued',next_retry_at=NULL,
+    safe_error='',completed_at=NULL
+WHERE id=$1 AND retry_generation=$2
+    AND status='failed' AND next_retry_at<=$3
+RETURNING id, run_revision, schedule_name, occurrence_at, kind, config_snapshot, status, retry_generation, next_retry_at, observation_ordinal, new_app_count, created_at, started_at, completed_at, last_successful_at, safe_error
+`
+
+type AdvanceSearchRunGenerationParams struct {
+	ID              pgtype.UUID        `json:"id"`
+	RetryGeneration int32              `json:"retry_generation"`
+	DueAt           pgtype.Timestamptz `json:"due_at"`
+}
+
+func (q *Queries) AdvanceSearchRunGeneration(ctx context.Context, arg AdvanceSearchRunGenerationParams) (CatalogSearchRun, error) {
+	row := q.db.QueryRow(ctx, advanceSearchRunGeneration, arg.ID, arg.RetryGeneration, arg.DueAt)
+	var i CatalogSearchRun
+	err := row.Scan(
+		&i.ID,
+		&i.RunRevision,
+		&i.ScheduleName,
+		&i.OccurrenceAt,
+		&i.Kind,
+		&i.ConfigSnapshot,
+		&i.Status,
+		&i.RetryGeneration,
+		&i.NextRetryAt,
+		&i.ObservationOrdinal,
+		&i.NewAppCount,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.LastSuccessfulAt,
+		&i.SafeError,
+	)
+	return i, err
+}
+
 const allocateObservationOrdinal = `-- name: AllocateObservationOrdinal :one
 UPDATE catalog_search_runs SET observation_ordinal=observation_ordinal+1
 WHERE id=$1 RETURNING observation_ordinal
@@ -301,6 +339,74 @@ func (q *Queries) ListDueEligibilityChanges(ctx context.Context, arg ListDueElig
 	return items, nil
 }
 
+const listTerminalSearchRuns = `-- name: ListTerminalSearchRuns :many
+SELECT r.id, r.run_revision, r.schedule_name, r.occurrence_at, r.kind, r.config_snapshot, r.status, r.retry_generation, r.next_retry_at, r.observation_ordinal, r.new_app_count, r.created_at, r.started_at, r.completed_at, r.last_successful_at, r.safe_error,j.updated_at AS job_updated_at FROM catalog_search_runs r
+JOIN sync_jobs j ON j.idempotency_key='catalog.search.run:v1:'||r.schedule_name||':'||
+    extract(epoch FROM r.occurrence_at)::bigint::text||':retry:'||r.retry_generation::text
+WHERE j.status='dead' AND r.status IN ('queued','running','failed','partial')
+ORDER BY r.run_revision FOR UPDATE OF r
+`
+
+type ListTerminalSearchRunsRow struct {
+	ID                 pgtype.UUID        `json:"id"`
+	RunRevision        int64              `json:"run_revision"`
+	ScheduleName       string             `json:"schedule_name"`
+	OccurrenceAt       pgtype.Timestamptz `json:"occurrence_at"`
+	Kind               string             `json:"kind"`
+	ConfigSnapshot     []byte             `json:"config_snapshot"`
+	Status             string             `json:"status"`
+	RetryGeneration    int32              `json:"retry_generation"`
+	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	NewAppCount        int32              `json:"new_app_count"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	StartedAt          pgtype.Timestamptz `json:"started_at"`
+	CompletedAt        pgtype.Timestamptz `json:"completed_at"`
+	LastSuccessfulAt   pgtype.Timestamptz `json:"last_successful_at"`
+	SafeError          string             `json:"safe_error"`
+	JobUpdatedAt       pgtype.Timestamptz `json:"job_updated_at"`
+}
+
+// The workflow singleton lock serializes coordinators; the row lock also fences
+// future page/run completion transactions using the same logical occurrence.
+func (q *Queries) ListTerminalSearchRuns(ctx context.Context) ([]ListTerminalSearchRunsRow, error) {
+	rows, err := q.db.Query(ctx, listTerminalSearchRuns)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTerminalSearchRunsRow{}
+	for rows.Next() {
+		var i ListTerminalSearchRunsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunRevision,
+			&i.ScheduleName,
+			&i.OccurrenceAt,
+			&i.Kind,
+			&i.ConfigSnapshot,
+			&i.Status,
+			&i.RetryGeneration,
+			&i.NextRetryAt,
+			&i.ObservationOrdinal,
+			&i.NewAppCount,
+			&i.CreatedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.LastSuccessfulAt,
+			&i.SafeError,
+			&i.JobUpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockCatalogWorkflowState = `-- name: LockCatalogWorkflowState :one
 SELECT singleton, legacy_enqueue_enabled, legacy_cutover_at FROM catalog_workflow_state WHERE singleton FOR UPDATE
 `
@@ -328,6 +434,21 @@ func (q *Queries) LockSearchFeedPublication(ctx context.Context, feed string) (C
 	var i CatalogSearchFeedPublication
 	err := row.Scan(&i.Feed, &i.PublishedRunRevision, &i.PublishedAt)
 	return i, err
+}
+
+const markSearchRunFailed = `-- name: MarkSearchRunFailed :exec
+UPDATE catalog_search_runs SET status='failed',safe_error='retry_exhausted',next_retry_at=$2
+WHERE id=$1 AND status IN ('queued','running','failed','partial')
+`
+
+type MarkSearchRunFailedParams struct {
+	ID          pgtype.UUID        `json:"id"`
+	NextRetryAt pgtype.Timestamptz `json:"next_retry_at"`
+}
+
+func (q *Queries) MarkSearchRunFailed(ctx context.Context, arg MarkSearchRunFailedParams) error {
+	_, err := q.db.Exec(ctx, markSearchRunFailed, arg.ID, arg.NextRetryAt)
+	return err
 }
 
 const publishFeedMembership = `-- name: PublishFeedMembership :one
@@ -438,6 +559,30 @@ func (q *Queries) ReserveCatalogBudget(ctx context.Context, arg ReserveCatalogBu
 		&i.Used,
 	)
 	return i, err
+}
+
+const searchCatalogNeedsInitial = `-- name: SearchCatalogNeedsInitial :one
+SELECT (NOT EXISTS(SELECT 1 FROM catalog_search_runs
+    WHERE status IN ('queued','running','complete') OR last_successful_at IS NOT NULL)
+    AND NOT EXISTS(SELECT 1 FROM catalog_search_memberships WHERE active))::boolean AS needs_initial
+`
+
+func (q *Queries) SearchCatalogNeedsInitial(ctx context.Context) (bool, error) {
+	row := q.db.QueryRow(ctx, searchCatalogNeedsInitial)
+	var needs_initial bool
+	err := row.Scan(&needs_initial)
+	return needs_initial, err
+}
+
+const searchRunJobExists = `-- name: SearchRunJobExists :one
+SELECT EXISTS(SELECT 1 FROM sync_jobs WHERE idempotency_key=$1)::boolean
+`
+
+func (q *Queries) SearchRunJobExists(ctx context.Context, idempotencyKey string) (bool, error) {
+	row := q.db.QueryRow(ctx, searchRunJobExists, idempotencyKey)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const upsertCurrentSearchObservation = `-- name: UpsertCurrentSearchObservation :execrows
