@@ -113,14 +113,42 @@ func (r *SearchRepository) finalizePageFailure(ctx context.Context, lease jobs.L
 	if err := q.FinishFailedAttempt(ctx, dbgen.FinishFailedAttemptParams{JobID: catalogUUID(lease.ID), WorkerID: lease.WorkerID, FencingToken: catalogUUID(lease.FencingToken), Status: "dead", Error: pgtype.Text{String: safeReason, Valid: true}}); err != nil {
 		return err
 	}
-	failed, err := q.FailSearchFeedAtCursor(ctx, dbgen.FailSearchFeedAtCursorParams{
-		CompletedAt: pgtype.Timestamptz{Time: at.UTC(), Valid: true}, SafeError: safeReason, RunID: catalogUUID(payload.RunID),
-		Feed: string(payload.Feed), ExpectedOffset: int32(payload.Start), PageGeneration: int32(payload.PageGeneration),
-	})
+	feedState, err := q.LockSearchFeed(ctx, dbgen.LockSearchFeedParams{RunID: catalogUUID(payload.RunID), Feed: string(payload.Feed)})
 	if err != nil {
 		return err
 	}
-	if failed == 1 {
+	_, manifestErr := q.GetCommittedSearchPage(ctx, dbgen.GetCommittedSearchPageParams{
+		RunID: catalogUUID(payload.RunID), Feed: string(payload.Feed), StartOffset: int32(payload.Start), PageGeneration: int32(payload.PageGeneration),
+	})
+	committed := manifestErr == nil
+	if manifestErr != nil && !errors.Is(manifestErr, pgx.ErrNoRows) {
+		return manifestErr
+	}
+	if !committed {
+		failed, err := q.FailSearchFeedAtCursor(ctx, dbgen.FailSearchFeedAtCursorParams{
+			CompletedAt: pgtype.Timestamptz{Time: at.UTC(), Valid: true}, SafeError: safeReason, RunID: catalogUUID(payload.RunID),
+			Feed: string(payload.Feed), ExpectedOffset: int32(payload.Start), PageGeneration: int32(payload.PageGeneration),
+		})
+		if err != nil {
+			return err
+		}
+		if failed == 1 {
+			feedState.Status = "failed"
+		}
+	}
+	if committed && feedState.Status == "running" {
+		if _, err := jobs.EnqueueInTx(ctx, q, searchPageSpec(SearchPagePayload{Version: 1, RunID: payload.RunID, Feed: payload.Feed, Start: int(feedState.CursorOffset), PageGeneration: int(feedState.PageGeneration)})); err != nil {
+			return err
+		}
+	} else if feedState.Status == "complete" || feedState.Status == "partial" || feedState.Status == "failed" {
+		if committed && feedState.Status == "complete" {
+			if _, err := q.LockSearchFeedPublication(ctx, string(payload.Feed)); err != nil {
+				return err
+			}
+			if _, err := q.PublishFeedMembership(ctx, dbgen.PublishFeedMembershipParams{PublishedAt: pgtype.Timestamptz{Time: at.UTC(), Valid: true}, RunID: catalogUUID(payload.RunID), Feed: string(payload.Feed)}); err != nil {
+				return err
+			}
+		}
 		for index, feed := range searchFeedOrder {
 			if feed != payload.Feed || index+1 >= len(searchFeedOrder) {
 				continue

@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -22,6 +23,18 @@ type searchStub struct {
 type terminalSearchStub struct {
 	mu       sync.Mutex
 	failures int
+}
+
+type concurrentSearchStub struct {
+	arrived chan struct{}
+	release chan struct{}
+	page    steam.SearchPage
+}
+
+func (s *concurrentSearchStub) Search(context.Context, steam.SearchRequest) (steam.SearchPage, error) {
+	s.arrived <- struct{}{}
+	<-s.release
+	return s.page, nil
 }
 
 func (s *terminalSearchStub) Search(_ context.Context, req steam.SearchRequest) (steam.SearchPage, error) {
@@ -376,5 +389,138 @@ func TestTerminalSearchPageFailureAdvancesRunAndPreservesAuthority(t *testing.T)
 	}
 	if runStatus != "failed" {
 		t.Fatalf("run status=%s", runStatus)
+	}
+}
+
+func TestConcurrentCommittedPageReplaySchedulesContinuationOnce(t *testing.T) {
+	cfg := DefaultDiscoveryConfig()
+	source := &concurrentSearchStub{
+		arrived: make(chan struct{}, 2), release: make(chan struct{}),
+		page: steam.SearchPage{Start: 0, Count: 1, Total: 2, HasMore: true, Items: []steam.SearchObservation{testObservation(42, "20 Oct, 2026", steam.ReviewPositive, "Positive")}},
+	}
+	service, repo := newSearchScanForTest(t, source, cfg)
+	run := searchTestRun(t, repo, cfg, time.Date(2026, 10, 18, 19, 0, 0, 0, time.UTC))
+	var hook sync.Mutex
+	crashed := false
+	service.afterPageCommitHook = func() error {
+		hook.Lock()
+		defer hook.Unlock()
+		if !crashed {
+			crashed = true
+			return errors.New("simulated crash after page commit")
+		}
+		return nil
+	}
+	payload := SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}
+	results := make(chan error, 2)
+	for range 2 {
+		go func() { results <- service.ProcessPage(context.Background(), payload) }()
+	}
+	<-source.arrived
+	<-source.arrived
+	close(source.release)
+	first, second := <-results, <-results
+	if (first == nil) == (second == nil) {
+		t.Fatalf("results=%v,%v, want one simulated crash and one replay success", first, second)
+	}
+	var pages, observations, work, nextJobs int
+	if err := repo.store.Pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM catalog_search_pages WHERE run_id=$1 AND feed='popular_upcoming'),
+		(SELECT count(*) FROM catalog_search_observations WHERE run_id=$1 AND feed='popular_upcoming'),
+		(SELECT count(*) FROM catalog_search_worklist WHERE run_id=$1),
+		(SELECT count(*) FROM sync_jobs WHERE idempotency_key=$2 AND status='queued')`, run.ID,
+		searchPageKey(SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming, Start: 1})).Scan(&pages, &observations, &work, &nextJobs); err != nil {
+		t.Fatal(err)
+	}
+	if pages != 1 || observations != 1 || work != 1 || nextJobs != 1 {
+		t.Fatalf("pages=%d observations=%d work=%d next=%d", pages, observations, work, nextJobs)
+	}
+}
+
+func TestTerminalInjectedPersistenceFailureDoesNotStrandFeed(t *testing.T) {
+	cfg := DefaultDiscoveryConfig()
+	source := &searchStub{pages: map[int]steam.SearchPage{0: {Start: 0, Count: 1, Total: 1, Items: []steam.SearchObservation{testObservation(42, "20 Oct, 2026", steam.ReviewPositive, "Positive")}}}}
+	service, repo := newSearchScanForTest(t, source, cfg)
+	service.beforePagePersistHook = func() error { return errors.New("database detail canary") }
+	ctx := context.Background()
+	run := searchTestRun(t, repo, cfg, time.Date(2026, 10, 18, 20, 0, 0, 0, time.UTC))
+	if _, err := repo.store.Pool.Exec(ctx, `UPDATE sync_jobs SET status='dead',worker_id=NULL,fencing_token=NULL,lease_until=NULL WHERE kind='catalog.search.run' AND status='queued'`); err != nil {
+		t.Fatal(err)
+	}
+	payload := SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}
+	jobID, err := service.queue.Enqueue(ctx, searchPageSpec(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= 4; attempt++ {
+		lease, err := service.queue.Claim(ctx, jobs.LaneCatalog, "persistence-test", time.Minute)
+		if err != nil || lease == nil || lease.ID != jobID || lease.Attempts != attempt {
+			t.Fatalf("attempt %d lease=%v err=%v", attempt, lease, err)
+		}
+		handlerErr := service.handlePage(ctx, *lease)
+		if attempt < 4 {
+			if handlerErr == nil || handlerErr.Error() != "request_failed" {
+				t.Fatalf("attempt %d unsafe error=%v", attempt, handlerErr)
+			}
+			if outcome, err := service.queue.Fail(ctx, *lease, handlerErr, time.Now().Add(-time.Second)); err != nil || outcome != jobs.FailureRetryScheduled {
+				t.Fatalf("attempt %d outcome=%s err=%v", attempt, outcome, err)
+			}
+		} else if !errors.Is(handlerErr, jobs.ErrDeferred) {
+			t.Fatalf("terminal error=%v", handlerErr)
+		}
+		var cursor int
+		if err := repo.store.Pool.QueryRow(ctx, `SELECT cursor_offset FROM catalog_search_feeds WHERE run_id=$1 AND feed='popular_upcoming'`, run.ID).Scan(&cursor); err != nil {
+			t.Fatal(err)
+		}
+		if cursor != 0 {
+			t.Fatalf("attempt %d cursor=%d", attempt, cursor)
+		}
+	}
+	var jobStatus, jobError, attemptError, feedStatus, safeError string
+	var next int
+	if err := repo.store.Pool.QueryRow(ctx, `SELECT j.status,j.last_error,
+		(SELECT error FROM job_attempts WHERE job_id=j.id ORDER BY started_at DESC LIMIT 1),f.status,f.safe_error,
+		(SELECT count(*) FROM sync_jobs WHERE idempotency_key=$3 AND status='queued')
+		FROM sync_jobs j JOIN catalog_search_feeds f ON f.run_id=$2 AND f.feed='popular_upcoming' WHERE j.id=$1`, jobID, run.ID,
+		searchPageKey(SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularNew})).Scan(&jobStatus, &jobError, &attemptError, &feedStatus, &safeError, &next); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != "dead" || jobError != "request_failed" || attemptError != "request_failed" || feedStatus != "failed" || safeError != "request_failed" || next != 1 {
+		t.Fatalf("job=%s job_error=%s attempt_error=%s feed=%s error=%s next=%d", jobStatus, jobError, attemptError, feedStatus, safeError, next)
+	}
+}
+
+func TestPageCancellationAndLeaseLossAreNotTerminalized(t *testing.T) {
+	cfg := DefaultDiscoveryConfig()
+	for _, tc := range []struct {
+		name   string
+		source steam.SearchCatalog
+		hook   func() error
+		want   error
+	}{
+		{name: "context cancellation", source: &searchStub{err: context.Canceled}, want: context.Canceled},
+		{name: "lease loss", source: &searchStub{pages: map[int]steam.SearchPage{0: {Start: 0}}}, hook: func() error { return jobs.ErrLeaseLost }, want: jobs.ErrLeaseLost},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, repo := newSearchScanForTest(t, tc.source, cfg)
+			service.beforePagePersistHook = tc.hook
+			run := searchTestRun(t, repo, cfg, time.Date(2026, 10, 18, 21, 0, 0, 0, time.UTC))
+			payload := SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease := jobs.Lease{ID: uuid.New(), FencingToken: uuid.New(), WorkerID: "worker", Attempts: 4, MaxAttempts: 4, IdempotencyKey: searchPageKey(payload), Payload: raw}
+			if err := service.handlePage(context.Background(), lease); !errors.Is(err, tc.want) {
+				t.Fatalf("error=%v want=%v", err, tc.want)
+			}
+			var status string
+			if err := repo.store.Pool.QueryRow(context.Background(), `SELECT status FROM catalog_search_feeds WHERE run_id=$1 AND feed='popular_upcoming'`, run.ID).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status != "queued" {
+				t.Fatalf("feed terminalized as %s", status)
+			}
+		})
 	}
 }

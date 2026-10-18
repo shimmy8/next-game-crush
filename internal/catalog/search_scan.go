@@ -21,11 +21,13 @@ var searchFeedOrder = []steam.SearchFeed{
 }
 
 type SearchScanService struct {
-	repo   *SearchRepository
-	source steam.SearchCatalog
-	queue  *jobs.Queue
-	cfg    DiscoveryConfig
-	now    func() time.Time
+	repo                  *SearchRepository
+	source                steam.SearchCatalog
+	queue                 *jobs.Queue
+	cfg                   DiscoveryConfig
+	now                   func() time.Time
+	afterPageCommitHook   func() error
+	beforePagePersistHook func() error
 }
 
 type catalogSearchFailure struct {
@@ -136,14 +138,36 @@ func (s *SearchScanService) handlePage(ctx context.Context, lease jobs.Lease) er
 	if err == nil {
 		return nil
 	}
-	var failure *catalogSearchFailure
-	if !errors.As(err, &failure) {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, context.Canceled) {
 		return err
 	}
-	if lease.Attempts < lease.MaxAttempts {
-		return failure
+	if errors.Is(err, jobs.ErrLeaseLost) {
+		return err
 	}
-	if err := s.repo.finalizePageFailure(ctx, lease, payload, failure.reason, s.now().UTC()); err != nil {
+	var failure *catalogSearchFailure
+	reason := "request_failed"
+	if errors.As(err, &failure) {
+		reason = failure.reason
+	} else {
+		type safeReasoner interface{ SafeReason() string }
+		var safe safeReasoner
+		if errors.As(err, &safe) {
+			switch safe.SafeReason() {
+			case "unavailable", "request_failed", "invalid_response", "rate_limited", "retry_exhausted", "malformed":
+				reason = safe.SafeReason()
+			}
+		}
+	}
+	if lease.Attempts < lease.MaxAttempts {
+		if failure != nil {
+			return failure
+		}
+		return jobs.NewCatalogRetryError(err, reason, nil)
+	}
+	if err := s.repo.finalizePageFailure(ctx, lease, payload, reason, s.now().UTC()); err != nil {
 		return err
 	}
 	// The terminal lifecycle was completed transactionally above; suppress the
@@ -222,9 +246,17 @@ func (s *SearchScanService) commitPage(ctx context.Context, run RunRef, feed ste
 	}
 	if state.CursorOffset != int32(start) || state.PageGeneration != int32(generation) || (state.Status != "queued" && state.Status != "running") {
 		if _, manifestErr := q.GetCommittedSearchPage(ctx, dbgen.GetCommittedSearchPageParams{RunID: catalogUUID(run.ID), Feed: string(feed), StartOffset: int32(start), PageGeneration: int32(generation)}); manifestErr == nil {
-			return tx.Commit(ctx)
+			if err := tx.Commit(ctx); err != nil {
+				return err
+			}
+			return s.afterPageCommit(ctx, run.ID, feed)
 		}
 		return errors.New("stale search page")
+	}
+	if s.beforePagePersistHook != nil {
+		if err := s.beforePagePersistHook(); err != nil {
+			return err
+		}
 	}
 	ordinal, err := q.AllocateObservationOrdinal(ctx, catalogUUID(run.ID))
 	if err != nil {
@@ -318,6 +350,11 @@ func (s *SearchScanService) commitPage(ctx context.Context, run RunRef, feed ste
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
+	}
+	if s.afterPageCommitHook != nil {
+		if err := s.afterPageCommitHook(); err != nil {
+			return err
+		}
 	}
 	return s.afterPageCommit(ctx, run.ID, feed)
 }
