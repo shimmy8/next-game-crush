@@ -160,15 +160,24 @@ assert_text_contains "$cleanup_step" 'rm -f -- "\$HOME/\.ssh/id_ed25519" "\$HOME
 
 assert_text_contains "$upload_step" '^[[:space:]]*scp -i ' 'deployment artifacts must be uploaded with OpenSSH scp'
 assert_text_contains "$upload_step" 'compose\.prod\.yml deploy/deploy\.sh ' 'both deployment artifacts must be uploaded together'
+assert_text_contains "$upload_step" 'exec 9>"\$deploy_root/deploy\.lock"' \
+  'remote artifact activation must open the deployment lock before installation'
+assert_text_contains "$upload_step" 'flock -n 9' \
+  'remote artifact activation must acquire the deployment lock before installation'
 assert_text_contains "$upload_step" 'install -m 0644 .*compose\.prod\.yml\.new' 'Compose must be staged to a temporary file'
 assert_text_contains "$upload_step" 'install -m 0755 .*deploy\.sh\.new' 'deploy.sh must be staged to a temporary file'
+readonly lock_line="$(grep -n 'flock -n 9' <<<"$upload_step" | head -1 | cut -d: -f1)"
 readonly first_install_line="$(grep -n 'install -m 0644 .*compose\.prod\.yml\.new' <<<"$upload_step" | cut -d: -f1)"
 readonly second_install_line="$(grep -n 'install -m 0755 .*deploy\.sh\.new' <<<"$upload_step" | cut -d: -f1)"
 readonly first_move_line="$(grep -n 'mv -f .*\.new' <<<"$upload_step" | head -1 | cut -d: -f1)"
+[[ "$lock_line" -lt "$first_install_line" && "$lock_line" -lt "$second_install_line" ]] ||
+  fail 'the deployment lock must be acquired before either artifact is installed'
 [[ "$first_install_line" -lt "$first_move_line" && "$second_install_line" -lt "$first_move_line" ]] ||
   fail 'both deployment files must be staged before either atomic rename'
 assert_text_contains "$upload_step" 'mv -f .*compose\.prod\.yml\.new.*compose\.prod\.yml' 'Compose installation must finish atomically'
 assert_text_contains "$upload_step" 'mv -f .*deploy\.sh\.new.*deploy\.sh' 'deploy script installation must finish atomically'
+assert_text_contains "$upload_step" 'DEPLOY_LOCK_FD=9 exec "\$deploy_root/deploy\.sh" "\$image_ref"' \
+  'remote deployment must inherit the installer lock through exec'
 assert_file_not_contains 'uses:.*(appleboy|ssh-action|scp-action)' 'third-party SSH actions are forbidden'
 
 seen_checkout=0

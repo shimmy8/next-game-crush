@@ -66,8 +66,8 @@ assert_not_contains "$nginx_file" '(mailpit|postgres|5432|8025|1025)' \
 assert_ordered "$setup_guide" \
   '^## 1\..*deploy user' \
   '^## 2\..*Docker' \
-  '^## 3\..*SSH' \
-  '^## 4\..*fingerprint' \
+  '^## 3\..*fingerprint' \
+  '^## 4\..*SSH' \
   '^## 5\..*UFW' \
   '^## 6\..*director' \
   '^## 7\..*\.env' \
@@ -80,7 +80,13 @@ assert_ordered "$setup_guide" \
 assert_contains "$setup_guide" 'download\.docker\.com/linux/ubuntu' \
   'VPS guide must install Docker from the official Ubuntu repository'
 assert_contains "$setup_guide" 'ssh-keygen -t ed25519' 'VPS guide must create an Ed25519 deployment key'
+assert_contains "$setup_guide" "ssh-keygen -t ed25519 -N ''" \
+  'VPS guide must create the automation key without an interactive passphrase'
 assert_contains "$setup_guide" 'ssh-keygen -lf' 'VPS guide must verify the host-key fingerprint'
+assert_contains "$setup_guide" 'scp .*StrictHostKeyChecking=yes.*UserKnownHostsFile=\./next-game-crush-known-hosts.*VPS_HOST_OR_IP' \
+  'VPS guide must pin the reviewed host key for the first scp connection'
+assert_contains "$setup_guide" 'ssh .*StrictHostKeyChecking=yes.*UserKnownHostsFile=\./next-game-crush-known-hosts.*VPS_HOST_OR_IP' \
+  'VPS guide must pin the reviewed host key for the first deploy-user SSH connection'
 assert_contains "$setup_guide" 'ufw allow (22/tcp|OpenSSH)' 'VPS guide must allow SSH before enabling UFW'
 assert_contains "$setup_guide" 'chmod 600 "\$env_tmp"' 'VPS guide must protect .env before atomic install'
 assert_contains "$setup_guide" 'openssl rand -hex' 'VPS guide must generate hex-safe independent secrets'
@@ -88,6 +94,25 @@ assert_contains "$setup_guide" 'APP_BASE_URL=https://nextgamecrush\.site' 'VPS g
 assert_contains "$setup_guide" 'DATABASE_URL=postgres://[^ ]+@db:5432/' 'VPS guide must use the internal db service'
 assert_contains "$setup_guide" 'SMTP_URL=smtp://mailpit:1025' 'VPS guide must use the internal Mailpit service'
 assert_contains "$setup_guide" 'TEST_HARNESS_MODE=0' 'VPS guide must disable the test harness'
+assert_contains "$setup_guide" 'DEMO_MODE_ENABLED=1' 'VPS guide must enable the approved public demo mode'
+assert_contains "$setup_guide" "readonly VPS_HOST_OR_IP='nextgamecrush\.site'" \
+  'VPS guide must define its host placeholder before using it'
+assert_contains "$setup_guide" 'x86_64.*amd64|amd64.*x86_64' \
+  'VPS guide must document the supported VPS architecture'
+assert_contains "$setup_guide" 'SSH.*(port|TCP).*22|(port|TCP).*22.*SSH' \
+  'VPS guide must document the port 22 deployment assumption'
+assert_contains "$setup_guide" 'ISPmanager' \
+  'VPS guide must explain how the detected control panel affects Nginx changes'
+for catalog_setting in \
+  CATALOG_HORIZON_DAYS \
+  CATALOG_DISCOVERY_INTERVAL_HOURS \
+  CATALOG_DISCOVERY_HOURLY_BUDGET \
+  CATALOG_DISCOVERY_UNKNOWN_FRESHNESS_DAYS \
+  CATALOG_DISCOVERY_PAGE_SIZE
+do
+  assert_contains "$setup_guide" "${catalog_setting}=" \
+    "VPS guide must write ${catalog_setting} to the production environment"
+done
 assert_contains "$setup_guide" 'VPS_SSH_KEY' 'VPS guide must configure the SSH key secret'
 assert_contains "$setup_guide" 'VPS_KNOWN_HOSTS' 'VPS guide must configure the reviewed host-key secret'
 assert_contains "$setup_guide" 'VPS_HOST' 'VPS guide must configure the VPS host variable'
@@ -150,6 +175,8 @@ assert_ordered "$operations_guide" \
   '^exit$'
 assert_contains "$operations_guide" 'flock -n 9 \|\|' \
   'manual restore must fail closed when the deployment lock is busy'
+assert_contains "$operations_guide" 'do not blindly re-run|never blindly re-run|do not use.*Re-run failed jobs.*until' \
+  'operations guide must forbid a blind retry after a possible migration'
 
 assert_contains "$readme" 'docs/vps-setup\.md' 'README must link the first-time VPS guide'
 assert_contains "$readme" 'docs/deployment\.md' 'README must link the operations guide'

@@ -23,7 +23,7 @@ service.
 - The current `docker-compose.yml` is for local development: it builds locally,
   uses development database credentials, and exposes Mailpit on loopback.
 - No GitHub Actions workflow or production Compose definition exists.
-- `nextgamecrush.site` resolves to `<VPS_IP>` and the VPS currently serves
+- `nextgamecrush.site` resolves to the VPS and the VPS currently serves
   HTTPS through Nginx.
 
 ## 3. Selected Approach
@@ -116,7 +116,7 @@ GitHub uses a `production` Environment containing:
 
 - secret `VPS_SSH_KEY`
 - secret `VPS_KNOWN_HOSTS`
-- variable `VPS_HOST` with value `<VPS_IP>`
+- variable `VPS_HOST` with the VPS hostname or IP address
 - variable `VPS_USER` naming the dedicated VPS deployment account
 
 The workflow authenticates to GHCR with its short-lived `GITHUB_TOKEN` and

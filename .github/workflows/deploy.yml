@@ -156,13 +156,18 @@ jobs:
           readonly image_ref="$2"
           readonly deploy_root=/opt/next-game-crush
 
+          exec 9>"$deploy_root/deploy.lock"
+          flock -n 9 || {
+            printf '%s\n' 'Another deployment or restore holds deploy.lock; artifacts were not changed' >&2
+            exit 1
+          }
           install -m 0644 "$incoming/compose.prod.yml" "$deploy_root/compose.prod.yml.new"
           install -m 0755 "$incoming/deploy.sh" "$deploy_root/deploy.sh.new"
           mv -f "$deploy_root/compose.prod.yml.new" "$deploy_root/compose.prod.yml"
           mv -f "$deploy_root/deploy.sh.new" "$deploy_root/deploy.sh"
           rm -f -- "$incoming/compose.prod.yml" "$incoming/deploy.sh"
           rmdir -- "$incoming"
-          exec "$deploy_root/deploy.sh" "$image_ref"
+          DEPLOY_LOCK_FD=9 exec "$deploy_root/deploy.sh" "$image_ref"
           REMOTE
 
       - name: Remove SSH credentials

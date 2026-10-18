@@ -135,7 +135,7 @@ git commit -m "deploy: add production Compose topology"
 
 - [ ] **Step 11: Implement rollout, public verification, and best-effort image rollback**
 
-  Read the previous full image reference from `docker inspect` when an app container exists. Pull the requested app image, run `docker compose up -d --no-deps --wait app`, then call `curl --fail --silent --show-error` with bounded connect and total timeouts. On either health failure, start the previous image when present, verify its container health, and return failure regardless of rollback success. Finish successful deploys with dangling-image pruning only; do not delete tagged rollback candidates.
+  Read the previous full image reference from `docker inspect` when an app container exists. Pull the requested app image, run `docker compose up -d --no-deps --wait app`, then call `curl --fail --silent --show-error` with bounded connect and total timeouts. On either health failure, start the previous image when present, verify its container health, and return failure regardless of rollback success. Finish successful deploys by retaining the active and immediately previous repository images, removing older SHA-tagged repository images, and pruning dangling layers.
 
 - [ ] **Step 12: Run syntax and behavior verification**
 

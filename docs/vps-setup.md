@@ -1,13 +1,27 @@
 # First-time Ubuntu VPS setup
 
-This runbook prepares the existing Ubuntu server at `<VPS_IP>` to deploy
-Next Game Crush at `https://nextgamecrush.site`. Run VPS commands from an
+This runbook prepares an existing Ubuntu server to deploy Next Game Crush at
+`https://nextgamecrush.site`. Run VPS commands from an
 existing administrator account with `sudo`; run commands marked "workstation"
 on a trusted local machine. The instructions keep the existing Nginx TLS
 certificate and do not expose PostgreSQL or Mailpit.
 
 Before starting, confirm that the DNS `A` record for `nextgamecrush.site`
-resolves to `<VPS_IP>` and that the existing site is reachable over HTTPS.
+resolves to the VPS and that the existing site is reachable over HTTPS.
+This deployment targets an `x86_64` VPS (`amd64` container images) and assumes
+that SSH listens on TCP port `22`. Verify both before enabling the firewall:
+
+```bash
+uname -m
+sudo sshd -T | awk '$1 == "port" {print}'
+```
+
+On the trusted workstation, define the reviewed hostname once before running
+the SSH commands below:
+
+```bash
+readonly VPS_HOST_OR_IP='nextgamecrush.site'
+```
 
 ## 1. Create the deploy user
 
@@ -39,7 +53,7 @@ if ((${#conflicting_packages[@]})); then
 fi
 unset conflicting_packages package
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl
+sudo apt-get install -y ca-certificates curl openssl
 sudo install -m 0755 -d /etc/apt/keyrings
 sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 sudo chmod a+r /etc/apt/keyrings/docker.asc
@@ -70,34 +84,7 @@ Membership in the `docker` group is effectively root-level host access. Use a
 dedicated key, keep the account single-purpose, and remove its access when the
 deployment is retired.
 
-## 3. Create and authorize a dedicated SSH key
-
-On the trusted workstation, create a key with no passphrase. GitHub Actions
-cannot answer an interactive passphrase prompt:
-
-```bash
-ssh-keygen -t ed25519 -f ./next-game-crush-deploy -C 'github-actions-next-game-crush'
-scp ./next-game-crush-deploy.pub ubuntu@<VPS_IP>:/tmp/next-game-crush-deploy.pub
-```
-
-Replace `ubuntu` if the existing administrator account has another name. On
-the VPS, install only the public half:
-
-```bash
-sudo install -d -o ngc-deploy -g ngc-deploy -m 0700 /home/ngc-deploy/.ssh
-sudo install -o ngc-deploy -g ngc-deploy -m 0600 /tmp/next-game-crush-deploy.pub /home/ngc-deploy/.ssh/authorized_keys
-sudo rm -f /tmp/next-game-crush-deploy.pub
-```
-
-Back on the workstation, verify that the dedicated key works:
-
-```bash
-ssh -i ./next-game-crush-deploy -o IdentitiesOnly=yes ngc-deploy@<VPS_IP> 'docker version'
-```
-
-Keep `next-game-crush-deploy` private. The `.pub` file is not secret.
-
-## 4. Verify and capture the SSH host fingerprint
+## 3. Verify and capture the SSH host fingerprint
 
 Do not trust a host key merely because `ssh-keyscan` returned it. First, read
 the Ed25519 fingerprint through the already trusted administrator session:
@@ -110,7 +97,7 @@ Then, on the workstation, capture the key for the same value that will be used
 as `VPS_HOST` and display its fingerprint:
 
 ```bash
-ssh-keyscan -t ed25519 <VPS_IP> > ./next-game-crush-known-hosts
+ssh-keyscan -t ed25519 "$VPS_HOST_OR_IP" > ./next-game-crush-known-hosts
 ssh-keygen -lf ./next-game-crush-known-hosts
 ```
 
@@ -118,6 +105,40 @@ The two SHA256 fingerprints must match exactly. Stop if they differ. Keep the
 entire line from `next-game-crush-known-hosts`; it will become the
 `VPS_KNOWN_HOSTS` GitHub secret. The workflow uses strict host-key checking and
 does not learn keys dynamically.
+
+Do not make a new workstation SSH or SCP connection until this comparison
+succeeds. The next section makes both first connections use this reviewed
+file with strict host-key checking.
+
+## 4. Create and authorize a dedicated SSH key
+
+On the trusted workstation, create a key with no passphrase. `-N ''` makes
+that choice explicit because GitHub Actions cannot answer an interactive
+passphrase prompt:
+
+```bash
+ssh-keygen -t ed25519 -N '' -f ./next-game-crush-deploy -C 'github-actions-next-game-crush'
+scp -o StrictHostKeyChecking=yes -o UserKnownHostsFile=./next-game-crush-known-hosts ./next-game-crush-deploy.pub "ubuntu@$VPS_HOST_OR_IP:/tmp/next-game-crush-deploy.pub"
+```
+
+Replace `ubuntu` if the existing administrator account has another name. On
+the VPS, install only the public half through the already trusted
+administrator session:
+
+```bash
+sudo install -d -o ngc-deploy -g ngc-deploy -m 0700 /home/ngc-deploy/.ssh
+sudo install -o ngc-deploy -g ngc-deploy -m 0600 /tmp/next-game-crush-deploy.pub /home/ngc-deploy/.ssh/authorized_keys
+sudo rm -f /tmp/next-game-crush-deploy.pub
+```
+
+Back on the workstation, verify that the dedicated key works without falling
+back to a newly learned host key:
+
+```bash
+ssh -i ./next-game-crush-deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=./next-game-crush-known-hosts "ngc-deploy@$VPS_HOST_OR_IP" 'docker version'
+```
+
+Keep `next-game-crush-deploy` private. The `.pub` file is not secret.
 
 ## 5. Configure UFW
 
@@ -146,7 +167,7 @@ On the VPS:
 sudo install -d -o ngc-deploy -g ngc-deploy -m 0750 /opt/next-game-crush
 sudo install -d -o ngc-deploy -g ngc-deploy -m 0750 /opt/next-game-crush/backups
 sudo install -d -o ngc-deploy -g ngc-deploy -m 0700 /opt/next-game-crush/incoming
-sudo -iu ngc-deploy touch /opt/next-game-crush/deploy.lock
+sudo install -o ngc-deploy -g ngc-deploy -m 0640 /dev/null /opt/next-game-crush/deploy.lock
 ```
 
 GitHub Actions atomically installs `compose.prod.yml` and `deploy.sh` into this
@@ -204,8 +225,15 @@ env_tmp="$(mktemp /opt/next-game-crush/.env.tmp.XXXXXX)"
 chmod 600 "$env_tmp"
 {
   printf 'APP_BASE_URL=https://nextgamecrush.site\n'
+  printf 'HTTP_ADDR=:8080\n'
   printf 'WORKER_CONCURRENCY=10\n'
+  printf 'DEMO_MODE_ENABLED=1\n'
   printf 'CATALOG_DISCOVERY_ENABLED=0\n'
+  printf 'CATALOG_HORIZON_DAYS=90\n'
+  printf 'CATALOG_DISCOVERY_INTERVAL_HOURS=1\n'
+  printf 'CATALOG_DISCOVERY_HOURLY_BUDGET=200\n'
+  printf 'CATALOG_DISCOVERY_UNKNOWN_FRESHNESS_DAYS=180\n'
+  printf 'CATALOG_DISCOVERY_PAGE_SIZE=100\n'
   printf 'ALLOWED_STEAM_ID=%s\n' "$allowed_steam_id"
   printf 'STEAM_WEB_API_KEY=%s\n' "$steam_web_api_key"
   printf 'OPENAI_API_KEY=%s\n' "$openai_api_key"
@@ -219,6 +247,8 @@ chmod 600 "$env_tmp"
   printf 'EMAIL_ACTION_SECRET=%s\n' "$email_action_secret"
   printf 'SESSION_SECRET=%s\n' "$session_secret"
   printf 'TEST_HARNESS_MODE=0\n'
+  printf 'FIXTURE_AUTH_ENABLED=0\n'
+  printf 'STEAM_STORE_SERVICE_BASE_URL=\n'
 } > "$env_tmp"
 mv -fT -- "$env_tmp" "$env_file"
 env_tmp=
@@ -233,7 +263,11 @@ are ready before a mode-`0600` temporary file is written; the EXIT trap removes
 that temporary file on failure, and GNU `mv -fT` installs it atomically. The
 final line must report mode `600` and owner `ngc-deploy`. Do not print, copy off
 the server, or commit this file. Leave `OPENAI_API_KEY` empty if AI enrichment
-is not needed. Mailpit remains an internal SMTP sink with no web route; it can
+is not needed. `DEMO_MODE_ENABLED=1` is intentional for this deployment and
+exposes the allowlisted owner's saved profile through public read-only routes;
+authenticated mutations remain allowlisted. Compose applies the value when it
+creates or recreates the app container; a plain container restart does not
+reload `.env`. Mailpit remains an internal SMTP sink with no web route; it can
 be replaced with a real server-side SMTP URL later.
 
 Leave the deploy-user shell with `exit` before continuing with administrator
@@ -241,21 +275,43 @@ commands.
 
 ## 8. Update and validate Nginx
 
-Find the already enabled HTTPS site in `/etc/nginx/sites-enabled`. Back up its
-source file before editing it; substitute the actual filename below if it is
-not `nextgamecrush.site`:
+Find the active configuration file from Nginx's loaded configuration, rather
+than a recursive filesystem search that could select a backup or template:
 
 ```bash
-sudo cp --preserve=all /etc/nginx/sites-available/nextgamecrush.site /etc/nginx/sites-available/nextgamecrush.site.before-next-game-crush
-sudoedit /etc/nginx/sites-available/nextgamecrush.site
+nginx_site="$(sudo nginx -T 2>&1 | awk '
+  /^# configuration file / { file=$0 }
+  /server_name[[:space:]].*nextgamecrush\.site/ {
+    sub(/^# configuration file /, "", file)
+    sub(/:$/, "", file)
+    print file
+    exit
+  }
+')"
+[[ -n "$nginx_site" ]] && sudo test -f "$nginx_site"
+printf 'Active Nginx site: %s\n' "$nginx_site"
 ```
 
-In the existing `server` block for `nextgamecrush.site` on port `443`, replace
-the old `location /` with the proxy settings from
+On an ISPmanager host the result is normally under
+`/etc/nginx/vhosts/<owner>/nextgamecrush.site.conf`. ISPmanager generates this
+file and can replace manual edits when the domain is changed in the panel.
+Record the path, create a timestamped backup, and use the panel's custom Nginx
+directives when that facility is available. If the installed edition provides
+no per-domain custom-directive field, edit the generated file deliberately and
+re-check it after every later ISPmanager domain change:
+
+```bash
+sudo cp --preserve=all "$nginx_site" "$nginx_site.before-next-game-crush.$(date +%Y%m%d%H%M%S)"
+sudoedit "$nginx_site"
+```
+
+In the existing HTTPS `server` block for `nextgamecrush.site`, replace only its
+empty `location /` with the proxy settings from
 [`deploy/nginx.conf.example`](../deploy/nginx.conf.example). Keep its current
-`ssl_certificate`, `ssl_certificate_key`, Certbot-managed text, and separate
-HTTP-to-HTTPS redirect unchanged. There must be only one enabled HTTPS server
-block for this hostname.
+`listen`, `server_name`, `ssl_certificate`, `ssl_certificate_key`,
+panel-managed includes, and separate HTTP-to-HTTPS redirect unchanged. Do not
+paste a second complete `server` block. There must be only one enabled HTTPS
+server block for this hostname.
 
 Validate the complete configuration before reloading:
 
@@ -277,14 +333,13 @@ environment**, create an environment named exactly `production`, and add:
 | --- | --- | --- |
 | Environment secret | `VPS_SSH_KEY` | Full contents of the private `next-game-crush-deploy` key |
 | Environment secret | `VPS_KNOWN_HOSTS` | Reviewed full line from `next-game-crush-known-hosts` |
-| Environment variable | `VPS_HOST` | `<VPS_IP>` |
+| Environment variable | `VPS_HOST` | VPS hostname or IPv4 address |
 | Environment variable | `VPS_USER` | `ngc-deploy` |
 
-Do not put application secrets in GitHub. The repository workflow needs
-permission to create packages: in **Settings → Actions → General → Workflow
-permissions**, allow read and write permissions if repository policy currently
-blocks package publication. The workflow still declares narrow permissions per
-job.
+Do not put application secrets in GitHub. The repository-level default may
+remain **Read repository contents and packages permissions**: the workflow
+declares `packages: write` only for the publish job. Change the broader setting
+only if an organization policy explicitly prevents that job permission.
 
 ## 10. Publish the first GHCR package and make it public
 
@@ -298,15 +353,20 @@ profile, choose **Package settings → Danger Zone → Change visibility**, and
 make it **Public**. GitHub warns that this visibility change cannot be undone;
 this runbook assumes the approved public-package design. Confirm that the
 package is linked to this repository. A public package lets the VPS pull
-immutable images without storing a long-lived registry token.
+commit-addressed images without storing a long-lived registry token.
 
 ## 11. Run the first deployment
 
-In the failed workflow run, use **Re-run jobs → Re-run failed jobs**. If no job
-failed, push the next reviewed commit to `main`; the workflow intentionally has
-no manual deployment trigger. The deploy job uploads the production Compose
-file and deploy script, starts PostgreSQL and internal Mailpit, writes the first
-successful dump, pulls the exact commit-SHA image, and checks public health.
+For the first private-package failure only, confirm in the job log that GHCR
+denied `docker pull` before the app container was created. After making the
+package public, use **Re-run jobs → Re-run failed jobs**. Do not blindly re-run
+after an app container has started or migrations may have run; follow
+[`docs/deployment.md`](deployment.md) first so the sole pre-deploy dump is not
+overwritten. If no job failed, push the next reviewed commit to `main`; the
+workflow intentionally has no manual deployment trigger. The deploy job uploads
+the production Compose file and deploy script, starts PostgreSQL and internal
+Mailpit, writes the first successful dump, pulls the exact commit-SHA image, and
+checks public health.
 
 Check the result from the VPS without reading `.env`:
 
@@ -348,6 +408,7 @@ sudo -iu ngc-deploy docker ps --filter label=com.docker.compose.project=next-gam
 curl --fail --silent --show-error https://nextgamecrush.site/api/health
 ```
 
-All Compose services use `restart: unless-stopped`, so they should start when
-Docker starts. If a container is missing or unhealthy, follow the diagnosis
-runbook before triggering another deployment.
+All Compose services use `restart: unless-stopped`. The application also retries
+transient initial database connection failures for up to 90 seconds, preventing
+the usual Docker-daemon restart race with PostgreSQL. If a container is missing
+or unhealthy, follow the diagnosis runbook before triggering another deployment.

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/auth"
 	"next-game-crush/internal/catalog"
@@ -41,8 +43,18 @@ func New(cfg config.Config) (*App, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("open frontend build: %w", err)
 	}
-	openCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	openCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	err := waitForDatabase(openCtx, time.Second, func(ctx context.Context) error {
+		connection, connectErr := pgx.Connect(ctx, cfg.DatabaseURL)
+		if connectErr != nil {
+			return connectErr
+		}
+		return connection.Close(ctx)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("wait for persistence store: %w", err)
+	}
 	db, err := store.Open(openCtx, cfg.DatabaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("open persistence store: %w", err)
@@ -189,6 +201,44 @@ func New(cfg config.Config) (*App, error) {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}}, nil
+}
+
+func waitForDatabase(
+	ctx context.Context,
+	retryInterval time.Duration,
+	connect func(context.Context) error,
+) error {
+	for {
+		err := connect(ctx)
+		if err == nil {
+			return nil
+		}
+		if !retryableDatabaseConnectError(err) {
+			return err
+		}
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return fmt.Errorf("database availability timeout: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func retryableDatabaseConnectError(err error) bool {
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) {
+		return postgresError.Code == "57P03"
+	}
+	var connectError *pgconn.ConnectError
+	return errors.As(err, &connectError) || pgconn.SafeToRetry(err)
 }
 
 func (app *App) Run(ctx context.Context) error {

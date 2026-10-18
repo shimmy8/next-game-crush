@@ -49,6 +49,7 @@ setup_case() {
   MOCK_ROLLBACK_HEALTH=0
   MOCK_PUBLIC_HEALTH_EXIT=0
   MOCK_PRUNE_EXIT=0
+  MOCK_REPOSITORY_IMAGES=''
   PUBLIC_HEALTH_URL='https://nextgamecrush.site/api/health'
   case_dir="$(mktemp -d)"
   deploy_root="$case_dir/root"
@@ -80,6 +81,15 @@ set -Eeuo pipefail
 } >>"$MOCK_COMMAND_LOG"
 
 if [[ "${1:-}" == "image" && "${2:-}" == "prune" ]]; then
+  exit "${MOCK_PRUNE_EXIT:-0}"
+fi
+
+if [[ "${1:-}" == "image" && "${2:-}" == "ls" ]]; then
+  printf '%s' "${MOCK_REPOSITORY_IMAGES:-}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "image" && "${2:-}" == "rm" ]]; then
   exit "${MOCK_PRUNE_EXIT:-0}"
 fi
 
@@ -188,9 +198,41 @@ run_deploy() {
     MOCK_ROLLBACK_HEALTH="${MOCK_ROLLBACK_HEALTH:-0}" \
     MOCK_PUBLIC_HEALTH_EXIT="${MOCK_PUBLIC_HEALTH_EXIT:-0}" \
     MOCK_PRUNE_EXIT="${MOCK_PRUNE_EXIT:-0}" \
+    MOCK_REPOSITORY_IMAGES="${MOCK_REPOSITORY_IMAGES:-}" \
     MOCK_REQUESTED_IMAGE="$valid_image" \
     MOCK_PREVIOUS_IMAGE="$previous_image" \
     bash "$deploy_script" "$image" >"$output_log" 2>&1
+  status=$?
+  set -e
+  return "$status"
+}
+
+run_deploy_with_inherited_lock() {
+  local image="$1"
+  local status
+
+  set +e
+  (
+    exec 9>"$deploy_root/deploy.lock"
+    env \
+      PATH="$mock_bin:$PATH" \
+      DEPLOY_ROOT="$deploy_root" \
+      DEPLOY_LOCK_FD=9 \
+      PUBLIC_HEALTH_URL="${PUBLIC_HEALTH_URL:-https://nextgamecrush.site/api/health}" \
+      MOCK_COMMAND_LOG="$command_log" \
+      MOCK_LOCK_AVAILABLE="${MOCK_LOCK_AVAILABLE:-1}" \
+      MOCK_CURRENT_IMAGE="${MOCK_CURRENT_IMAGE:-}" \
+      MOCK_DUMP_EXIT="${MOCK_DUMP_EXIT:-0}" \
+      MOCK_GZIP_EXIT="${MOCK_GZIP_EXIT:-0}" \
+      MOCK_CONTAINER_HEALTH="${MOCK_CONTAINER_HEALTH:-0}" \
+      MOCK_ROLLBACK_HEALTH="${MOCK_ROLLBACK_HEALTH:-0}" \
+      MOCK_PUBLIC_HEALTH_EXIT="${MOCK_PUBLIC_HEALTH_EXIT:-0}" \
+      MOCK_PRUNE_EXIT="${MOCK_PRUNE_EXIT:-0}" \
+      MOCK_REPOSITORY_IMAGES="${MOCK_REPOSITORY_IMAGES:-}" \
+      MOCK_REQUESTED_IMAGE="$valid_image" \
+      MOCK_PREVIOUS_IMAGE="$previous_image" \
+      bash "$deploy_script" "$image" >"$output_log" 2>&1
+  )
   status=$?
   set -e
   return "$status"
@@ -225,6 +267,37 @@ test_lock_contention_fails_without_changes() {
   assert_contains "$command_log" 'flock -n 9' "deployment did not request the lock"
   assert_not_contains "$command_log" 'docker ' "lock contention invoked Docker"
   [[ ! -e "$deploy_root/backups/latest.sql.gz" ]] || fail "lock contention created a backup"
+  teardown_case
+}
+
+test_inherited_lock_covers_rollout() {
+  setup_case
+  if ! run_deploy_with_inherited_lock "$valid_image"; then
+    fail "deployment rejected the workflow's inherited deployment lock"
+  fi
+  [[ "$(grep -Fc 'flock -n 9' "$command_log")" -eq 1 ]] ||
+    fail "inherited deployment lock was not validated exactly once"
+  assert_contains "$command_log" ' pull app' "inherited lock deployment did not reach rollout"
+  assert_contains "$command_log" 'curl --fail' "inherited lock deployment did not reach public verification"
+  teardown_case
+}
+
+test_rejects_inherited_descriptor_for_another_file() {
+  setup_case
+  set +e
+  (
+    exec 9>"$case_dir/not-the-deploy-lock"
+    env \
+      PATH="$mock_bin:$PATH" \
+      DEPLOY_ROOT="$deploy_root" \
+      DEPLOY_LOCK_FD=9 \
+      MOCK_COMMAND_LOG="$command_log" \
+      bash "$deploy_script" "$valid_image" >"$output_log" 2>&1
+  )
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "deployment accepted an unrelated inherited lock descriptor"
+  assert_not_contains "$command_log" 'docker ' "invalid inherited descriptor reached Docker"
   teardown_case
 }
 
@@ -430,8 +503,26 @@ test_prune_failure_is_best_effort() {
   fi
   assert_contains "$command_log" ' image prune -f --filter dangling=true' \
     "healthy rollout did not attempt dangling-image pruning"
-  assert_contains "$output_log" 'deploy: dangling-image prune failed' \
+  assert_contains "$output_log" 'deploy: old-image prune failed' \
     "best-effort prune failure diagnostic is missing"
+  teardown_case
+}
+
+test_successful_upgrade_prunes_only_older_repository_images() {
+  setup_case
+  local old_image='ghcr.io/shimmy8/next-game-crush:1111111111111111111111111111111111111111'
+  MOCK_CURRENT_IMAGE="$previous_image"
+  MOCK_REPOSITORY_IMAGES="$valid_image"$'\n'"$previous_image"$'\n'"$old_image"$'\n'
+
+  if ! run_deploy "$valid_image"; then
+    fail "healthy upgrade failed while pruning old repository images"
+  fi
+  assert_contains "$command_log" " image rm $old_image" \
+    "healthy rollout did not remove the image older than the rollback image"
+  assert_not_contains "$command_log" " image rm $valid_image" \
+    "healthy rollout removed the active image"
+  assert_not_contains "$command_log" " image rm $previous_image" \
+    "healthy rollout removed the previous rollback image"
   teardown_case
 }
 
@@ -439,6 +530,8 @@ test_prune_failure_is_best_effort() {
 
 test_rejects_invalid_image_reference
 test_lock_contention_fails_without_changes
+test_inherited_lock_covers_rollout
+test_rejects_inherited_descriptor_for_another_file
 test_rejects_unprotected_inputs
 test_rejects_unsafe_backup_targets
 test_dump_failure_stops_before_pull
@@ -449,5 +542,6 @@ test_public_health_failure_rolls_back_image
 test_container_health_failure_rolls_back_image
 test_rollback_failure_preserves_rollout_failure
 test_prune_failure_is_best_effort
+test_successful_upgrade_prunes_only_older_repository_images
 
 printf 'PASS: guarded deployment and rollback behavior\n'

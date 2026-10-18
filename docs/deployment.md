@@ -17,14 +17,27 @@ Every pull request and every push to `main` starts `.github/workflows/deploy.yml
    exact image reference over strictly verified SSH.
 
 The production concurrency group allows only one deploy job at a time and does
-not cancel an in-progress deployment. The remote script also takes
-`/opt/next-game-crush/deploy.lock`, protecting against overlap with a manual
-invocation. A later workflow waits instead of interrupting a dump, migration,
-or rollback.
+not cancel an in-progress deployment. On the VPS, the workflow takes
+`/opt/next-game-crush/deploy.lock` before installing either deployment
+artifact and keeps file descriptor 9 open across `exec` for the complete
+rollout. `deploy.sh` validates that the inherited descriptor names the same
+lock file; a direct manual invocation opens and takes that lock itself. This
+internal `DEPLOY_LOCK_FD=9` protocol is workflow-owned and must not be set for
+operator commands. A contending workflow or manual invocation fails before
+changing deployment artifacts, taking a dump, running a migration, or
+attempting rollback.
 
-The immutable SHA tag identifies exactly what is running. There is no `latest`
-tag and no source build on the VPS. The normal way to deploy is to merge or push
-a reviewed commit to `main` and follow its **Verify and deploy** workflow run.
+GitHub concurrency preserves the running production deploy and one pending
+deploy. If several commits reach `main` while a deploy is running, GitHub may
+replace the older pending run with the newest one. This is intentional: the
+server converges to the latest verified commit rather than deploying every
+intermediate commit.
+
+The commit-addressed SHA tag identifies what the workflow requested. There is
+no `latest` tag and no source build on the VPS. Registry tags are technically
+mutable, so package write access remains tightly scoped. The normal way to
+deploy is to merge or push a reviewed commit to `main` and follow its
+**Verify and deploy** workflow run.
 
 The VPS layout is:
 
@@ -56,9 +69,16 @@ sudo journalctl -u nginx --since '30 minutes ago' --no-pager
 Review logs before sharing them. Application diagnostics are designed to be
 sanitized, but operator review is still required.
 
-To retry the exact same rollout, use **Re-run failed jobs** in the GitHub run.
-Do not invent an image tag. A manual rollout, when needed for recovery, accepts
-only this repository's lowercase 40-character SHA image:
+Do not blindly re-run a failed deploy. If the new app container started, its
+embedded migrations may already have changed the database; another run would
+replace the only pre-deploy dump with that changed state. First inspect the job
+and container logs, verify `backups/latest.sql.gz`, and decide whether the
+database needs the manual restore below. A re-run is safe without that recovery
+decision only when failure happened before the requested app started, such as a
+denied GHCR pull.
+
+A manual rollout, when needed after diagnosis, accepts only this repository's
+lowercase 40-character SHA image:
 
 ```bash
 sudo -iu ngc-deploy /opt/next-game-crush/deploy.sh ghcr.io/shimmy8/next-game-crush:0123456789abcdef0123456789abcdef01234567
@@ -90,6 +110,11 @@ sudo -iu ngc-deploy stat /opt/next-game-crush/backups/latest.sql.gz
 
 This single local dump is a rollback aid for a study project, not an off-host
 backup strategy. A disk loss removes both the database and the dump.
+
+After a healthy rollout, image cleanup keeps the active app image and the
+immediately previous rollback image, and removes older SHA-tagged images from
+this repository plus dangling layers. Cleanup failure is reported but does not
+turn an otherwise healthy rollout into a failure.
 
 ## Automatic image rollback
 
@@ -157,7 +182,7 @@ automatic image rollback does not authorize an automatic database restore.
 
 First verify the dump. Print the current container image only as a candidate,
 then enter the exact known-compatible image associated with the pre-deploy
-state. The validation deliberately accepts only an immutable image from this
+state. The validation deliberately accepts only a commit-addressed image from this
 repository, and the pull proves that it is available before any data is
 destroyed:
 

@@ -35,6 +35,7 @@ common_env=(
   EMAIL_ACTION_SECRET=fixture-email-secret
   SESSION_SECRET=fixture-session-secret
   WORKER_CONCURRENCY=10
+  DEMO_MODE_ENABLED=0
   CATALOG_DISCOVERY_ENABLED=0
   CATALOG_HORIZON_DAYS=90
   CATALOG_DISCOVERY_INTERVAL_HOURS=1
@@ -182,6 +183,7 @@ expected_environment = {
     "EMAIL_ACTION_SECRET",
     "SESSION_SECRET",
     "WORKER_CONCURRENCY",
+    "DEMO_MODE_ENABLED",
     "CATALOG_DISCOVERY_ENABLED",
     "CATALOG_HORIZON_DAYS",
     "CATALOG_DISCOVERY_INTERVAL_HOURS",
@@ -195,6 +197,8 @@ if missing_environment:
     fail("app is missing explicit production environment settings")
 if app_environment.get("TEST_HARNESS_MODE") != "0":
     fail("TEST_HARNESS_MODE must be fixed to 0")
+if app_environment.get("DEMO_MODE_ENABLED") != "0":
+    fail("DEMO_MODE_ENABLED must default to 0")
 for unsafe_name in (
     "FIXTURE_AUTH_ENABLED",
     "STEAM_WEB_API_BASE_URL",

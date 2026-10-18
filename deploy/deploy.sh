@@ -27,8 +27,25 @@ else
 fi
 [[ "$env_mode" == '600' ]] || fail 'protected .env must have mode 0600'
 
-exec 9>"$deploy_root/deploy.lock"
-flock -n 9 || fail 'another deployment is already running'
+readonly inherited_lock_fd="${DEPLOY_LOCK_FD:-}"
+if [[ -n "$inherited_lock_fd" ]]; then
+  [[ "$inherited_lock_fd" == '9' ]] || fail 'invalid inherited deployment lock descriptor'
+  if [[ -d /proc/self/fd ]]; then
+    [[ -e "/proc/self/fd/$inherited_lock_fd" && "$deploy_root/deploy.lock" -ef "/proc/self/fd/$inherited_lock_fd" ]] ||
+      fail 'inherited deployment lock descriptor does not reference deploy.lock'
+  else
+    [[ -e "/dev/fd/$inherited_lock_fd" ]] || fail 'inherited deployment lock descriptor is not open'
+    lock_inode="$(stat -f '%i' "$deploy_root/deploy.lock")"
+    inherited_inode="$(stat -f '%i' "/dev/fd/$inherited_lock_fd")"
+    [[ "$lock_inode" == "$inherited_inode" ]] ||
+      fail 'inherited deployment lock descriptor does not reference deploy.lock'
+  fi
+  flock -n "$inherited_lock_fd" || fail 'another deployment is already running'
+  unset DEPLOY_LOCK_FD
+else
+  exec 9>"$deploy_root/deploy.lock"
+  flock -n 9 || fail 'another deployment is already running'
+fi
 
 compose() {
   env APP_IMAGE_REF="$1" docker compose --env-file "$env_file" -f "$compose_file" "${@:2}"
@@ -106,6 +123,27 @@ if ! curl --fail --silent --show-error --output /dev/null --connect-timeout 10 -
   exit 1
 fi
 
+prune_failed=0
+repository_images=''
+if repository_images="$(docker image ls --format '{{.Repository}}:{{.Tag}}' \
+  --filter 'reference=ghcr.io/shimmy8/next-game-crush:*')"; then
+  while IFS= read -r repository_image; do
+    [[ -n "$repository_image" ]] || continue
+    [[ "$repository_image" =~ $expected_image_pattern ]] || continue
+    if [[ "$repository_image" == "$requested_image" || "$repository_image" == "$previous_image" ]]; then
+      continue
+    fi
+    if ! docker image rm "$repository_image"; then
+      prune_failed=1
+    fi
+  done <<<"$repository_images"
+else
+  prune_failed=1
+fi
+
 if ! docker image prune -f --filter dangling=true; then
-  printf '%s\n' 'deploy: dangling-image prune failed; rollout remains healthy' >&2
+  prune_failed=1
+fi
+if [[ "$prune_failed" -ne 0 ]]; then
+  printf '%s\n' 'deploy: old-image prune failed; rollout remains healthy' >&2
 fi
