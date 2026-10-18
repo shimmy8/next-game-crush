@@ -10,6 +10,7 @@ type Client interface {
 	RecentlyPlayed(context.Context, string) ([]RecentGame, Availability, error)
 	Wishlist(context.Context, string) ([]WishlistItem, Availability, error)
 	Achievements(context.Context, string, int64) (AchievementSummary, Availability, error)
+	AchievementSchema(context.Context, int64) (AchievementSchema, Availability, error)
 	GameDetails(context.Context, int64) (GameDetails, error)
 }
 

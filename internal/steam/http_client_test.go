@@ -252,10 +252,10 @@ func TestWishlistContracts(t *testing.T) {
 }
 
 func TestAchievementContracts(t *testing.T) {
-	t.Run("available", func(t *testing.T) {
+	t.Run("available localized metadata", func(t *testing.T) {
 		client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Query().Get("appid") != "620" {
-				t.Fatalf("appid = %q", r.URL.Query().Get("appid"))
+			if r.URL.Query().Get("appid") != "620" || r.URL.Query().Get("l") != "en" {
+				t.Fatalf("request URL = %s", r.URL.String())
 			}
 			serveFixture(t, w, "achievements.json")
 		}), HTTPConfig{})
@@ -266,6 +266,14 @@ func TestAchievementContracts(t *testing.T) {
 		if summary.AppID != 620 || summary.Total != 3 || summary.Unlocked != 2 || summary.Percentage != 2.0/3.0 {
 			t.Fatalf("summary = %#v", summary)
 		}
+		want := []Achievement{
+			{APIName: "ACH.ONE", Name: "Wake Up", Description: "Finish the first test chamber.", Achieved: true, UnlockedAt: time.Unix(1600000000, 0).UTC()},
+			{APIName: "ACH.TWO", Name: "Still Alive", Description: "Reach an ending.", Achieved: false},
+			{APIName: "ACH.THREE", Name: "Partygoer", Description: "Complete the game.", Achieved: true, UnlockedAt: time.Unix(1650000000, 0).UTC()},
+		}
+		if fmt.Sprint(summary.Achievements) != fmt.Sprint(want) {
+			t.Fatalf("achievements = %#v, want %#v", summary.Achievements, want)
+		}
 	})
 
 	t.Run("missing stats", func(t *testing.T) {
@@ -273,7 +281,7 @@ func TestAchievementContracts(t *testing.T) {
 			_, _ = w.Write([]byte(`{"playerstats":{"steamID":"76561197960287930","gameName":"No Stats","success":false,"error":"Requested app has no stats"}}`))
 		}), HTTPConfig{})
 		summary, availability, err := client.Achievements(context.Background(), "76561197960287930", 10)
-		if err != nil || availability != Unavailable || summary != (AchievementSummary{}) {
+		if err != nil || availability != Unavailable || summary.AppID != 0 || len(summary.Achievements) != 0 {
 			t.Fatalf("summary = %#v, availability = %q, err = %v", summary, availability, err)
 		}
 	})
@@ -283,10 +291,72 @@ func TestAchievementContracts(t *testing.T) {
 			serveFixture(t, w, "private_achievements.json")
 		}), HTTPConfig{})
 		summary, availability, err := client.Achievements(context.Background(), "76561197960287930", 620)
-		if err != nil || availability != Unavailable || summary != (AchievementSummary{}) {
+		if err != nil || availability != Unavailable || summary.AppID != 0 || len(summary.Achievements) != 0 {
 			t.Fatalf("summary = %#v, availability = %q, err = %v", summary, availability, err)
 		}
 	})
+}
+
+func TestAchievementSchemaContracts(t *testing.T) {
+	t.Run("available app scoped metadata", func(t *testing.T) {
+		client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/ISteamUserStats/GetSchemaForGame/v2/" || r.URL.Query().Get("appid") != "620" || r.URL.Query().Get("l") != "en" {
+				t.Fatalf("request URL = %s", r.URL.String())
+			}
+			w.Header().Set("ETag", `"schema-v1"`)
+			serveFixture(t, w, "achievement_schema.json")
+		}), HTTPConfig{})
+		got, availability, err := client.AchievementSchema(context.Background(), 620)
+		if err != nil || availability != Available {
+			t.Fatalf("schema = %#v, availability = %q, err = %v", got, availability, err)
+		}
+		want := AchievementSchema{AppID: 620, Achievements: []AchievementDefinition{
+			{APIName: "ACH.ONE", Name: "Wake Up", Description: "Finish the first test chamber."},
+			{APIName: "ACH.TWO", Name: "Still Alive", Description: "Reach an ending."},
+		}}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("schema = %#v, want %#v", got, want)
+		}
+		metadata, ok := client.CacheMetadata(AchievementSchemaCacheKey(620))
+		if !ok || metadata.ETag != `"schema-v1"` {
+			t.Fatalf("cache metadata = %#v, present = %v", metadata, ok)
+		}
+		if _, ok := client.CacheMetadata(AchievementSchemaCacheKey(440)); ok {
+			t.Fatal("schema metadata leaked between games")
+		}
+	})
+
+	t.Run("unavailable", func(t *testing.T) {
+		client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"game":{"gameName":"Portal 2"}}`))
+		}), HTTPConfig{})
+		got, availability, err := client.AchievementSchema(context.Background(), 620)
+		if err != nil || availability != Unavailable || got.AppID != 0 || len(got.Achievements) != 0 {
+			t.Fatalf("schema = %#v, availability = %q, err = %v", got, availability, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "blank api name", body: `{"game":{"availableGameStats":{"achievements":[{"name":" ","displayName":"Blank","description":"Bad"}]}}}`},
+		{name: "duplicate api name", body: `{"game":{"availableGameStats":{"achievements":[{"name":"ACH.ONE","displayName":"One"},{"name":"ACH.ONE","displayName":"Two"}]}}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("ETag", `"invalid"`)
+				_, _ = w.Write([]byte(test.body))
+			}), HTTPConfig{})
+			got, availability, err := client.AchievementSchema(context.Background(), 620)
+			if got.AppID != 0 || len(got.Achievements) != 0 || availability != RequestFailed || !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("schema = %#v, availability = %q, err = %v", got, availability, err)
+			}
+			if _, ok := client.CacheMetadata(AchievementSchemaCacheKey(620)); ok {
+				t.Fatal("invalid schema published cache metadata")
+			}
+		})
+	}
 }
 
 func TestGameDetailsContractAndMalformedReleaseDate(t *testing.T) {
@@ -523,9 +593,10 @@ func TestStructuredResponseValidation(t *testing.T) {
 	})
 
 	invalidCases := []struct {
-		name string
-		call func(*HTTPClient) (Availability, error)
-		body string
+		name                  string
+		call                  func(*HTTPClient) (Availability, error)
+		body                  string
+		checkAchievementCache bool
 	}{
 		{
 			name: "owned negative playtime",
@@ -552,16 +623,63 @@ func TestStructuredResponseValidation(t *testing.T) {
 			},
 		},
 		{
-			name: "achievement negative timestamp",
-			body: `{"playerstats":{"gameName":"Portal 2","success":true,"achievements":[{"achieved":1,"unlocktime":-1}]}}`,
+			name:                  "achievement negative timestamp",
+			body:                  `{"playerstats":{"gameName":"Portal 2","success":true,"achievements":[{"apiname":"ACH.ONE","achieved":1,"unlocktime":-1}]}}`,
+			checkAchievementCache: true,
 			call: func(client *HTTPClient) (Availability, error) {
 				_, availability, err := client.Achievements(context.Background(), "76561197960287930", 620)
 				return availability, err
 			},
 		},
 		{
-			name: "achievement blank game name",
-			body: `{"playerstats":{"gameName":" ","success":true,"achievements":[]}}`,
+			name:                  "achievement empty api name",
+			body:                  `{"playerstats":{"gameName":"Portal 2","success":true,"achievements":[{"apiname":" ","achieved":0,"unlocktime":0}]}}`,
+			checkAchievementCache: true,
+			call: func(client *HTTPClient) (Availability, error) {
+				_, availability, err := client.Achievements(context.Background(), "76561197960287930", 620)
+				return availability, err
+			},
+		},
+		{
+			name:                  "achievement duplicate api name",
+			body:                  `{"playerstats":{"gameName":"Portal 2","success":true,"achievements":[{"apiname":"ACH.ONE","achieved":0,"unlocktime":0},{"apiname":"ACH.ONE","achieved":1,"unlocktime":1}]}}`,
+			checkAchievementCache: true,
+			call: func(client *HTTPClient) (Availability, error) {
+				_, availability, err := client.Achievements(context.Background(), "76561197960287930", 620)
+				return availability, err
+			},
+		},
+		{
+			name:                  "achievement invalid achieved flag",
+			body:                  `{"playerstats":{"gameName":"Portal 2","success":true,"achievements":[{"apiname":"ACH.ONE","achieved":2,"unlocktime":0}]}}`,
+			checkAchievementCache: true,
+			call: func(client *HTTPClient) (Availability, error) {
+				_, availability, err := client.Achievements(context.Background(), "76561197960287930", 620)
+				return availability, err
+			},
+		},
+		{
+			name:                  "locked achievement nonzero unlock time",
+			body:                  `{"playerstats":{"gameName":"Portal 2","success":true,"achievements":[{"apiname":"ACH.ONE","achieved":0,"unlocktime":1}]}}`,
+			checkAchievementCache: true,
+			call: func(client *HTTPClient) (Availability, error) {
+				_, availability, err := client.Achievements(context.Background(), "76561197960287930", 620)
+				return availability, err
+			},
+		},
+		{
+			name:                  "achievement trailing member",
+			body:                  `{"playerstats":{"gameName":"Portal 2","success":true,"achievements":[{"apiname":"ACH.ONE","achieved":0,"unlocktime":0,"unexpected":"reject"}]}}`,
+			checkAchievementCache: true,
+			call: func(client *HTTPClient) (Availability, error) {
+				_, availability, err := client.Achievements(context.Background(), "76561197960287930", 620)
+				return availability, err
+			},
+		},
+		{
+			name:                  "achievement blank game name",
+			body:                  `{"playerstats":{"gameName":" ","success":true,"achievements":[]}}`,
+			checkAchievementCache: true,
 			call: func(client *HTTPClient) (Availability, error) {
 				_, availability, err := client.Achievements(context.Background(), "76561197960287930", 620)
 				return availability, err
@@ -571,11 +689,17 @@ func TestStructuredResponseValidation(t *testing.T) {
 	for _, test := range invalidCases {
 		t.Run(test.name, func(t *testing.T) {
 			client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("ETag", `"invalid"`)
 				_, _ = w.Write([]byte(test.body))
 			}), HTTPConfig{})
 			availability, err := test.call(client)
 			if availability != RequestFailed || !errors.Is(err, ErrInvalidResponse) {
 				t.Fatalf("availability = %q, err = %v", availability, err)
+			}
+			if test.checkAchievementCache {
+				if _, ok := client.CacheMetadata(AchievementsCacheKey("76561197960287930", 620)); ok {
+					t.Fatal("invalid achievements response published cache metadata")
+				}
 			}
 		})
 	}

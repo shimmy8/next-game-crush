@@ -397,12 +397,9 @@ func (c *HTTPClient) Achievements(ctx context.Context, steamID string, appID int
 	}
 	var payload struct {
 		PlayerStats *struct {
-			GameName     string `json:"gameName"`
-			Success      *bool  `json:"success"`
-			Achievements *[]struct {
-				Achieved   int   `json:"achieved"`
-				UnlockTime int64 `json:"unlocktime"`
-			} `json:"achievements"`
+			GameName     string             `json:"gameName"`
+			Success      *bool              `json:"success"`
+			Achievements *[]json.RawMessage `json:"achievements"`
 		} `json:"playerstats"`
 	}
 	if err := decode(response.body, &payload, AchievementsOperation); err != nil {
@@ -414,11 +411,38 @@ func (c *HTTPClient) Achievements(ctx context.Context, steamID string, appID int
 	if strings.TrimSpace(payload.PlayerStats.GameName) == "" {
 		return AchievementSummary{}, RequestFailed, invalidResponse(AchievementsOperation)
 	}
-	summary := AchievementSummary{AppID: appID, GameName: payload.PlayerStats.GameName, Total: len(*payload.PlayerStats.Achievements)}
-	for _, achievement := range *payload.PlayerStats.Achievements {
-		if (achievement.Achieved != 0 && achievement.Achieved != 1) || achievement.UnlockTime < 0 {
+	summary := AchievementSummary{
+		AppID:        appID,
+		GameName:     payload.PlayerStats.GameName,
+		Achievements: make([]Achievement, 0, len(*payload.PlayerStats.Achievements)),
+		Total:        len(*payload.PlayerStats.Achievements),
+	}
+	apiNames := make(map[string]struct{}, summary.Total)
+	for _, rawAchievement := range *payload.PlayerStats.Achievements {
+		var achievement struct {
+			APIName     string `json:"apiname"`
+			Achieved    int    `json:"achieved"`
+			UnlockTime  int64  `json:"unlocktime"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		}
+		if err := decodeStrict(rawAchievement, &achievement, AchievementsOperation); err != nil {
+			return AchievementSummary{}, RequestFailed, err
+		}
+		apiName := strings.TrimSpace(achievement.APIName)
+		_, duplicate := apiNames[apiName]
+		if apiName == "" || duplicate || (achievement.Achieved != 0 && achievement.Achieved != 1) || achievement.UnlockTime < 0 || (achievement.Achieved == 0 && achievement.UnlockTime != 0) {
 			return AchievementSummary{}, RequestFailed, invalidResponse(AchievementsOperation)
 		}
+		apiNames[apiName] = struct{}{}
+		item := Achievement{
+			APIName:     apiName,
+			Name:        achievement.Name,
+			Description: achievement.Description,
+			Achieved:    achievement.Achieved == 1,
+			UnlockedAt:  unixTime(achievement.UnlockTime),
+		}
+		summary.Achievements = append(summary.Achievements, item)
 		if achievement.Achieved != 0 {
 			summary.Unlocked++
 			unlockedAt := unixTime(achievement.UnlockTime)
@@ -432,6 +456,56 @@ func (c *HTTPClient) Achievements(ctx context.Context, steamID string, appID int
 	}
 	c.recordMetadata(cacheKey, response.header, false)
 	return summary, Available, nil
+}
+
+func (c *HTTPClient) AchievementSchema(ctx context.Context, appID int64) (AchievementSchema, Availability, error) {
+	if appID <= 0 {
+		return AchievementSchema{}, RequestFailed, invalidResponse(AchievementSchemaOperation)
+	}
+	cacheKey := AchievementSchemaCacheKey(appID)
+	values := url.Values{"key": {c.apiKey}, "appid": {strconv.FormatInt(appID, 10)}, "l": {"en"}, "format": {"json"}}
+	response, availability, err := c.get(ctx, cacheKey, c.webBase, "/ISteamUserStats/GetSchemaForGame/v2/", values)
+	if err != nil {
+		return AchievementSchema{}, availability, err
+	}
+	var payload struct {
+		Game *struct {
+			AvailableGameStats *struct {
+				Achievements *[]struct {
+					APIName     string `json:"name"`
+					Name        string `json:"displayName"`
+					Description string `json:"description"`
+					Default     int    `json:"defaultvalue"`
+					Hidden      int    `json:"hidden"`
+					Icon        string `json:"icon"`
+					IconGray    string `json:"icongray"`
+				} `json:"achievements"`
+			} `json:"availableGameStats"`
+		} `json:"game"`
+	}
+	if err := decode(response.body, &payload, AchievementSchemaOperation); err != nil {
+		return AchievementSchema{}, RequestFailed, err
+	}
+	if payload.Game == nil || payload.Game.AvailableGameStats == nil || payload.Game.AvailableGameStats.Achievements == nil {
+		return AchievementSchema{}, Unavailable, nil
+	}
+	schema := AchievementSchema{AppID: appID, Achievements: make([]AchievementDefinition, 0, len(*payload.Game.AvailableGameStats.Achievements))}
+	apiNames := make(map[string]struct{}, len(*payload.Game.AvailableGameStats.Achievements))
+	for _, achievement := range *payload.Game.AvailableGameStats.Achievements {
+		apiName := strings.TrimSpace(achievement.APIName)
+		_, duplicate := apiNames[apiName]
+		if apiName == "" || duplicate {
+			return AchievementSchema{}, RequestFailed, invalidResponse(AchievementSchemaOperation)
+		}
+		apiNames[apiName] = struct{}{}
+		schema.Achievements = append(schema.Achievements, AchievementDefinition{
+			APIName:     apiName,
+			Name:        achievement.Name,
+			Description: achievement.Description,
+		})
+	}
+	c.recordMetadata(cacheKey, response.header, false)
+	return schema, Available, nil
 }
 
 func (c *HTTPClient) GameDetails(ctx context.Context, appID int64) (GameDetails, error) {
@@ -661,6 +735,18 @@ func waitContext(ctx context.Context, duration time.Duration) error {
 
 func decode(body []byte, target any, operation Operation) error {
 	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(target); err != nil {
+		return invalidResponse(operation)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return invalidResponse(operation)
+	}
+	return nil
+}
+
+func decodeStrict(body []byte, target any, operation Operation) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return invalidResponse(operation)
 	}

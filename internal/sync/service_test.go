@@ -1051,6 +1051,9 @@ type fakeSteam struct {
 	detailErrors                                                map[int64]error
 	achievementAvailability                                     map[int64]steam.Availability
 	achievementErrors                                           map[int64]error
+	achievementSchemas                                          map[int64]steam.AchievementSchema
+	achievementSchemaAvailability                               map[int64]steam.Availability
+	achievementSchemaErrors                                     map[int64]error
 	ownedCalls, probeOwnedCalls                                 int
 	summary                                                     steam.PlayerSummary
 	summaryErr, ownedErr, recentErr, wishlistErr                error
@@ -1096,6 +1099,15 @@ func (f *fakeSteam) Achievements(_ context.Context, _ string, appID int64) (stea
 		state = steam.Available
 	}
 	return steam.AchievementSummary{AppID: appID, GameName: "Game", Total: 10, Unlocked: 5}, state, f.achievementErrors[appID]
+}
+func (f *fakeSteam) AchievementSchema(_ context.Context, appID int64) (steam.AchievementSchema, steam.Availability, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state := f.achievementSchemaAvailability[appID]
+	if state == "" {
+		state = steam.Available
+	}
+	return f.achievementSchemas[appID], state, f.achievementSchemaErrors[appID]
 }
 func (f *fakeSteam) GameDetails(_ context.Context, appID int64) (steam.GameDetails, error) {
 	f.mu.Lock()

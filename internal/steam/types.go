@@ -79,6 +79,8 @@ const (
 	PlayerSummaryOperation  Operation = "player_summary"
 )
 
+const AchievementSchemaOperation Operation = "achievement_schema"
+
 // CacheKey identifies one cacheable upstream resource. Resource-scoped keys
 // prevent validators for one game or user from being applied to another.
 type CacheKey struct {
@@ -100,6 +102,10 @@ func WishlistCacheKey(steamID string) CacheKey {
 
 func AchievementsCacheKey(steamID string, appID int64) CacheKey {
 	return CacheKey{Operation: AchievementsOperation, Resource: steamID + ":" + strconv.FormatInt(appID, 10)}
+}
+
+func AchievementSchemaCacheKey(appID int64) CacheKey {
+	return CacheKey{Operation: AchievementSchemaOperation, Resource: strconv.FormatInt(appID, 10)}
 }
 
 func GameDetailsCacheKey(appID int64) CacheKey {
@@ -148,13 +154,33 @@ type WishlistItem struct {
 	AddedAt  time.Time
 }
 
+type Achievement struct {
+	APIName     string
+	Name        string
+	Description string
+	Achieved    bool
+	UnlockedAt  time.Time
+}
+
 type AchievementSummary struct {
 	AppID          int64
 	GameName       string
+	Achievements   []Achievement
 	Total          int
 	Unlocked       int
 	Percentage     float64
 	LastUnlockedAt time.Time
+}
+
+type AchievementDefinition struct {
+	APIName     string
+	Name        string
+	Description string
+}
+
+type AchievementSchema struct {
+	AppID        int64
+	Achievements []AchievementDefinition
 }
 
 type Category struct {
