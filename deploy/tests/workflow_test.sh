@@ -226,8 +226,6 @@ assert_text_contains "$verify_job" 'go-version: .1\.27\.2.' 'verify must use Go 
 assert_text_contains "$verify_job" 'node-version: .26.' 'verify must use Node.js 26'
 assert_text_contains "$verify_job" 'pnpm@11\.25\.0' 'verify must install pnpm 11.25.0'
 assert_text_contains "$verify_job" 'pnpm --dir web install --frozen-lockfile' 'verify must install locked frontend dependencies'
-assert_text_contains "$verify_job" '\[\[ -x /usr/bin/google-chrome \]\]' 'system Chrome fallback must check executable Chrome'
-assert_text_contains "$verify_job" 'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome' 'system Chrome fallback path is incorrect'
 assert_text_contains "$verify_job" "GOWORK=off TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127\\.0\\.0\\.1:55432/next_game_crush_test\\?sslmode=disable' go test -json -race \\./\\.\\.\\." \
   'verify must run all backend tests with race detection against the isolated test database'
 assert_text_contains "$verify_job" '::error title=Backend race tests failed::' \
@@ -237,9 +235,8 @@ assert_text_contains "$verify_job" 'pnpm --dir web run typecheck' 'verify must r
 assert_text_contains "$verify_job" 'pnpm --dir web run lint' 'verify must run frontend lint'
 assert_text_contains "$verify_job" 'pnpm --dir web run build' 'verify must build the frontend'
 assert_text_contains "$verify_job" 'docker compose build app' 'verify must build the production image'
-assert_text_contains "$verify_job" 'playwright test tests/e2e/smoke\.spec\.ts' 'verify must run browser acceptance tests'
-assert_text_contains "$verify_job" 'E2E_OPENAI_DISABLED=1.*completion-signals\.spec\.ts' \
-  'verify must run completion acceptance with OpenAI disabled'
+assert_text_not_contains "$verify_job" 'playwright|PLAYWRIGHT|google-chrome' \
+  'automatic deployment verification must remain browser-independent'
 assert_text_contains "$verify_job" 'bash -n deploy/deploy\.sh deploy/tests/\*\.sh' 'verify must syntax-check deployment scripts'
 for test_script in compose deploy docs workflow; do
   assert_text_contains "$verify_job" "bash deploy/tests/${test_script}_test\\.sh" \

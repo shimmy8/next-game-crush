@@ -9,8 +9,10 @@ This runbook covers routine operation after the one-time Ubuntu setup in
 Every pull request and every push to `main` starts `.github/workflows/deploy.yml`:
 
 1. `verify` checks the deployment contracts, installs the pinned Go, Node.js,
-   and pnpm versions, then runs the same backend, frontend, Docker, and browser
-   gates as `GOWORK=off make verify` in separately reported steps.
+   and pnpm versions, then runs backend race tests, frontend unit/type/lint/build
+   checks, Compose validation, and a production image build in separately
+   reported steps. Browser E2E is deliberately outside the automatic deploy
+   gate.
 2. On a push to `main` only, `publish` builds the repository `Dockerfile` and
    publishes `ghcr.io/shimmy8/next-game-crush:<40-character-git-sha>`.
 3. `deploy` uses the GitHub `production` Environment, uploads
