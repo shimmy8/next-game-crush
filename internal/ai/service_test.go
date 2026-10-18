@@ -220,6 +220,128 @@ func TestRegisterHandlersRegistersAllVersionedKinds(t *testing.T) {
 	}
 }
 
+func TestCatalogFeaturePlanningPreservesLegacySemanticIdentity(t *testing.T) {
+	gameID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	service := &Service{model: "text-v1", embeddingModel: "embedding-v1"}
+
+	legacy, err := service.PlanGameFeatureJob(context.Background(), gameID, "content", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := service.PlanCatalogGameFeatureJob(context.Background(), gameID, "content", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantKey := "catalog:ai.features:v1:11111111-1111-4111-8111-111111111111:ec7907e0740f96381e6fd1b046f7c3a9e9f3a77427fe48b5ba138d4ec1c99fa6"
+	wantPayload := `{"version":1,"game_id":"11111111-1111-4111-8111-111111111111","profile_id":"00000000-0000-0000-0000-000000000000","execution":{"content_hash":"content","text_model":"text-v1","embedding_model":"embedding-v1","generation":0,"key":"` + wantKey + `"}}`
+	if legacy.Lane != jobs.LaneInteractive || legacy.MaxAttempts != 3 || legacy.Kind != FeaturesJobKind || legacy.Stage != "ai_features" || legacy.Priority != 42 {
+		t.Fatalf("legacy spec changed: %+v", legacy)
+	}
+	if legacy.IdempotencyKey != wantKey || string(legacy.Payload) != wantPayload {
+		t.Fatalf("legacy identity changed: key=%q payload=%s", legacy.IdempotencyKey, legacy.Payload)
+	}
+	if catalog.Lane != jobs.LaneCatalog || catalog.MaxAttempts != 4 {
+		t.Fatalf("catalog retry contract = lane %q attempts %d", catalog.Lane, catalog.MaxAttempts)
+	}
+	if catalog.Kind != legacy.Kind || catalog.Stage != legacy.Stage || catalog.Priority != legacy.Priority || catalog.IdempotencyKey != legacy.IdempotencyKey || string(catalog.Payload) != string(legacy.Payload) {
+		t.Fatalf("catalog planning changed semantic identity:\nlegacy=%+v\ncatalog=%+v", legacy, catalog)
+	}
+}
+
+func TestFeaturePlanningRejectsInvalidIdentityOnBothLanes(t *testing.T) {
+	service := &Service{model: "text-v1", embeddingModel: "embedding-v1"}
+	tests := []struct {
+		name     string
+		gameID   uuid.UUID
+		hash     string
+		priority int
+	}{
+		{name: "nil game", hash: "content", priority: 50},
+		{name: "blank hash", gameID: uuid.New(), hash: " \t", priority: 50},
+		{name: "zero priority", gameID: uuid.New(), hash: "content"},
+		{name: "priority above maximum", gameID: uuid.New(), hash: "content", priority: 101},
+	}
+	planners := []struct {
+		name string
+		plan func(context.Context, uuid.UUID, string, int) (jobs.Spec, error)
+	}{
+		{name: "legacy", plan: service.PlanGameFeatureJob},
+		{name: "catalog", plan: service.PlanCatalogGameFeatureJob},
+	}
+	for _, planner := range planners {
+		for _, test := range tests {
+			t.Run(planner.name+"/"+test.name, func(t *testing.T) {
+				if _, err := planner.plan(context.Background(), test.gameID, test.hash, test.priority); err == nil {
+					t.Fatal("invalid enrichment identity was accepted")
+				}
+			})
+		}
+	}
+}
+
+func TestRegisterCatalogHandlersExcludesProfileSummary(t *testing.T) {
+	service, _ := NewService(&fakeRepository{}, &fakeClient{}, "gpt-6-luna", "text-embedding-3-small")
+	if err := service.RegisterCatalogHandlers(nil); err == nil {
+		t.Fatal("nil catalog worker was accepted")
+	}
+	worker := jobs.NewWorker(nil, jobs.LaneCatalog, "catalog-registration-only")
+	if err := service.RegisterCatalogHandlers(worker); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{FeaturesJobKind, EmbeddingJobKind} {
+		if err := worker.Register(kind, func(context.Context, jobs.Lease) error { return nil }); err == nil {
+			t.Fatalf("handler %q was not registered", kind)
+		}
+	}
+	if err := worker.Register(ProfileSummaryJobKind, func(context.Context, jobs.Lease) error { return nil }); err != nil {
+		t.Fatalf("profile summary leaked into catalog registration: %v", err)
+	}
+}
+
+func TestEmbeddingChildInheritsFeatureLaneAndAttempts(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		lane        jobs.Lane
+		maxAttempts int
+	}{
+		{name: "legacy", lane: jobs.LaneInteractive, maxAttempts: 3},
+		{name: "catalog", lane: jobs.LaneCatalog, maxAttempts: 4},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := openAIIntegrationStore(t)
+			queue := jobs.NewQueue(db)
+			gameID := uuid.New()
+			repository := &fakeRepository{game: StoredGameEvidence{Name: "Portal"}}
+			client := &fakeClient{features: GameFeatures{Themes: []string{"puzzle"}, Mechanics: []string{}, Modes: []string{}, Tone: []string{}, EvidenceKeys: []string{"title"}}}
+			service, err := NewService(repository, client, "text-v1", "embedding-v1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			service.SetQueue(queue)
+			payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID})
+			parentID, err := queue.Enqueue(context.Background(), jobs.Spec{Lane: test.lane, Kind: FeaturesJobKind, IdempotencyKey: "feature-lane:" + test.name, Payload: payload, MaxAttempts: test.maxAttempts})
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent, err := queue.Claim(context.Background(), test.lane, "feature-lane", time.Minute)
+			if err != nil || parent == nil || parent.ID != parentID {
+				t.Fatalf("parent=%+v err=%v", parent, err)
+			}
+			if err := service.handleFeatures(context.Background(), *parent); !errors.Is(err, jobs.ErrDeferred) {
+				t.Fatalf("feature handler = %v, want deferred", err)
+			}
+			child, err := queue.Claim(context.Background(), test.lane, "embedding-lane", time.Minute)
+			if err != nil || child == nil {
+				t.Fatalf("child=%+v err=%v", child, err)
+			}
+			if child.Kind != EmbeddingJobKind || child.Lane != test.lane || child.MaxAttempts != test.maxAttempts {
+				t.Fatalf("embedding child = kind %q lane %q attempts %d", child.Kind, child.Lane, child.MaxAttempts)
+			}
+		})
+	}
+}
+
 func TestPlanFeatureJobsUsesVersionedIdempotencyKeys(t *testing.T) {
 	first, second := uuid.New(), uuid.New()
 	repository := &fakeRepository{gameIDs: []uuid.UUID{first, second}}
