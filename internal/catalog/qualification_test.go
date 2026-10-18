@@ -10,6 +10,8 @@ import (
 func TestQualificationPolicy(t *testing.T) {
 	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	cfg := DefaultDiscoveryConfig()
+	// Keep this legacy policy fixture's historical 90-day candidate set.
+	cfg.HorizonDays = 90
 	for _, tc := range []struct {
 		raw, product, status string
 		soon                 bool

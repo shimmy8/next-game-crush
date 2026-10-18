@@ -109,6 +109,8 @@ func discoveryFixture(t *testing.T) (*DiscoveryService, *discoveryMetadata) {
 	t.Helper()
 	db := openCatalogTestStore(t)
 	cfg := DefaultDiscoveryConfig()
+	// Legacy discovery regressions retain the original 90-day policy fixture.
+	cfg.HorizonDays = 90
 	cfg.Enabled = true
 	m := &discoveryMetadata{
 		details:          steam.GameDetails{AppID: 42, Name: "Upcoming", Type: "game", ShortDescription: "A game", ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "Coming Soon"}},

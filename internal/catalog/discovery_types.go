@@ -2,7 +2,7 @@ package catalog
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"time"
 
 	"next-game-crush/internal/steam"
@@ -44,8 +44,19 @@ type ScanState struct {
 	LastError       string
 }
 type DiscoveryConfig struct {
-	Enabled              bool
-	HorizonDays          int
+	LookbackDays           int
+	AppDetailsHourlyBudget int
+	AIHourlyBudget         int
+	WorkerConcurrency      int
+	SearchPageSize         int
+	SearchMaxPagesPerFeed  int
+	SearchMaxNewAppsPerRun int
+	RefreshCron            string
+	RefreshTimezone        string
+	ReconciliationCron     string
+	Enabled                bool
+	HorizonDays            int
+	// Retained while the legacy coordinator drains during the search rollout.
 	IntervalHours        int
 	HourlyBudget         int
 	UnknownFreshnessDays int
@@ -53,11 +64,35 @@ type DiscoveryConfig struct {
 }
 
 func DefaultDiscoveryConfig() DiscoveryConfig {
-	return DiscoveryConfig{HorizonDays: 90, IntervalHours: 1, HourlyBudget: 200, UnknownFreshnessDays: 180, PageSize: 100}
+	return DiscoveryConfig{
+		LookbackDays: 30, HorizonDays: 30, AppDetailsHourlyBudget: 1000, AIHourlyBudget: 100,
+		WorkerConcurrency: 4, SearchPageSize: 100, SearchMaxPagesPerFeed: 100, SearchMaxNewAppsPerRun: 20000,
+		RefreshCron: "0 3 * * *", RefreshTimezone: "Europe/Moscow", ReconciliationCron: "0 4 * * 0",
+		IntervalHours: 1, HourlyBudget: 200, UnknownFreshnessDays: 180, PageSize: 100,
+	}
 }
 func (c DiscoveryConfig) Validate() error {
-	if c.HorizonDays < 1 || c.HorizonDays > 366 || c.IntervalHours < 1 || c.IntervalHours > 24 || c.HourlyBudget < 1 || c.HourlyBudget > 1000 || c.UnknownFreshnessDays < 1 || c.UnknownFreshnessDays > 730 || c.PageSize < 1 || c.PageSize > 200 {
-		return errors.New("discovery configuration is outside supported bounds")
+	for _, setting := range []struct {
+		name       string
+		value, max int
+	}{
+		{"CATALOG_LOOKBACK_DAYS", c.LookbackDays, 366}, {"CATALOG_HORIZON_DAYS", c.HorizonDays, 366},
+		{"CATALOG_APPDETAILS_HOURLY_BUDGET", c.AppDetailsHourlyBudget, 100000}, {"CATALOG_AI_HOURLY_BUDGET", c.AIHourlyBudget, 100000},
+		{"CATALOG_WORKER_CONCURRENCY", c.WorkerConcurrency, 16}, {"CATALOG_SEARCH_PAGE_SIZE", c.SearchPageSize, 200},
+		{"CATALOG_SEARCH_MAX_PAGES_PER_FEED", c.SearchMaxPagesPerFeed, 1000}, {"CATALOG_SEARCH_MAX_NEW_APPS_PER_RUN", c.SearchMaxNewAppsPerRun, 100000},
+		{"CATALOG_DISCOVERY_INTERVAL_HOURS", c.IntervalHours, 24}, {"CATALOG_DISCOVERY_HOURLY_BUDGET", c.HourlyBudget, 1000},
+		{"CATALOG_DISCOVERY_UNKNOWN_FRESHNESS_DAYS", c.UnknownFreshnessDays, 730}, {"CATALOG_DISCOVERY_PAGE_SIZE", c.PageSize, 200},
+	} {
+		if setting.value < 1 || setting.value > setting.max {
+			return fmt.Errorf("%s is outside supported bounds", setting.name)
+		}
+	}
+	for _, setting := range []struct{ name, expression string }{
+		{"CATALOG_REFRESH_CRON", c.RefreshCron}, {"CATALOG_RECONCILIATION_CRON", c.ReconciliationCron},
+	} {
+		if _, _, err := ParseSchedule(setting.expression, c.RefreshTimezone); err != nil {
+			return fmt.Errorf("%s or CATALOG_REFRESH_TIMEZONE is invalid", setting.name)
+		}
 	}
 	return nil
 }

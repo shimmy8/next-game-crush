@@ -79,6 +79,7 @@ func Load() (Config, error) {
 		target *int
 		max    int
 	}{
+		{"CATALOG_LOOKBACK_DAYS", &cfg.CatalogDiscovery.LookbackDays, 366},
 		{"CATALOG_HORIZON_DAYS", &cfg.CatalogDiscovery.HorizonDays, 366},
 		{"CATALOG_DISCOVERY_INTERVAL_HOURS", &cfg.CatalogDiscovery.IntervalHours, 24},
 		{"CATALOG_DISCOVERY_HOURLY_BUDGET", &cfg.CatalogDiscovery.HourlyBudget, 1000},
@@ -93,6 +94,41 @@ func Load() (Config, error) {
 				*setting.target = value
 			}
 		}
+	}
+	// During rollout, legacy shared limits supply a fallback only. Explicit search
+	// settings below always win, and catalog AI retains its independent budget.
+	if strings.TrimSpace(os.Getenv("CATALOG_DISCOVERY_HOURLY_BUDGET")) != "" {
+		cfg.CatalogDiscovery.AppDetailsHourlyBudget = cfg.CatalogDiscovery.HourlyBudget
+	}
+	if strings.TrimSpace(os.Getenv("CATALOG_DISCOVERY_PAGE_SIZE")) != "" {
+		cfg.CatalogDiscovery.SearchPageSize = cfg.CatalogDiscovery.PageSize
+	}
+	for _, setting := range []struct {
+		name   string
+		target *int
+		max    int
+	}{
+		{"CATALOG_APPDETAILS_HOURLY_BUDGET", &cfg.CatalogDiscovery.AppDetailsHourlyBudget, 100000},
+		{"CATALOG_AI_HOURLY_BUDGET", &cfg.CatalogDiscovery.AIHourlyBudget, 100000},
+		{"CATALOG_WORKER_CONCURRENCY", &cfg.CatalogDiscovery.WorkerConcurrency, 16},
+		{"CATALOG_SEARCH_PAGE_SIZE", &cfg.CatalogDiscovery.SearchPageSize, 200},
+		{"CATALOG_SEARCH_MAX_PAGES_PER_FEED", &cfg.CatalogDiscovery.SearchMaxPagesPerFeed, 1000},
+		{"CATALOG_SEARCH_MAX_NEW_APPS_PER_RUN", &cfg.CatalogDiscovery.SearchMaxNewAppsPerRun, 100000},
+	} {
+		if raw := strings.TrimSpace(os.Getenv(setting.name)); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil || value < 1 || value > setting.max {
+				problems = append(problems, setting.name+" is outside supported bounds")
+			} else {
+				*setting.target = value
+			}
+		}
+	}
+	cfg.CatalogDiscovery.RefreshCron = envOrDefault("CATALOG_REFRESH_CRON", cfg.CatalogDiscovery.RefreshCron)
+	cfg.CatalogDiscovery.RefreshTimezone = envOrDefault("CATALOG_REFRESH_TIMEZONE", cfg.CatalogDiscovery.RefreshTimezone)
+	cfg.CatalogDiscovery.ReconciliationCron = envOrDefault("CATALOG_RECONCILIATION_CRON", cfg.CatalogDiscovery.ReconciliationCron)
+	if err := cfg.CatalogDiscovery.Validate(); err != nil {
+		problems = append(problems, err.Error())
 	}
 	if raw := strings.TrimSpace(os.Getenv("WORKER_CONCURRENCY")); raw != "" {
 		concurrency, err := strconv.Atoi(raw)
