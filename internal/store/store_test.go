@@ -196,8 +196,21 @@ func TestGameCompatibilityQueriesPreserveIndependentFreshness(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
-	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM game_compatibility WHERE game_id=$1`, gameID).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("failure created unobserved platforms: rows=%d err=%v", count, err)
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM game_compatibility WHERE game_id=$1`, gameID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("failure did not persist its Deck-only observation: rows=%d err=%v", count, err)
+	}
+	var windows, mac, linux *bool
+	var platformsAt, successAt *time.Time
+	var status, availability string
+	var attemptAt time.Time
+	if err := db.Pool.QueryRow(ctx, `SELECT windows,mac,linux,platforms_last_successful_fetch_at,deck_status,deck_availability,deck_last_attempt_at,deck_last_successful_fetch_at FROM game_compatibility WHERE game_id=$1`, gameID).Scan(&windows, &mac, &linux, &platformsAt, &status, &availability, &attemptAt, &successAt); err != nil {
+		t.Fatal(err)
+	}
+	if windows != nil || mac != nil || linux != nil || platformsAt != nil {
+		t.Fatal("Deck failure invented platform support or freshness")
+	}
+	if status != "unknown" || availability != "request_failed" || !attemptAt.Equal(first) || successAt != nil {
+		t.Fatalf("unexpected initial Deck failure: status=%s availability=%s attempt=%v success=%v", status, availability, attemptAt, successAt)
 	}
 	upsert := dbgen.UpsertGamePlatformsParams{
 		GameID: uuidToPG(gameID), Windows: true, Mac: false, Linux: true, PlatformsLastSuccessfulFetchAt: timestamptz(first),
@@ -233,8 +246,8 @@ func TestGameCompatibilityQueriesPreserveIndependentFreshness(t *testing.T) {
 	}
 	initial := load()
 	assertPlatforms(initial, true, false, true, first)
-	if initial.status != "unknown" || initial.available != "unknown" || initial.attempt != nil || initial.success != nil {
-		t.Fatalf("platform observation invented Deck result: %+v", initial)
+	if initial.status != "unknown" || initial.available != "request_failed" || initial.attempt == nil || !initial.attempt.Equal(first) || initial.success != nil {
+		t.Fatalf("platform observation changed saved Deck failure: %+v", initial)
 	}
 	if err := db.Queries.RecordDeckCompatibilitySuccess(ctx, dbgen.RecordDeckCompatibilitySuccessParams{
 		GameID: uuidToPG(gameID), DeckStatus: "verified", DeckAvailability: "available",

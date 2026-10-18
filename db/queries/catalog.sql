@@ -72,7 +72,7 @@ ON CONFLICT (game_id) DO UPDATE SET
 
 -- name: UpsertGamePlatforms :exec
 INSERT INTO game_compatibility (game_id, windows, mac, linux, platforms_last_successful_fetch_at)
-VALUES ($1, $2, $3, $4, $5)
+VALUES ($1, sqlc.arg(windows)::boolean, sqlc.arg(mac)::boolean, sqlc.arg(linux)::boolean, sqlc.arg(platforms_last_successful_fetch_at)::timestamptz)
 ON CONFLICT (game_id) DO UPDATE SET
     windows = EXCLUDED.windows,
     mac = EXCLUDED.mac,
@@ -80,15 +80,17 @@ ON CONFLICT (game_id) DO UPDATE SET
     platforms_last_successful_fetch_at = EXCLUDED.platforms_last_successful_fetch_at;
 
 -- name: RecordDeckCompatibilitySuccess :exec
-UPDATE game_compatibility SET
-    deck_status = $2,
-    deck_availability = $3,
-    deck_last_attempt_at = $4,
-    deck_last_successful_fetch_at = $5
-WHERE game_id = $1;
+INSERT INTO game_compatibility (game_id, deck_status, deck_availability, deck_last_attempt_at, deck_last_successful_fetch_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (game_id) DO UPDATE SET
+    deck_status = EXCLUDED.deck_status,
+    deck_availability = EXCLUDED.deck_availability,
+    deck_last_attempt_at = EXCLUDED.deck_last_attempt_at,
+    deck_last_successful_fetch_at = EXCLUDED.deck_last_successful_fetch_at;
 
 -- name: RecordDeckCompatibilityFailure :exec
-UPDATE game_compatibility SET
-    deck_availability = $2,
-    deck_last_attempt_at = $3
-WHERE game_id = $1;
+INSERT INTO game_compatibility (game_id, deck_availability, deck_last_attempt_at)
+VALUES ($1, $2, $3)
+ON CONFLICT (game_id) DO UPDATE SET
+    deck_availability = EXCLUDED.deck_availability,
+    deck_last_attempt_at = EXCLUDED.deck_last_attempt_at;

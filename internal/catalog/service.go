@@ -239,7 +239,7 @@ func (s *Service) refreshOne(ctx context.Context, game dbgen.Game) error {
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit catalog metadata refresh: %w", err)
 	}
-	return s.refreshDeckCompatibility(ctx, updated.ID, game.SteamAppID)
+	return nil
 }
 
 // catalogRankingEvidence returns only canonical fields consumed by ranking.
@@ -271,11 +271,6 @@ func catalogRankingEvidence(ctx context.Context, tx pgx.Tx, gameID pgtype.UUID) 
 		Platforms    json.RawMessage `json:"platforms"`
 	}{steam.GameContentHash(details), modes, release, platforms})
 	return evidence, candidate, err
-}
-
-func (s *Service) refreshDeckCompatibility(ctx context.Context, gameID pgtype.UUID, appID int64) error {
-	observation := fetchDeckCompatibility(ctx, s.client, appID)
-	return recordDeckCompatibility(ctx, s.store.Queries, gameID, observation, s.now().UTC())
 }
 
 type deckCompatibilityObservation struct {

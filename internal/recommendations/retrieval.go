@@ -765,6 +765,29 @@ func (r *SQLRepository) PublishRanking(ctx context.Context, userID uuid.UUID, ve
 	return tx.Commit(ctx)
 }
 
+// PublishedDeckRefreshTargets deliberately reads the requested immutable run,
+// without current candidate/feedback filters or a latest-run lookup. A retry
+// must recover all targets even if the catalog or a newer ranking has changed.
+func (r *SQLRepository) PublishedDeckRefreshTargets(ctx context.Context, userID uuid.UUID, rankingVersion int64) ([]catalog.DeckRefreshTarget, error) {
+	rows, err := r.store.Pool.Query(ctx, `SELECT DISTINCT r.game_id,g.steam_app_id,r.ranking_version
+		FROM recommendations r JOIN games g ON g.id=r.game_id
+		JOIN recommendation_runs run ON run.user_id=r.user_id AND run.ranking_version=r.ranking_version AND run.published
+		WHERE r.user_id=$1 AND r.ranking_version=$2 ORDER BY g.steam_app_id,r.game_id`, userID, rankingVersion)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	targets := []catalog.DeckRefreshTarget{}
+	for rows.Next() {
+		var target catalog.DeckRefreshTarget
+		if err := rows.Scan(&target.GameID, &target.SteamAppID, &target.RankingVersion); err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	return targets, rows.Err()
+}
+
 func (r *SQLRepository) Latest(ctx context.Context, userID uuid.UUID) ([]Recommendation, error) {
 	rows, err := r.store.Pool.Query(ctx, `SELECT r.id,r.game_id,g.steam_app_id,g.source_snapshot,g.name,p.version,r.ranking_version,r.algorithm_version,r.score,r.explanation,r.explanation_evidence,r.explanation_generated,r.explanation_source,r.explanation_failure_reason,r.created_at,rf.factors,rf.weights,
 		COALESCE(rd.precision,'unknown'),rd.release_date,rd.raw_text,gc.windows,gc.mac,gc.linux,COALESCE(gc.deck_status,'unknown'),latest_feedback.action,latest_feedback.reasons

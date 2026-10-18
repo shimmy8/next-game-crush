@@ -401,9 +401,9 @@ type GameAchievementDefinition struct {
 
 type GameCompatibility struct {
 	GameID                         pgtype.UUID        `json:"game_id"`
-	Windows                        bool               `json:"windows"`
-	Mac                            bool               `json:"mac"`
-	Linux                          bool               `json:"linux"`
+	Windows                        pgtype.Bool        `json:"windows"`
+	Mac                            pgtype.Bool        `json:"mac"`
+	Linux                          pgtype.Bool        `json:"linux"`
 	PlatformsLastSuccessfulFetchAt pgtype.Timestamptz `json:"platforms_last_successful_fetch_at"`
 	DeckStatus                     string             `json:"deck_status"`
 	DeckAvailability               string             `json:"deck_availability"`

@@ -30,28 +30,50 @@ type ExplanationCache interface {
 	GetExplanationByInput(context.Context, uuid.UUID, uuid.UUID, string, string) (ai.Explanation, bool, error)
 	PutExplanationByInput(context.Context, uuid.UUID, uuid.UUID, string, string, ai.Explanation) error
 }
+type DeckRefreshPlanner interface {
+	EnqueueDeckRefresh(context.Context, catalog.DeckRefreshTarget) error
+}
 type Repository interface {
 	Candidates(context.Context, uuid.UUID, profile.Profile, int) ([]Candidate, error)
 	RankingInputs(context.Context, uuid.UUID, profile.Profile, int) (RankingInputs, error)
 	SaveRanking(context.Context, uuid.UUID, profile.Profile, []Recommendation, string) ([]Recommendation, int64, bool, error)
 	SaveExplanation(context.Context, uuid.UUID, int64, string, uuid.UUID, string, ExplanationRecord) error
 	PublishRanking(context.Context, uuid.UUID, int64, string) error
+	PublishedDeckRefreshTargets(context.Context, uuid.UUID, int64) ([]catalog.DeckRefreshTarget, error)
 	Latest(context.Context, uuid.UUID) ([]Recommendation, error)
 	Get(context.Context, uuid.UUID, uuid.UUID) (Recommendation, error)
 }
 type Service struct {
-	repository       Repository
-	profiles         *profile.Service
-	explainer        ExplanationClient
-	limit            int
-	queue            *jobs.Queue
-	wishlistSource   WishlistStateReader
-	discoveryStatus  catalog.DiscoveryStatusReader
-	explanationCache ExplanationCache
-	explanationModel string
+	repository         Repository
+	profiles           *profile.Service
+	explainer          ExplanationClient
+	limit              int
+	queue              *jobs.Queue
+	wishlistSource     WishlistStateReader
+	discoveryStatus    catalog.DiscoveryStatusReader
+	explanationCache   ExplanationCache
+	explanationModel   string
+	deckRefreshPlanner DeckRefreshPlanner
 }
 
-func (s *Service) SetQueue(queue *jobs.Queue) { s.queue = queue }
+func (s *Service) SetQueue(queue *jobs.Queue)                       { s.queue = queue }
+func (s *Service) SetDeckRefreshPlanner(planner DeckRefreshPlanner) { s.deckRefreshPlanner = planner }
+
+func (s *Service) enqueuePublishedDeckRefreshes(ctx context.Context, userID uuid.UUID, rankingVersion int64) error {
+	if s.deckRefreshPlanner == nil {
+		return nil
+	}
+	targets, err := s.repository.PublishedDeckRefreshTargets(ctx, userID, rankingVersion)
+	if err != nil {
+		return fmt.Errorf("load published Deck refresh targets: %w", err)
+	}
+	for _, target := range targets {
+		if err := s.deckRefreshPlanner.EnqueueDeckRefresh(ctx, target); err != nil {
+			return fmt.Errorf("enqueue published Deck refresh: %w", err)
+		}
+	}
+	return nil
+}
 func (s *Service) SetExplanationCache(cache ExplanationCache, model string) {
 	s.explanationCache = cache
 	s.explanationModel = strings.TrimSpace(model)
@@ -98,11 +120,14 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 		return nil, 0, emptyStats, fmt.Errorf("persist ranking: %w", err)
 	}
 	if alreadyPublished {
-		return nil, rankingVersion, emptyStats, nil
+		return nil, rankingVersion, emptyStats, s.enqueuePublishedDeckRefreshes(ctx, userID, rankingVersion)
 	}
 	if len(saved) == 0 {
 		if err := s.repository.PublishRanking(ctx, userID, rankingVersion, runBuildKey); err != nil {
 			return nil, 0, emptyStats, err
+		}
+		if err := s.enqueuePublishedDeckRefreshes(ctx, userID, rankingVersion); err != nil {
+			return nil, rankingVersion, emptyStats, err
 		}
 		return saved, rankingVersion, emptyStats, nil
 	}
@@ -145,6 +170,9 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 	}
 	if err := s.repository.PublishRanking(ctx, userID, rankingVersion, runBuildKey); err != nil {
 		return nil, 0, stats, err
+	}
+	if err := s.enqueuePublishedDeckRefreshes(ctx, userID, rankingVersion); err != nil {
+		return nil, rankingVersion, stats, err
 	}
 	return saved, rankingVersion, stats, nil
 }

@@ -772,7 +772,7 @@ func TestCatalogFailurePreservesLastGoodSnapshot(t *testing.T) {
 	}
 }
 
-func TestCatalogPersistsPlatformsAndDeckStatuses(t *testing.T) {
+func TestCatalogRefreshPersistsPlatformsWithoutFetchingDeck(t *testing.T) {
 	for _, status := range []steam.DeckCompatibility{steam.DeckVerified, steam.DeckPlayable, steam.DeckUnsupported, steam.DeckUnknown} {
 		t.Run(string(status), func(t *testing.T) {
 			service, fake, db, _ := newTestService(t)
@@ -782,17 +782,17 @@ func TestCatalogPersistsPlatformsAndDeckStatuses(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := readCatalogCompatibility(t, db, 30)
-			if !got.Windows || got.Mac || !got.Linux || got.DeckStatus != string(status) || got.DeckAvailability != string(steam.Available) {
+			if !got.Windows.Valid || !got.Mac.Valid || !got.Linux.Valid || !got.Windows.Bool || got.Mac.Bool || !got.Linux.Bool || got.DeckStatus != string(steam.DeckUnknown) || fake.deckCalls != 0 {
 				t.Fatalf("compatibility = %+v", got)
 			}
-			if !got.PlatformsLastSuccessfulFetchAt.Valid || !got.DeckLastAttemptAt.Valid || !got.DeckLastSuccessfulFetchAt.Valid {
+			if !got.PlatformsLastSuccessfulFetchAt.Valid || got.DeckLastAttemptAt.Valid || got.DeckLastSuccessfulFetchAt.Valid {
 				t.Fatalf("compatibility freshness missing: %+v", got)
 			}
 		})
 	}
 }
 
-func TestCatalogDeckFailurePreservesLastSuccess(t *testing.T) {
+func TestCatalogRefreshPreservesSelectedDeckStateWithoutRefetch(t *testing.T) {
 	for _, test := range []struct {
 		name         string
 		availability steam.Availability
@@ -814,7 +814,7 @@ func TestCatalogDeckFailurePreservesLastSuccess(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Fix old freshness explicitly; the catalog clock is independent of sync's clock.
-			if _, err := db.Pool.Exec(ctx, `UPDATE game_compatibility SET platforms_last_successful_fetch_at='2026-01-01',deck_last_attempt_at='2026-01-01',deck_last_successful_fetch_at='2026-01-01'`); err != nil {
+			if _, err := db.Pool.Exec(ctx, `UPDATE game_compatibility SET platforms_last_successful_fetch_at='2026-01-01',deck_status='verified',deck_availability='available',deck_last_attempt_at='2026-01-01',deck_last_successful_fetch_at='2026-01-01'`); err != nil {
 				t.Fatal(err)
 			}
 			before := readCatalogCompatibility(t, db, 30)
@@ -826,10 +826,10 @@ func TestCatalogDeckFailurePreservesLastSuccess(t *testing.T) {
 				t.Fatalf("optional Deck failure aborted catalog: %v", err)
 			}
 			after := readCatalogCompatibility(t, db, 30)
-			if after.DeckStatus != before.DeckStatus || after.DeckLastSuccessfulFetchAt != before.DeckLastSuccessfulFetchAt || after.DeckAvailability != string(test.want) || !after.DeckLastAttemptAt.Time.After(before.DeckLastAttemptAt.Time) {
+			if after.DeckStatus != before.DeckStatus || after.DeckLastSuccessfulFetchAt != before.DeckLastSuccessfulFetchAt || after.DeckAvailability != before.DeckAvailability || after.DeckLastAttemptAt != before.DeckLastAttemptAt || fake.deckCalls != 0 {
 				t.Fatalf("Deck state lost last success: before=%+v after=%+v", before, after)
 			}
-			if after.Windows || !after.Mac || after.Linux || !after.PlatformsLastSuccessfulFetchAt.Time.After(before.PlatformsLastSuccessfulFetchAt.Time) {
+			if !after.Windows.Valid || !after.Mac.Valid || !after.Linux.Valid || after.Windows.Bool || !after.Mac.Bool || after.Linux.Bool || !after.PlatformsLastSuccessfulFetchAt.Time.After(before.PlatformsLastSuccessfulFetchAt.Time) {
 				t.Fatalf("platform refresh blocked by Deck failure: %+v", after)
 			}
 		})
@@ -896,8 +896,12 @@ func TestCatalogCompatibilityPersistenceFailureAbortsRefresh(t *testing.T) {
 			if _, err := db.Pool.Exec(ctx, `CREATE FUNCTION reject_compatibility_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected compatibility failure'; END $$; CREATE TRIGGER reject_compatibility_write BEFORE UPDATE ON game_compatibility FOR EACH ROW WHEN (`+when+`) EXECUTE FUNCTION reject_compatibility_write()`); err != nil {
 				t.Fatal(err)
 			}
-			if err := service.catalog.RefreshKnown(ctx); err == nil || !strings.Contains(err.Error(), wantError) {
+			err = service.catalog.RefreshKnown(ctx)
+			if stage == "platforms" && (err == nil || !strings.Contains(err.Error(), wantError)) {
 				t.Fatalf("refresh error = %v, want %s", err, wantError)
+			}
+			if stage != "platforms" && err != nil {
+				t.Fatalf("ordinary refresh unexpectedly wrote Deck state: %v", err)
 			}
 			after := readCatalogCompatibility(t, db, 30)
 			afterGame, err := db.Queries.GetGameByAppID(ctx, 30)
@@ -918,11 +922,14 @@ func TestCatalogCompatibilityPersistenceFailureAbortsRefresh(t *testing.T) {
 				}
 				return
 			}
-			if after.Windows || !after.Mac || after.Linux || !after.PlatformsLastSuccessfulFetchAt.Time.After(before.PlatformsLastSuccessfulFetchAt.Time) {
+			if !after.Windows.Valid || !after.Mac.Valid || !after.Linux.Valid || after.Windows.Bool || !after.Mac.Bool || after.Linux.Bool || !after.PlatformsLastSuccessfulFetchAt.Time.After(before.PlatformsLastSuccessfulFetchAt.Time) {
 				t.Fatalf("Deck persistence failure lost committed platform refresh: %+v", after)
 			}
 			if after.DeckStatus != before.DeckStatus || after.DeckAvailability != before.DeckAvailability || after.DeckLastAttemptAt != before.DeckLastAttemptAt || after.DeckLastSuccessfulFetchAt != before.DeckLastSuccessfulFetchAt {
 				t.Fatalf("Deck persistence failure changed prior Deck observation: before=%+v after=%+v", before, after)
+			}
+			if fake.deckCalls != 0 {
+				t.Fatalf("ordinary refresh made %d Deck calls", fake.deckCalls)
 			}
 			if afterGame.Name != details.Name || bytes.Equal(afterGame.SourceSnapshot, beforeGame.SourceSnapshot) || afterGame.ContentHash == beforeGame.ContentHash || !afterGame.LastSuccessfulFetchAt.Time.After(beforeGame.LastSuccessfulFetchAt.Time) {
 				t.Fatal("Deck persistence failure lost committed catalog metadata")
@@ -1339,6 +1346,7 @@ type fakeSteam struct {
 	deckStatuses                                                map[int64]steam.DeckCompatibility
 	deckAvailability                                            map[int64]steam.Availability
 	deckErrors                                                  map[int64]error
+	deckCalls                                                   int
 	achievementAvailability                                     map[int64]steam.Availability
 	achievementErrors                                           map[int64]error
 	achievementSchemas                                          map[int64]steam.AchievementSchema
@@ -1414,6 +1422,7 @@ func (f *fakeSteam) GameDetails(_ context.Context, appID int64) (steam.GameDetai
 func (f *fakeSteam) DeckCompatibility(_ context.Context, appID int64) (steam.DeckCompatibility, steam.Availability, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.deckCalls++
 	status, ok := f.deckStatuses[appID]
 	if !ok {
 		status = steam.DeckUnknown
