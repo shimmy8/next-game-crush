@@ -140,7 +140,10 @@ Jobs execute in this order:
 
 The production deploy job uses a single concurrency group with cancellation
 disabled. A later deploy waits rather than interrupting a database dump,
-migration, or health check already in progress.
+migration, or health check already in progress. Once admitted to that group,
+the job refreshes the remote `main` ref and performs no SSH or production
+mutation if its commit has already been superseded. Thus a slower older run
+cannot overwrite a newer deployment.
 
 Official GitHub and Docker actions are pinned to reviewed immutable commit
 SHAs rather than floating third-party tags. The SSH deployment uses the

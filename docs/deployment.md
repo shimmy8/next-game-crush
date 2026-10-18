@@ -17,7 +17,10 @@ Every pull request and every push to `main` starts `.github/workflows/deploy.yml
    exact image reference over strictly verified SSH.
 
 The production concurrency group allows only one deploy job at a time and does
-not cancel an in-progress deployment. On the VPS, the workflow takes
+not cancel an in-progress deployment. After entering that serialized group,
+the job refreshes `origin/main` and skips all SSH work unless its exact commit
+is still the branch head. This prevents an older run whose verification or
+image build finished late from overwriting a newer deployment. On the VPS, the workflow takes
 `/opt/next-game-crush/deploy.lock` before installing either deployment
 artifact and keeps file descriptor 9 open across `exec` for the complete
 rollout. `deploy.sh` validates that the inherited descriptor names the same
@@ -30,8 +33,9 @@ attempting rollback.
 GitHub concurrency preserves the running production deploy and one pending
 deploy. If several commits reach `main` while a deploy is running, GitHub may
 replace the older pending run with the newest one. This is intentional: the
-server converges to the latest verified commit rather than deploying every
-intermediate commit.
+server converges to the latest verified branch head rather than deploying
+every intermediate commit. If the newest branch head has not passed
+verification, superseded runs leave the currently deployed version unchanged.
 
 The commit-addressed SHA tag identifies what the workflow requested. There is
 no `latest` tag and no source build on the VPS. Registry tags are technically

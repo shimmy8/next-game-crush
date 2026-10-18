@@ -182,6 +182,7 @@ func TestDeleteUserDataRetainsSharedCatalogAndRemovesOwnedRows(t *testing.T) {
 		{`INSERT INTO profile_embeddings(profile_id,polarity,model,input_content_hash,embedding)VALUES($1,'positive','test','x',$2)`, []any{profileID, zeroVectorLiteral()}},
 		{`INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key)VALUES($1,$2,$3,1,'v1','build')`, []any{uuid.New(), userID, profileID}},
 		{`INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score)VALUES($1,$2,$3,$4,'v1',80)`, []any{recID, userID, gameID, profileID}},
+		{`INSERT INTO catalog_explanation_cache(user_id,game_id,model,input_hash,explanation)VALUES($1,$2,'fixture','personalized',jsonb_build_object('text','Owned game: private context'))`, []any{userID, gameID}},
 		{`INSERT INTO feedback_events(id,recommendation_id,user_id,action,idempotency_key)VALUES($1,$2,$3,'like','event')`, []any{uuid.New(), recID, userID}},
 		{`INSERT INTO notification_preferences(user_id)VALUES($1)`, []any{userID}},
 		{`INSERT INTO email_deliveries(id,user_id,idempotency_key,status)VALUES($1,$2,'delivery','pending')`, []any{deliveryID, userID}},
@@ -197,7 +198,7 @@ func TestDeleteUserDataRetainsSharedCatalogAndRemovesOwnedRows(t *testing.T) {
 	if err := NewSQLDataService(db, false, true).DeleteUserData(ctx, userID); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"users", "sessions", "steam_accounts", "user_games", "wishlist_entries", "achievement_summaries", "user_achievement_unlocks", "user_game_completion_evidence", "user_game_completion_projections", "preference_profiles", "profile_embeddings", "recommendations", "feedback_events", "notification_preferences", "email_deliveries"} {
+	for _, table := range []string{"users", "sessions", "steam_accounts", "user_games", "wishlist_entries", "achievement_summaries", "user_achievement_unlocks", "user_game_completion_evidence", "user_game_completion_projections", "preference_profiles", "profile_embeddings", "recommendations", "catalog_explanation_cache", "feedback_events", "notification_preferences", "email_deliveries"} {
 		var count int
 		if err := db.Pool.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil {
 			t.Fatal(err)

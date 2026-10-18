@@ -141,9 +141,26 @@ assert_file_not_contains 'ssh-keyscan' 'host keys must never be learned dynamica
 readonly configure_step="$(extract_step "$deploy_job" 'Configure reviewed SSH credentials')"
 readonly upload_step="$(extract_step "$deploy_job" 'Upload and deploy exact image')"
 readonly cleanup_step="$(extract_step "$deploy_job" 'Remove SSH credentials')"
+readonly freshness_step="$(extract_step "$deploy_job" 'Verify commit is current main')"
+[[ -n "$freshness_step" ]] || fail 'main freshness check is missing from the serialized deploy job'
 [[ -n "$configure_step" ]] || fail 'SSH credential configuration step is missing'
 [[ -n "$upload_step" ]] || fail 'SSH upload step is missing'
 [[ -n "$cleanup_step" ]] || fail 'SSH cleanup step is missing'
+assert_text_contains "$freshness_step" '^        id: freshness$' 'freshness step must expose a stable output id'
+assert_text_contains "$freshness_step" 'git fetch --no-tags --depth=1 origin' \
+  'freshness step must read the current remote main after acquiring production concurrency'
+assert_text_contains "$freshness_step" 'refs/heads/main:refs/remotes/origin/main' \
+  'freshness step must refresh the main remote-tracking ref explicitly'
+assert_text_contains "$freshness_step" 'git rev-parse refs/remotes/origin/main' \
+  'freshness step must compare against the refreshed main commit'
+assert_text_contains "$freshness_step" 'current=false.*GITHUB_OUTPUT' \
+  'superseded commits must be marked without mutating production'
+assert_text_contains "$freshness_step" 'current=true.*GITHUB_OUTPUT' \
+  'the current main commit must be allowed to deploy'
+assert_text_contains "$configure_step" "^        if: steps\.freshness\.outputs\.current == 'true'$" \
+  'SSH setup must be skipped for a superseded commit'
+assert_text_contains "$upload_step" "^        if: steps\.freshness\.outputs\.current == 'true'$" \
+  'remote deployment must be skipped for a superseded commit'
 assert_text_contains "$configure_step" '^          VPS_SSH_KEY: \$\{\{ secrets\.VPS_SSH_KEY \}\}$' \
   'SSH key secret must be scoped to the configuration step'
 assert_text_contains "$configure_step" '^          VPS_KNOWN_HOSTS: \$\{\{ secrets\.VPS_KNOWN_HOSTS \}\}$' \

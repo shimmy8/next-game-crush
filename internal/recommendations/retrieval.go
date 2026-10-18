@@ -603,43 +603,43 @@ func withinHorizon(window ReleaseWindow, now time.Time, days int) bool {
 	}
 }
 
-func (r *SQLRepository) SaveRanking(ctx context.Context, userID uuid.UUID, p profile.Profile, input []Recommendation, buildKey string) ([]Recommendation, int64, error) {
+func (r *SQLRepository) SaveRanking(ctx context.Context, userID uuid.UUID, p profile.Profile, input []Recommendation, buildKey string) ([]Recommendation, int64, bool, error) {
 	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
 	defer tx.Rollback(ctx)
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, `ranking:`+userID.String()); err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
 	var rankingVersion int64
 	var published bool
 	err = tx.QueryRow(ctx, `SELECT ranking_version,published FROM recommendation_runs WHERE user_id=$1 AND (build_key=$2 OR ($3<>'' AND starts_with(build_key,$3))) ORDER BY ranking_version LIMIT 1`, userID, buildKey, rankingRequestPrefix(buildKey)).Scan(&rankingVersion, &published)
 	replay := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
 	if replay && published {
 		if err = tx.Commit(ctx); err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
-		return nil, rankingVersion, nil
+		return nil, rankingVersion, true, nil
 	}
 	if replay {
 		if _, err = tx.Exec(ctx, `DELETE FROM recommendations WHERE user_id=$1 AND ranking_version=$2`, userID, rankingVersion); err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 		if _, err = tx.Exec(ctx, `UPDATE recommendation_runs SET published=false,profile_id=$3,build_key=$4 WHERE user_id=$1 AND ranking_version=$2`, userID, rankingVersion, p.ID, buildKey); err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 	} else if err = tx.QueryRow(ctx, `SELECT COALESCE(max(ranking_version),0)+1 FROM recommendation_runs WHERE user_id=$1`, userID).Scan(&rankingVersion); err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
 	result := make([]Recommendation, 0, len(input))
 	now := r.now().UTC()
 	if !replay {
 		if _, err = tx.Exec(ctx, `INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key,created_at)VALUES($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), userID, p.ID, rankingVersion, AlgorithmVersion, buildKey, now); err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 	}
 	for _, item := range input {
@@ -648,19 +648,19 @@ func (r *SQLRepository) SaveRanking(ctx context.Context, userID uuid.UUID, p pro
 		err = tx.QueryRow(ctx, `INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,ranking_version,score,text_model,embedding_model,created_at)
 		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id,created_at`, id, userID, item.GameID, p.ID, item.AlgorithmVersion, rankingVersion, item.Score, nullableText(r.textModel), r.embeddingModel, now).Scan(&item.ID, &item.CreatedAt)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 		factors, _ := json.Marshal(item.Factors)
 		weights, _ := json.Marshal(item.Weights)
 		if _, err = tx.Exec(ctx, `INSERT INTO recommendation_factors(recommendation_id,factors,weights) VALUES($1,$2,$3) ON CONFLICT(recommendation_id) DO UPDATE SET factors=EXCLUDED.factors,weights=EXCLUDED.weights`, item.ID, factors, weights); err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
 		result = append(result, item)
 	}
 	if err = tx.Commit(ctx); err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
-	return result, rankingVersion, nil
+	return result, rankingVersion, false, nil
 }
 
 func (r *SQLRepository) SaveExplanation(ctx context.Context, userID uuid.UUID, rankingVersion int64, buildKey string, id uuid.UUID, gameName string, record ExplanationRecord) error {
@@ -694,12 +694,12 @@ func (r *SQLRepository) SaveExplanation(ctx context.Context, userID uuid.UUID, r
 	return nil
 }
 
-func (r *SQLRepository) GetExplanationByInput(ctx context.Context, gameID uuid.UUID, model, inputHash string) (ai.Explanation, bool, error) {
-	if gameID == uuid.Nil || strings.TrimSpace(model) == "" || strings.TrimSpace(inputHash) == "" {
+func (r *SQLRepository) GetExplanationByInput(ctx context.Context, userID, gameID uuid.UUID, model, inputHash string) (ai.Explanation, bool, error) {
+	if userID == uuid.Nil || gameID == uuid.Nil || strings.TrimSpace(model) == "" || strings.TrimSpace(inputHash) == "" {
 		return ai.Explanation{}, false, errors.New("explanation cache identity is required")
 	}
 	var raw []byte
-	err := r.store.Pool.QueryRow(ctx, `SELECT explanation FROM catalog_explanation_cache WHERE game_id=$1 AND model=$2 AND input_hash=$3`, gameID, model, inputHash).Scan(&raw)
+	err := r.store.Pool.QueryRow(ctx, `SELECT explanation FROM catalog_explanation_cache WHERE user_id=$1 AND game_id=$2 AND model=$3 AND input_hash=$4`, userID, gameID, model, inputHash).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ai.Explanation{}, false, nil
 	}
@@ -713,17 +713,33 @@ func (r *SQLRepository) GetExplanationByInput(ctx context.Context, gameID uuid.U
 	return value, true, nil
 }
 
-func (r *SQLRepository) PutExplanationByInput(ctx context.Context, gameID uuid.UUID, model, inputHash string, value ai.Explanation) error {
-	if gameID == uuid.Nil || strings.TrimSpace(model) == "" || strings.TrimSpace(inputHash) == "" {
+func (r *SQLRepository) PutExplanationByInput(ctx context.Context, userID, gameID uuid.UUID, model, inputHash string, value ai.Explanation) error {
+	if userID == uuid.Nil || gameID == uuid.Nil || strings.TrimSpace(model) == "" || strings.TrimSpace(inputHash) == "" {
 		return errors.New("explanation cache identity is required")
 	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	_, err = r.store.Pool.Exec(ctx, `INSERT INTO catalog_explanation_cache(game_id,model,input_hash,explanation) VALUES($1,$2,$3,$4)
-		ON CONFLICT(game_id,model,input_hash) DO UPDATE SET explanation=EXCLUDED.explanation,created_at=now()`, gameID, model, inputHash, raw)
-	return err
+	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))`, userID); err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `INSERT INTO catalog_explanation_cache(user_id,game_id,model,input_hash,explanation)
+		SELECT $1,$2,$3,$4,$5 FROM users
+		WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM deleted_user_tombstones WHERE user_id=$1)
+		ON CONFLICT(user_id,game_id,model,input_hash) DO UPDATE SET explanation=EXCLUDED.explanation,created_at=now()`, userID, gameID, model, inputHash, raw)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return pgx.ErrNoRows
+	}
+	return tx.Commit(ctx)
 }
 func (r *SQLRepository) PublishRanking(ctx context.Context, userID uuid.UUID, version int64, buildKey string) error {
 	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})

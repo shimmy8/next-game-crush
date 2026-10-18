@@ -27,13 +27,13 @@ type ExplanationClient interface {
 	ExplainRecommendation(context.Context, ai.RecommendationEvidence) (ai.Explanation, error)
 }
 type ExplanationCache interface {
-	GetExplanationByInput(context.Context, uuid.UUID, string, string) (ai.Explanation, bool, error)
-	PutExplanationByInput(context.Context, uuid.UUID, string, string, ai.Explanation) error
+	GetExplanationByInput(context.Context, uuid.UUID, uuid.UUID, string, string) (ai.Explanation, bool, error)
+	PutExplanationByInput(context.Context, uuid.UUID, uuid.UUID, string, string, ai.Explanation) error
 }
 type Repository interface {
 	Candidates(context.Context, uuid.UUID, profile.Profile, int) ([]Candidate, error)
 	RankingInputs(context.Context, uuid.UUID, profile.Profile, int) (RankingInputs, error)
-	SaveRanking(context.Context, uuid.UUID, profile.Profile, []Recommendation, string) ([]Recommendation, int64, error)
+	SaveRanking(context.Context, uuid.UUID, profile.Profile, []Recommendation, string) ([]Recommendation, int64, bool, error)
 	SaveExplanation(context.Context, uuid.UUID, int64, string, uuid.UUID, string, ExplanationRecord) error
 	PublishRanking(context.Context, uuid.UUID, int64, string) error
 	Latest(context.Context, uuid.UUID) ([]Recommendation, error)
@@ -93,12 +93,18 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 	}
 	output = Sort(output)
 	runBuildKey := RankingBuildKey(buildKey, AlgorithmVersion, ActiveAdjustmentsDigest(input.ActiveAdjustments))
-	saved, rankingVersion, err := s.repository.SaveRanking(ctx, userID, p, output, runBuildKey)
+	saved, rankingVersion, alreadyPublished, err := s.repository.SaveRanking(ctx, userID, p, output, runBuildKey)
 	if err != nil {
 		return nil, 0, emptyStats, fmt.Errorf("persist ranking: %w", err)
 	}
-	if len(saved) == 0 {
+	if alreadyPublished {
 		return nil, rankingVersion, emptyStats, nil
+	}
+	if len(saved) == 0 {
+		if err := s.repository.PublishRanking(ctx, userID, rankingVersion, runBuildKey); err != nil {
+			return nil, 0, emptyStats, err
+		}
+		return saved, rankingVersion, emptyStats, nil
 	}
 	corpus := input.Corpus
 	stats := emptyStats
@@ -108,7 +114,7 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 			candidate.GameID = saved[i].GameID
 		}
 		selected := SelectGroundingEvidence(BuildGroundingEvidence(saved[i], candidate, corpus.Anchors, p.CreatedAt))
-		explanation, err := s.explainCached(ctx, saved[i].GameID, saved[i].Name, selected)
+		explanation, err := s.explainCached(ctx, userID, saved[i].GameID, saved[i].Name, selected)
 		if err != nil {
 			return nil, 0, stats, fmt.Errorf("reuse explanation input: %w", err)
 		}
@@ -143,7 +149,7 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 	return saved, rankingVersion, stats, nil
 }
 
-func (s *Service) explainCached(ctx context.Context, gameID uuid.UUID, name string, selected []GroundingEvidence) (ExplanationResult, error) {
+func (s *Service) explainCached(ctx context.Context, userID, gameID uuid.UUID, name string, selected []GroundingEvidence) (ExplanationResult, error) {
 	if s.explanationCache == nil || s.explanationModel == "" {
 		return Explain(ctx, s.explainer, name, selected), nil
 	}
@@ -156,7 +162,7 @@ func (s *Service) explainCached(ctx context.Context, gameID uuid.UUID, name stri
 		return ExplanationResult{}, err
 	}
 	hash := fmt.Sprintf("%x", sha256.Sum256(input))
-	if cached, ok, err := s.explanationCache.GetExplanationByInput(ctx, gameID, s.explanationModel, hash); err != nil {
+	if cached, ok, err := s.explanationCache.GetExplanationByInput(ctx, userID, gameID, s.explanationModel, hash); err != nil {
 		return ExplanationResult{}, err
 	} else if ok {
 		if result, valid := validatedCachedExplanation(cached, selected); valid {
@@ -165,7 +171,7 @@ func (s *Service) explainCached(ctx context.Context, gameID uuid.UUID, name stri
 	}
 	result := Explain(ctx, s.explainer, name, selected)
 	if result.Source == ExplanationSourceAI {
-		if err := s.explanationCache.PutExplanationByInput(ctx, gameID, s.explanationModel, hash, ai.Explanation{Text: result.Text, EvidenceKeys: append([]string(nil), result.EvidenceKeys...), Generated: true}); err != nil {
+		if err := s.explanationCache.PutExplanationByInput(ctx, userID, gameID, s.explanationModel, hash, ai.Explanation{Text: result.Text, EvidenceKeys: append([]string(nil), result.EvidenceKeys...), Generated: true}); err != nil {
 			return ExplanationResult{}, err
 		}
 	}

@@ -128,16 +128,16 @@ type memoryExplanationCache struct {
 	values map[string]ai.Explanation
 }
 
-func (c *memoryExplanationCache) GetExplanationByInput(_ context.Context, _ uuid.UUID, model, hash string) (ai.Explanation, bool, error) {
-	value, ok := c.values[model+":"+hash]
+func (c *memoryExplanationCache) GetExplanationByInput(_ context.Context, userID, _ uuid.UUID, model, hash string) (ai.Explanation, bool, error) {
+	value, ok := c.values[userID.String()+":"+model+":"+hash]
 	return value, ok, nil
 }
 
-func (c *memoryExplanationCache) PutExplanationByInput(_ context.Context, _ uuid.UUID, model, hash string, value ai.Explanation) error {
+func (c *memoryExplanationCache) PutExplanationByInput(_ context.Context, userID, _ uuid.UUID, model, hash string, value ai.Explanation) error {
 	if c.values == nil {
 		c.values = map[string]ai.Explanation{}
 	}
-	c.values[model+":"+hash] = value
+	c.values[userID.String()+":"+model+":"+hash] = value
 	return nil
 }
 
@@ -146,10 +146,11 @@ func TestRankingReusesGroundedExplanationInput(t *testing.T) {
 	service := &Service{explainer: client}
 	cache := &memoryExplanationCache{}
 	service.SetExplanationCache(cache, "model-a")
+	userID := uuid.New()
 	gameID := uuid.New()
 	evidence := []GroundingEvidence{{ID: "feature-overlap-1", Kind: EvidenceFeatureOverlap, PublicText: "Совпадают темы: horror.", Strength: 1}}
 	for i := 0; i < 2; i++ {
-		result, err := service.explainCached(context.Background(), gameID, "Игра", evidence)
+		result, err := service.explainCached(context.Background(), userID, gameID, "Игра", evidence)
 		if err != nil || result.Source != ExplanationSourceAI {
 			t.Fatalf("result=%#v err=%v", result, err)
 		}
@@ -158,7 +159,7 @@ func TestRankingReusesGroundedExplanationInput(t *testing.T) {
 		t.Fatalf("identical input calls=%d", client.calls)
 	}
 	evidence[0].PublicText = "Совпадают темы: survival horror."
-	if _, err := service.explainCached(context.Background(), gameID, "Игра", evidence); err != nil {
+	if _, err := service.explainCached(context.Background(), userID, gameID, "Игра", evidence); err != nil {
 		t.Fatal(err)
 	}
 	if client.calls != 2 {

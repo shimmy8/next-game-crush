@@ -119,12 +119,12 @@ func TestRankingBuildUnpublishedReplacementAndPublishedReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	item := Recommendation{GameID: game, Name: "Watched Game", AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights(), Factors: Factors{NegativeModePreference: 1}}
-	initial, v, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, RankingBuildKey("replacement-request", AlgorithmVersion, "initial"))
+	initial, v, _, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, RankingBuildKey("replacement-request", AlgorithmVersion, "initial"))
 	if err != nil || v != 2 {
 		t.Fatalf("initial=%d err=%v", v, err)
 	}
 	item.Factors.NegativeModePreference = .4
-	replaced, v, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, RankingBuildKey("replacement-request", AlgorithmVersion, "changed"))
+	replaced, v, _, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, RankingBuildKey("replacement-request", AlgorithmVersion, "changed"))
 	if err != nil || v != 2 || len(replaced) != 1 || replaced[0].ID == initial[0].ID {
 		t.Fatalf("replacement=%#v version=%d err=%v", replaced, v, err)
 	}
@@ -142,7 +142,7 @@ func TestRankingBuildUnpublishedReplacementAndPublishedReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	item.Factors.NegativeModePreference = 0
-	replay, v, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, RankingBuildKey("replacement-request", AlgorithmVersion, "later"))
+	replay, v, _, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, RankingBuildKey("replacement-request", AlgorithmVersion, "later"))
 	if err != nil || v != 2 || len(replay) != 0 {
 		t.Fatalf("published replay=%#v version=%d err=%v", replay, v, err)
 	}
@@ -150,7 +150,7 @@ func TestRankingBuildUnpublishedReplacementAndPublishedReplay(t *testing.T) {
 	if err != nil || persisted.Factors.NegativeModePreference != .4 {
 		t.Fatalf("published mutation=%#v err=%v", persisted, err)
 	}
-	_, next, err := repo.SaveRanking(ctx, old.owner, p, nil, RankingBuildKey("replacement-request", "different-algorithm", "changed"))
+	_, next, _, err := repo.SaveRanking(ctx, old.owner, p, nil, RankingBuildKey("replacement-request", "different-algorithm", "changed"))
 	if err != nil || next != 3 {
 		t.Fatalf("new algorithm=%d err=%v", next, err)
 	}
@@ -171,7 +171,7 @@ func TestRankingBuildConcurrentDigestsReplayOneVersion(t *testing.T) {
 		wg.Add(1)
 		go func(digest string) {
 			defer wg.Done()
-			_, v, err := repo.SaveRanking(ctx, old.owner, p, nil, RankingBuildKey("concurrent-request", AlgorithmVersion, digest))
+			_, v, _, err := repo.SaveRanking(ctx, old.owner, p, nil, RankingBuildKey("concurrent-request", AlgorithmVersion, digest))
 			versions <- v
 			errs <- err
 		}(digest)
@@ -196,7 +196,7 @@ func TestRankingBuildConcurrentDigestsReplayOneVersion(t *testing.T) {
 	if err := repo.PublishRanking(ctx, old.owner, 2, currentBuildKey); err != nil {
 		t.Fatal(err)
 	}
-	_, replayed, err := repo.SaveRanking(ctx, old.owner, p, nil, RankingBuildKey("concurrent-request", AlgorithmVersion, "three"))
+	_, replayed, _, err := repo.SaveRanking(ctx, old.owner, p, nil, RankingBuildKey("concurrent-request", AlgorithmVersion, "three"))
 	if err != nil || replayed != 2 {
 		t.Fatalf("replay=%d err=%v", replayed, err)
 	}
@@ -204,7 +204,7 @@ func TestRankingBuildConcurrentDigestsReplayOneVersion(t *testing.T) {
 	if err := repo.store.Pool.QueryRow(ctx, `SELECT count(*) FROM recommendation_runs WHERE user_id=$1`, old.owner).Scan(&count); err != nil || count != 2 {
 		t.Fatalf("runs=%d err=%v", count, err)
 	}
-	_, next, err := repo.SaveRanking(ctx, old.owner, profile.Profile{ID: p.ID}, nil, RankingBuildKey("disable-independent", AlgorithmVersion, "three"))
+	_, next, _, err := repo.SaveRanking(ctx, old.owner, profile.Profile{ID: p.ID}, nil, RankingBuildKey("disable-independent", AlgorithmVersion, "three"))
 	if err != nil || next != 3 {
 		t.Fatalf("independent=%d err=%v", next, err)
 	}
@@ -224,12 +224,12 @@ func TestRankingBuildFencesStaleExplanationAndPublication(t *testing.T) {
 	}
 	item := Recommendation{GameID: gameID, Name: "Watched Game", AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights()}
 	staleKey := RankingBuildKey("fenced-request", AlgorithmVersion, "stale")
-	stale, version, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, staleKey)
+	stale, version, _, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, staleKey)
 	if err != nil || len(stale) != 1 {
 		t.Fatalf("stale preparation=%#v version=%d err=%v", stale, version, err)
 	}
 	currentKey := RankingBuildKey("fenced-request", AlgorithmVersion, "current")
-	current, currentVersion, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, currentKey)
+	current, currentVersion, _, err := repo.SaveRanking(ctx, old.owner, p, []Recommendation{item}, currentKey)
 	if err != nil || currentVersion != version || len(current) != 1 {
 		t.Fatalf("current preparation=%#v version=%d err=%v", current, currentVersion, err)
 	}

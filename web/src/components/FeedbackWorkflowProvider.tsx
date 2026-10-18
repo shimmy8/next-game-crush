@@ -97,7 +97,11 @@ export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingU
     }
   }, [dispatch, poll, reconcile])
 
-  useEffect(() => () => { mounted.current = false; controllers.current.forEach((controller) => controller.abort()); recordsRef.current = feedbackWorkflowReducer(recordsRef.current, { type: 'teardown' }) }, [])
+  useEffect(() => {
+    mounted.current = true
+    const activeControllers = controllers.current
+    return () => { mounted.current = false; activeControllers.forEach((controller) => controller.abort()); recordsRef.current = feedbackWorkflowReducer(recordsRef.current, { type: 'teardown' }) }
+  }, [])
 
   const stateFor = useCallback((gameId: string): PublicFeedbackWorkflowState => {
     void revision

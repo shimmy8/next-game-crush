@@ -3,6 +3,7 @@ package recommendations
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -845,6 +846,53 @@ func assertSafeLegacyPresentation(t *testing.T, got Recommendation) {
 		t.Fatalf("safe evidence = %#v generated=%v", got.Evidence, got.GeneratedExplanation)
 	}
 	assertSteamPresentation(t, got)
+}
+
+func TestExplanationCacheIsUserScopedAndFencedAfterDeletion(t *testing.T) {
+	db := openRankingStore(t)
+	ctx := context.Background()
+	firstUser, secondUser := uuid.New(), uuid.New()
+	gameID := insertRankingGame(t, db, 9100, "Shared recommendation")
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1),($2)`, firstUser, secondUser); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := NewSQLRepository(db, "embed", "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := ai.Explanation{Text: "Первое личное объяснение.", EvidenceKeys: []string{"feature-overlap-1"}}
+	second := ai.Explanation{Text: "Второе личное объяснение.", EvidenceKeys: []string{"wishlist-1"}}
+	if err := repo.PutExplanationByInput(ctx, firstUser, gameID, "model", "hash", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.PutExplanationByInput(ctx, secondUser, gameID, "model", "hash", second); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		user uuid.UUID
+		want ai.Explanation
+	}{{firstUser, first}, {secondUser, second}} {
+		got, ok, err := repo.GetExplanationByInput(ctx, test.user, gameID, "model", "hash")
+		if err != nil || !ok || !reflect.DeepEqual(got, test.want) {
+			t.Fatalf("cache user=%s got=%#v ok=%v err=%v", test.user, got, ok, err)
+		}
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO deleted_user_tombstones(user_id) VALUES($1)`, firstUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `DELETE FROM users WHERE id=$1`, firstUser); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.PutExplanationByInput(ctx, firstUser, gameID, "model", "late", first); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("late cache write error=%v, want pgx.ErrNoRows", err)
+	}
+	if _, ok, err := repo.GetExplanationByInput(ctx, firstUser, gameID, "model", "hash"); err != nil || ok {
+		t.Fatalf("deleted user cache ok=%v err=%v", ok, err)
+	}
+	got, ok, err := repo.GetExplanationByInput(ctx, secondUser, gameID, "model", "hash")
+	if err != nil || !ok || !reflect.DeepEqual(got, second) {
+		t.Fatalf("surviving cache got=%#v ok=%v err=%v", got, ok, err)
+	}
 }
 
 func insertRankingGame(t *testing.T, db *store.Store, appID int64, name string) uuid.UUID {

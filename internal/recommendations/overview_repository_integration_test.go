@@ -64,7 +64,7 @@ func TestOverviewReadsOnePublishedRunDuringRebuild(t *testing.T) {
 	service.SetOverviewSources(repo, nil)
 	first := insertRankingGame(t, db, 7101, "Published discovery")
 	second := insertRankingGame(t, db, 7102, "Next wishlist")
-	firstSaved, v1, err := repo.SaveRanking(ctx, owner, p, []Recommendation{{GameID: first, AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights()}}, "overview-v1")
+	firstSaved, v1, _, err := repo.SaveRanking(ctx, owner, p, []Recommendation{{GameID: first, AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights()}}, "overview-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestOverviewReadsOnePublishedRunDuringRebuild(t *testing.T) {
 	if err = repo.PublishRanking(ctx, owner, v1, "overview-v1"); err != nil {
 		t.Fatal(err)
 	}
-	secondSaved, v2, err := repo.SaveRanking(ctx, owner, p, []Recommendation{{GameID: second, AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights(), Factors: Factors{Wishlist: 1}}}, "overview-v2")
+	secondSaved, v2, _, err := repo.SaveRanking(ctx, owner, p, []Recommendation{{GameID: second, AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights(), Factors: Factors{Wishlist: 1}}}, "overview-v2")
 	if err != nil {
 		t.Fatal(err)
 	}

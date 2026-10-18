@@ -1,5 +1,7 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
+import type { getRankingDiff } from '../api/client'
 import FeedbackWorkflowProvider from './FeedbackWorkflowProvider'
 import { useFeedbackWorkflows } from './FeedbackWorkflowContext'
 import { overviewFixture } from '../test/overviewFixture'
@@ -14,6 +16,49 @@ const accepted = { eventId: 'event', rebuildJobId: 'job', previousRankingVersion
 const diff = { rebuildStatus: 'succeeded', previousVersion: 1, currentVersion: 2, added: [], removed: [], reordered: [] }
 
 describe('FeedbackWorkflowProvider', () => {
+  it('accepts feedback, polls, and reloads after StrictMode replays effect setup', async () => {
+    let finishPolling!: (value: typeof diff) => void
+    const submitFeedback = vi.fn().mockResolvedValue(accepted)
+    const readRankingDiff = vi.fn(() => new Promise<typeof diff>((resolve) => { finishPolling = resolve }))
+    const onRankingUpdated = vi.fn()
+    const reload = vi.fn().mockResolvedValue({ kind: 'fresh', data: { profile: null, overview: overviewFixture(0, 0) } })
+    render(<StrictMode><FeedbackWorkflowProvider csrfToken="csrf" submitFeedback={submitFeedback} readRankingDiff={readRankingDiff} wait={async () => undefined} reload={reload} onRankingUpdated={onRankingUpdated}><Probe /></FeedbackWorkflowProvider></StrictMode>)
+
+    fireEvent.click(screen.getByText('dislike one'))
+
+    await waitFor(() => expect(screen.getByTestId('phase')).toHaveTextContent('polling'))
+    expect(screen.getByTestId('tombstone')).toHaveTextContent('true')
+    expect(submitFeedback).toHaveBeenCalledTimes(1)
+    expect(readRankingDiff).toHaveBeenCalledWith(1, 'job', expect.any(AbortSignal))
+    expect(reload).not.toHaveBeenCalled()
+
+    await act(async () => { finishPolling(diff) })
+
+    await waitFor(() => expect(screen.getByTestId('busy')).toHaveTextContent('false'))
+    expect(onRankingUpdated).toHaveBeenCalledExactlyOnceWith(diff)
+    expect(reload).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId('tombstone')).toHaveTextContent('true')
+  })
+
+  it('aborts polling on real unmount and ignores its late result after StrictMode setup', async () => {
+    let finishPolling!: (value: typeof diff) => void
+    const readRankingDiff = vi.fn<typeof getRankingDiff>(() => new Promise<typeof diff>((resolve) => { finishPolling = resolve }))
+    const onRankingUpdated = vi.fn()
+    const reload = vi.fn()
+    const { unmount } = render(<StrictMode><FeedbackWorkflowProvider csrfToken="csrf" submitFeedback={vi.fn().mockResolvedValue(accepted)} readRankingDiff={readRankingDiff} wait={async () => undefined} reload={reload} onRankingUpdated={onRankingUpdated}><Probe /></FeedbackWorkflowProvider></StrictMode>)
+    fireEvent.click(screen.getByText('dislike one'))
+    await waitFor(() => expect(readRankingDiff).toHaveBeenCalledTimes(1))
+    const signal = readRankingDiff.mock.calls[0][2]
+    expect(signal?.aborted).toBe(false)
+
+    unmount()
+    expect(signal?.aborted).toBe(true)
+    await act(async () => { finishPolling(diff) })
+
+    expect(onRankingUpdated).not.toHaveBeenCalled()
+    expect(reload).not.toHaveBeenCalled()
+  })
+
   it('acquires synchronously per game and lets another game proceed', async () => {
     let resolve!: (value: typeof accepted) => void
     const submitFeedback = vi.fn(() => new Promise<typeof accepted>((done) => { resolve = done }))

@@ -62,6 +62,165 @@ func TestClassificationJobIsSharedAndGameScoped(t *testing.T) {
 	}
 }
 
+func TestRecordAchievementSnapshotRollsBackWhenClassificationEnqueueFails(t *testing.T) {
+	db := openCompletionStore(t)
+	ctx := context.Background()
+	userID, gameID := seedCompletionGame(t, db, nil)
+	repository, _ := NewSQLRepository(db)
+	service, _ := NewService(repository, semanticClassifierFunc(func(context.Context, ai.AchievementSemanticEvidence) (ai.AchievementSemanticClassification, error) {
+		return ai.AchievementSemanticClassification{}, ai.ErrCapabilityDisabled
+	}), "semantic-model", jobs.NewQueue(db))
+	summary := steam.AchievementSummary{Achievements: []steam.Achievement{{APIName: "ending", Name: "Ending", Description: "Reach an ending", Achieved: true}}}
+	if _, err := db.Pool.Exec(ctx, `CREATE FUNCTION reject_classification_enqueue() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.kind='achievement.classify' THEN RAISE EXCEPTION 'injected enqueue failure'; END IF; RETURN NEW; END $$;
+		CREATE TRIGGER reject_classification_enqueue BEFORE INSERT ON sync_jobs FOR EACH ROW EXECUTE FUNCTION reject_classification_enqueue()`); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordAchievementSnapshot(ctx, userID, gameID, summary, time.Now()); err == nil {
+		t.Fatal("snapshot unexpectedly succeeded despite enqueue failure")
+	}
+	for _, table := range []string{"achievement_summaries", "user_achievement_unlocks", "game_achievement_definitions", "user_game_completion_evidence", "user_game_completion_projections", "sync_jobs"} {
+		var count int
+		if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM `+table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Errorf("%s retained %d rows after enqueue failure", table, count)
+		}
+	}
+	if _, err := db.Pool.Exec(ctx, `DROP TRIGGER reject_classification_enqueue ON sync_jobs`); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := service.RecordAchievementSnapshot(ctx, userID, gameID, summary, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var jobsCount int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind='achievement.classify' AND user_id IS NULL`).Scan(&jobsCount); err != nil || jobsCount != 1 {
+		t.Fatalf("classification jobs=%d err=%v", jobsCount, err)
+	}
+}
+
+func TestRecordAchievementSnapshotRecoversCurrentClassificationIntent(t *testing.T) {
+	for _, scenario := range []string{"orphan", "old model", "old prompt", "old schema", "old lexical rules", "old definitions", "succeeded job", "dead job", "pending job", "active current", "empty definitions"} {
+		t.Run(scenario, func(t *testing.T) {
+			db := openCompletionStore(t)
+			ctx := context.Background()
+			userID, gameID := seedCompletionGame(t, db, nil)
+			repository, _ := NewSQLRepository(db)
+			service, _ := NewService(repository, semanticClassifierFunc(func(context.Context, ai.AchievementSemanticEvidence) (ai.AchievementSemanticClassification, error) {
+				return ai.AchievementSemanticClassification{}, ai.ErrCapabilityDisabled
+			}), "semantic-model", jobs.NewQueue(db))
+			summary := steam.AchievementSummary{Achievements: []steam.Achievement{{APIName: "ending", Name: "Ending", Description: "Reach an ending", Achieved: true}}}
+			if scenario == "empty definitions" {
+				summary.Achievements[0].Name, summary.Achievements[0].Description = "", ""
+			}
+			change, err := repository.SaveSteamSnapshot(ctx, userID, gameID, summary, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(scenario, "old ") || scenario == "active current" {
+				model, prompt, schema, lexical := "semantic-model", ai.AchievementSemanticsPromptVersion, ai.AchievementSemanticsSchemaVersion, LexicalRuleVersion
+				switch scenario {
+				case "old model":
+					model += "-old"
+				case "old prompt":
+					prompt += "-old"
+				case "old schema":
+					schema += "-old"
+				case "old lexical rules":
+					lexical += "-old"
+				}
+				staged := []StagedClassification{{APIName: "ending", DefinitionContentHash: definitionHashFor(t, db, gameID, "ending"), Class: ai.AchievementSemanticBaseGameEnding, Source: ClassificationSourceLexical}}
+				if _, err := repository.PublishClassificationGeneration(ctx, gameID, model, prompt, schema, lexical, change.DefinitionSetHash, staged, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "old definitions" {
+					if _, err := db.Pool.Exec(ctx, `UPDATE achievement_semantic_classification_generations SET definition_set_hash=$2 WHERE game_id=$1`, gameID, strings.Repeat("0", 64)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			spec, err := service.PlanClassificationJob(ctx, gameID, change.DefinitionSetHash, 80)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var priorJob uuid.UUID
+			if strings.HasSuffix(scenario, " job") {
+				priorJob, err = jobs.NewQueue(db).Enqueue(ctx, spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if scenario != "pending job" {
+					status := strings.TrimSuffix(scenario, " job")
+					if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET status=$2,attempts=max_attempts,result='{"published_hook_pending":false}' WHERE id=$1`, priorJob, status); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			for range 2 {
+				if err := service.RecordAchievementSnapshot(ctx, userID, gameID, summary, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var count int
+			if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind='achievement.classify'`).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "active current" || scenario == "empty definitions" {
+				if count != 0 {
+					t.Fatalf("classification jobs=%d want=0", count)
+				}
+				return
+			}
+			if count != 1 {
+				t.Fatalf("classification jobs=%d want=1", count)
+			}
+			var id uuid.UUID
+			var status string
+			var claimable, shared bool
+			var payload []byte
+			if err := db.Pool.QueryRow(ctx, `SELECT id,status,attempts<max_attempts,user_id IS NULL,payload FROM sync_jobs WHERE idempotency_key=$1`, spec.IdempotencyKey).Scan(&id, &status, &claimable, &shared, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if status != "queued" || !claimable || !shared || (priorJob != uuid.Nil && priorJob != id) || strings.Contains(string(payload), userID.String()) {
+				t.Fatalf("recovered intent status=%s claimable=%v shared=%v reused=%v", status, claimable, shared, priorJob == uuid.Nil || priorJob == id)
+			}
+		})
+	}
+}
+
+func TestRecordAchievementSnapshotKeepsClassificationIntentAfterProjectionFailure(t *testing.T) {
+	db := openCompletionStore(t)
+	ctx := context.Background()
+	userID, gameID := seedCompletionGame(t, db, nil)
+	repository, _ := NewSQLRepository(db)
+	service, _ := NewService(repository, semanticClassifierFunc(func(context.Context, ai.AchievementSemanticEvidence) (ai.AchievementSemanticClassification, error) {
+		return ai.AchievementSemanticClassification{}, ai.ErrCapabilityDisabled
+	}), "semantic-model", jobs.NewQueue(db))
+	summary := steam.AchievementSummary{Achievements: []steam.Achievement{{APIName: "ending", Name: "Ending", Description: "Reach an ending", Achieved: true}}}
+	if _, err := db.Pool.Exec(ctx, `CREATE FUNCTION reject_snapshot_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected projection failure'; END $$;
+		CREATE TRIGGER reject_snapshot_projection BEFORE INSERT ON user_game_completion_projections FOR EACH ROW EXECUTE FUNCTION reject_snapshot_projection()`); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordAchievementSnapshot(ctx, userID, gameID, summary, time.Now()); err == nil {
+		t.Fatal("snapshot unexpectedly succeeded despite projection failure")
+	}
+	var count int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind='achievement.classify' AND user_id IS NULL`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("classification intent after projection failure=%d err=%v", count, err)
+	}
+	if _, err := db.Pool.Exec(ctx, `DROP TRIGGER reject_snapshot_projection ON user_game_completion_projections`); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordAchievementSnapshot(ctx, userID, gameID, summary, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind='achievement.classify'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("classification intent after retry=%d err=%v", count, err)
+	}
+}
+
 func TestClassificationUnavailablePublishesLocalFirstGenerationOnly(t *testing.T) {
 	db := openCompletionStore(t)
 	ctx := context.Background()

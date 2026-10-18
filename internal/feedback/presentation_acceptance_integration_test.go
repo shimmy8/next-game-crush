@@ -155,7 +155,7 @@ func TestWishlistMembershipChangeReclassifiesOnlyAfterPublishedRebuild(t *testin
 	}
 	prepared = recommendations.Sort(prepared)
 	const buildKey = "wishlist-membership-publish-boundary"
-	saved, version, err := fixture.rankingRepo.SaveRanking(ctx, fixture.userID, p, prepared, buildKey)
+	saved, version, _, err := fixture.rankingRepo.SaveRanking(ctx, fixture.userID, p, prepared, buildKey)
 	if err != nil {
 		t.Fatal(err)
 	}

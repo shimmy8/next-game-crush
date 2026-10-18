@@ -39,6 +39,10 @@ func (r *SQLRepository) RecordAchievementSnapshot(ctx context.Context, userID, g
 }
 
 func (r *SQLRepository) SaveSteamSnapshot(ctx context.Context, userID, gameID uuid.UUID, summary steam.AchievementSummary, observedAt time.Time) (SnapshotChange, error) {
+	return r.saveSteamSnapshot(ctx, userID, gameID, summary, observedAt, nil)
+}
+
+func (r *SQLRepository) saveSteamSnapshot(ctx context.Context, userID, gameID uuid.UUID, summary steam.AchievementSummary, observedAt time.Time, beforeCommit func(context.Context, pgx.Tx, SnapshotChange) error) (SnapshotChange, error) {
 	if userID == uuid.Nil || gameID == uuid.Nil {
 		return SnapshotChange{}, errors.New("user ID and game ID are required")
 	}
@@ -160,10 +164,16 @@ func (r *SQLRepository) SaveSteamSnapshot(ctx context.Context, userID, gameID uu
 		return SnapshotChange{}, fmt.Errorf("reload achievement definitions: %w", err)
 	}
 	afterHash := hashDefinitionRows(after)
+	change := SnapshotChange{DefinitionSetHash: afterHash, DefinitionsChanged: beforeHash != afterHash, HundredPercentObserved: hundredPercent}
+	if beforeCommit != nil {
+		if err := beforeCommit(ctx, tx, change); err != nil {
+			return SnapshotChange{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return SnapshotChange{}, fmt.Errorf("commit achievement snapshot: %w", err)
 	}
-	return SnapshotChange{DefinitionSetHash: afterHash, DefinitionsChanged: beforeHash != afterHash, HundredPercentObserved: hundredPercent}, nil
+	return change, nil
 }
 
 func (r *SQLRepository) LoadDefinitionGenerationInput(ctx context.Context, gameID uuid.UUID, model, promptVersion, schemaVersion, lexicalRuleVersion string) (ai.AchievementSemanticEvidence, map[string]StoredClassification, string, error) {

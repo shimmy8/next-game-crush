@@ -105,6 +105,7 @@ type CatalogExplanationCache struct {
 	InputHash   string             `json:"input_hash"`
 	Explanation []byte             `json:"explanation"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UserID      pgtype.UUID        `json:"user_id"`
 }
 
 type CatalogFetchState struct {

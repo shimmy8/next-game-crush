@@ -56,6 +56,33 @@ func TestFailedV2BuildKeepsPreviousPublishedRun(t *testing.T) {
 	assertHistoricalRanking(t, service, old)
 }
 
+func TestEmptyRebuildPublishesEmptyRanking(t *testing.T) {
+	service, old := historicalRankingFixture(t, false)
+	repo := service.repository.(*SQLRepository)
+	ctx := context.Background()
+	if _, err := repo.store.Pool.Exec(ctx, `DELETE FROM wishlist_entries WHERE user_id=$1`, old.owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.store.Pool.Exec(ctx, `DELETE FROM catalog_entries`); err != nil {
+		t.Fatal(err)
+	}
+	items, version, _, err := service.rebuild(ctx, old.owner, "empty-workflow")
+	if err != nil || len(items) != 0 || version != 2 {
+		t.Fatalf("empty rebuild: items=%#v version=%d err=%v", items, version, err)
+	}
+	var published bool
+	if err := repo.store.Pool.QueryRow(ctx, `SELECT published FROM recommendation_runs WHERE user_id=$1 AND ranking_version=$2`, old.owner, version).Scan(&published); err != nil {
+		t.Fatal(err)
+	}
+	if !published {
+		t.Fatal("empty ranking run was not published")
+	}
+	latest, err := service.Latest(ctx, old.owner)
+	if err != nil || len(latest) != 0 {
+		t.Fatalf("stale ranking remained visible: latest=%#v err=%v", latest, err)
+	}
+}
+
 func TestLatestSuppressesDislikedGameWhileReplacementBuildFails(t *testing.T) {
 	service, old := historicalRankingFixture(t, true)
 	repo := service.repository.(failingExplanationRepository).SQLRepository

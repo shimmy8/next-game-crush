@@ -105,7 +105,22 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
+      - name: Verify commit is current main
+        id: freshness
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git fetch --no-tags --depth=1 origin \
+            +refs/heads/main:refs/remotes/origin/main
+          if [[ "$(git rev-parse refs/remotes/origin/main)" != "$GITHUB_SHA" ]]; then
+            printf '%s\n' 'current=false' >>"$GITHUB_OUTPUT"
+            printf '%s\n' 'Skipping superseded deployment; this commit is no longer main.'
+            exit 0
+          fi
+          printf '%s\n' 'current=true' >>"$GITHUB_OUTPUT"
+
       - name: Configure reviewed SSH credentials
+        if: steps.freshness.outputs.current == 'true'
         shell: bash
         env:
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
@@ -129,6 +144,7 @@ jobs:
           }
 
       - name: Upload and deploy exact image
+        if: steps.freshness.outputs.current == 'true'
         shell: bash
         run: |
           set -Eeuo pipefail

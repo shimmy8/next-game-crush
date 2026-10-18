@@ -17,6 +17,7 @@ import (
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/steam"
+	dbgen "next-game-crush/internal/store/sqlc"
 )
 
 type Service struct {
@@ -73,22 +74,51 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 }
 
 func (s *Service) RecordAchievementSnapshot(ctx context.Context, userID, gameID uuid.UUID, summary steam.AchievementSummary, observedAt time.Time) error {
-	change, err := s.repository.SaveSteamSnapshot(ctx, userID, gameID, summary, observedAt)
+	_, err := s.repository.saveSteamSnapshot(ctx, userID, gameID, summary, observedAt, func(ctx context.Context, tx pgx.Tx, change SnapshotChange) error {
+		return s.ensureClassificationInTx(ctx, tx, gameID, change.DefinitionSetHash)
+	})
 	if err != nil {
 		return err
 	}
-	if _, _, err := s.repository.RebuildProjection(ctx, userID, gameID, s.model, observedAt); err != nil {
-		return err
+	_, _, err = s.repository.RebuildProjection(ctx, userID, gameID, s.model, observedAt)
+	return err
+}
+
+// The caller holds the game's definition-set lock and user-game deletion fence.
+// Persist classification intent before committing the snapshot, including when
+// an earlier import or a classifier identity change left unchanged definitions.
+func (s *Service) ensureClassificationInTx(ctx context.Context, tx pgx.Tx, gameID uuid.UUID, definitionSetHash string) error {
+	var hasDefinitions, active bool
+	if err := tx.QueryRow(ctx, `SELECT
+		EXISTS(SELECT 1 FROM game_achievement_definitions WHERE game_id=$1),
+		EXISTS(SELECT 1 FROM achievement_semantic_classification_generations
+		       WHERE game_id=$1 AND model=$2 AND prompt_version=$3 AND schema_version=$4
+		         AND lexical_rule_version=$5 AND definition_set_hash=$6 AND status='active')`,
+		gameID, s.model, ai.AchievementSemanticsPromptVersion, ai.AchievementSemanticsSchemaVersion,
+		LexicalRuleVersion, definitionSetHash).Scan(&hasDefinitions, &active); err != nil {
+		return fmt.Errorf("inspect snapshot classification intent: %w", err)
 	}
-	if !change.DefinitionsChanged || change.DefinitionSetHash == "" {
+	if !hasDefinitions || active {
 		return nil
 	}
-	spec, err := s.PlanClassificationJob(ctx, gameID, change.DefinitionSetHash, 80)
+	spec, err := s.PlanClassificationJob(ctx, gameID, definitionSetHash, 80)
 	if err != nil {
 		return err
 	}
-	_, err = s.queue.Enqueue(ctx, spec)
-	return err
+	jobID, err := jobs.EnqueueInTx(ctx, dbgen.New(tx), spec)
+	if err != nil {
+		return err
+	}
+	// A completed obsolete attempt can have no active generation (for example,
+	// metadata changed away and back). Reuse its identity and retain attempt
+	// history while granting a fresh bounded retry budget. Live jobs are untouched.
+	if _, err := tx.Exec(ctx, `UPDATE sync_jobs SET status='queued',
+		max_attempts=GREATEST(max_attempts,attempts+$2),available_at=now(),
+		worker_id=NULL,fencing_token=NULL,lease_until=NULL,last_error=NULL,result='{}'::jsonb,updated_at=now()
+		WHERE id=$1 AND status IN ('succeeded','dead')`, jobID, spec.MaxAttempts); err != nil {
+		return fmt.Errorf("recover snapshot classification intent: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) EnqueueProjectionJobsForGame(ctx context.Context, gameID uuid.UUID) error {
