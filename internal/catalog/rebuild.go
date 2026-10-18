@@ -16,6 +16,177 @@ import (
 const catalogRebuildDebounce = 10 * time.Minute
 const catalogRebuildMinimumInterval = time.Hour
 const catalogRebuildWakePoll = 5 * time.Second
+const catalogRebuildMaxRetryGenerations = 3
+const catalogRecommendationRebuildJobKind = "recommendations.rebuild"
+
+const (
+	EligibilityChangeMembership        = "membership"
+	EligibilityChangeSemanticContent   = "semantic_content"
+	EligibilityChangeReviewEligibility = "review_eligibility"
+)
+
+// EligibilityChange is the persistence-neutral input to catalog rebuild
+// coalescing. NextChangeAt is a clock deadline, not an invented release date.
+type EligibilityChange struct {
+	GameID       uuid.UUID
+	Kind         string
+	NextChangeAt *time.Time
+}
+
+func (c EligibilityChange) dirtiesRanking() bool {
+	switch c.Kind {
+	case EligibilityChangeMembership, EligibilityChangeSemanticContent, EligibilityChangeReviewEligibility:
+		return true
+	default:
+		return false
+	}
+}
+
+// rebuildWakePlan is deliberately independent of PostgreSQL and the queue.
+// The repository integration can compute and persist this decision while
+// holding its per-user row lock.
+type rebuildWakePlan struct {
+	UserID          uuid.UUID
+	Revision        int64
+	RetryGeneration int
+	AvailableAt     time.Time
+	IdempotencyKey  string
+}
+
+type rebuildCoordinatorState struct {
+	UserID                uuid.UUID
+	DirtyRevision         int64
+	EnqueuedRevision      int64
+	LastCompletedRevision int64
+	RetryGeneration       int
+	FirstDirtyAt          *time.Time
+	LastScheduledAt       *time.Time
+	Pending               *rebuildWakePlan
+}
+
+func (s *rebuildCoordinatorState) applyEligibilityChange(change EligibilityChange, at time.Time) bool {
+	if change.GameID == uuid.Nil || !change.dirtiesRanking() {
+		return false
+	}
+	at = at.UTC()
+	if s.DirtyRevision <= s.EnqueuedRevision && s.Pending == nil {
+		s.RetryGeneration = 0
+		s.FirstDirtyAt = &at
+	}
+	s.DirtyRevision++
+	if s.FirstDirtyAt == nil {
+		s.FirstDirtyAt = &at
+	}
+	return true
+}
+
+func (s rebuildCoordinatorState) wakeDueAt() (time.Time, bool) {
+	if s.UserID == uuid.Nil || s.Pending != nil || s.DirtyRevision <= s.LastCompletedRevision || s.FirstDirtyAt == nil || s.RetryGeneration > catalogRebuildMaxRetryGenerations {
+		return time.Time{}, false
+	}
+	dueAt := s.FirstDirtyAt.UTC().Add(catalogRebuildDebounce)
+	if s.LastScheduledAt != nil {
+		minimum := s.LastScheduledAt.UTC().Add(catalogRebuildMinimumInterval)
+		if minimum.After(dueAt) {
+			dueAt = minimum
+		}
+	}
+	return dueAt, true
+}
+
+func (s rebuildCoordinatorState) nextWake(now time.Time) (rebuildWakePlan, bool) {
+	dueAt, ok := s.wakeDueAt()
+	if !ok {
+		return rebuildWakePlan{}, false
+	}
+	now = now.UTC()
+	if dueAt.After(now) {
+		return rebuildWakePlan{}, false
+	}
+	return rebuildWakePlan{
+		UserID:          s.UserID,
+		Revision:        s.DirtyRevision,
+		RetryGeneration: s.RetryGeneration,
+		AvailableAt:     now,
+		IdempotencyKey:  fmt.Sprintf("catalog:recommendations.rebuild:v2:%s:%d:retry:%d", s.UserID, s.DirtyRevision, s.RetryGeneration),
+	}, true
+}
+
+func (s *rebuildCoordinatorState) recordWake(wake rebuildWakePlan) bool {
+	if s.Pending != nil || wake.UserID != s.UserID || wake.Revision != s.DirtyRevision || wake.RetryGeneration != s.RetryGeneration {
+		return false
+	}
+	s.EnqueuedRevision = wake.Revision
+	availableAt := wake.AvailableAt.UTC()
+	s.LastScheduledAt = &availableAt
+	wake.AvailableAt = availableAt
+	s.Pending = &wake
+	s.FirstDirtyAt = nil
+	return true
+}
+
+func (s *rebuildCoordinatorState) finishWake(wake rebuildWakePlan, succeeded bool) bool {
+	if s.Pending == nil || wake.UserID != s.Pending.UserID || wake.Revision != s.Pending.Revision || wake.RetryGeneration != s.Pending.RetryGeneration || wake.IdempotencyKey != s.Pending.IdempotencyKey {
+		return false
+	}
+	s.Pending = nil
+	if succeeded {
+		if wake.Revision > s.LastCompletedRevision {
+			s.LastCompletedRevision = wake.Revision
+		}
+		s.RetryGeneration = 0
+	} else {
+		if s.DirtyRevision > wake.Revision {
+			// Retry generations belong to one immutable dirty revision. New
+			// content schedules its own generation zero successor.
+			s.RetryGeneration = 0
+		} else {
+			s.RetryGeneration++
+		}
+		if s.FirstDirtyAt == nil {
+			failedAt := wake.AvailableAt.UTC()
+			s.FirstDirtyAt = &failedAt
+		}
+	}
+	return true
+}
+
+type eligibilityDueFence struct {
+	GameID      uuid.UUID
+	ExpectedAt  time.Time
+	SuccessorAt *time.Time
+}
+
+// clockDrivenEligibilityChange converts a due deadline into the same semantic
+// dirty signal used by review transitions. The returned fence lets persistence
+// clear or advance the deadline only after the corresponding rebuild succeeds.
+func clockDrivenEligibilityChange(gameID uuid.UUID, now, dueAt time.Time, successorAt *time.Time) (EligibilityChange, eligibilityDueFence, bool) {
+	now, dueAt = now.UTC(), dueAt.UTC()
+	if gameID == uuid.Nil || dueAt.After(now) {
+		return EligibilityChange{}, eligibilityDueFence{}, false
+	}
+	var successor *time.Time
+	if successorAt != nil {
+		next := successorAt.UTC()
+		successor = &next
+	}
+	return EligibilityChange{GameID: gameID, Kind: EligibilityChangeReviewEligibility, NextChangeAt: successor}, eligibilityDueFence{GameID: gameID, ExpectedAt: dueAt, SuccessorAt: successor}, true
+}
+
+func (f eligibilityDueFence) resolve(current *time.Time, succeeded bool) (*time.Time, bool) {
+	if current == nil {
+		return nil, false
+	}
+	currentUTC := current.UTC()
+	if !succeeded || f.GameID == uuid.Nil || !currentUTC.Equal(f.ExpectedAt) {
+		return &currentUTC, false
+	}
+	if f.SuccessorAt == nil {
+		return nil, true
+	}
+	next := f.SuccessorAt.UTC()
+	return &next, true
+}
 
 type rebuildWakePayload struct {
 	Version  int       `json:"version"`
@@ -105,7 +276,7 @@ func (s *DiscoveryService) ScheduleRebuilds(ctx context.Context) error {
 			UserID  uuid.UUID `json:"user_id"`
 		}{Version: 1, UserID: row.userID})
 		key := fmt.Sprintf("catalog:recommendations.rebuild:v1:%s:%d", row.userID, row.dirtyRevision)
-		jobID, err := jobs.EnqueueInTx(ctx, q, jobs.Spec{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", IdempotencyKey: key, Payload: payload, AvailableAt: availableAt, MaxAttempts: 3, Priority: 50, UserID: row.userID})
+		jobID, err := jobs.EnqueueInTx(ctx, q, jobs.Spec{Lane: jobs.LaneInteractive, Kind: catalogRecommendationRebuildJobKind, Stage: "recommendations", IdempotencyKey: key, Payload: payload, AvailableAt: availableAt, MaxAttempts: 3, Priority: 50, UserID: row.userID})
 		if err != nil {
 			return err
 		}
