@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { disablePreferenceAdjustment, getDiagnostics, getPreferenceAdjustments, getProfile, getCurrentSync, getRecommendationOverview, normalizeCalendar, normalizeOverview, preflightSync } from './client'
 import type { SyncStatus } from './types'
-import { overviewFixture, recommendation } from '../test/overviewFixture'
+import { overviewFixture, recommendation, reviewFixture } from '../test/overviewFixture'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -40,6 +40,60 @@ describe('preference adjustments', () => {
 })
 
 describe('recommendation overview', () => {
+  it('preserves only the normalized review contract in every recommendation collection', () => {
+    const raw = { ...recommendation('rated'), reviews: { ...reviewFixture, rawTooltip: '<br>untrusted' } }
+    const value = normalizeOverview({
+      discoveries: { featured: raw, items: [raw], total: 1 },
+      wishlist: { ...overviewFixture().wishlist, items: [raw] },
+      calendar: { exactDates: [raw], month: [raw], quarter: [raw], year: [raw], comingSoon: [raw], tba: [raw] },
+    })
+    for (const item of [value.discoveries.featured!, ...value.discoveries.items, ...value.wishlist.items, ...Object.values(value.calendar).flat()]) {
+      expect(item.reviews).toEqual(reviewFixture)
+      expect(item.score).toBe(raw.score)
+      expect(item.factors).toEqual(raw.factors)
+    }
+  })
+
+  it('keeps valid unrated, mixed, and last successful review observations', () => {
+    const reviews = [
+      { ...reviewFixture, observedAt: '2026-10-01T03:14:15Z' },
+      { ...reviewFixture, band: 'unrated', label: 'No user reviews', positivePercent: null, total: 0 },
+      { ...reviewFixture, band: 'mixed_or_below', label: 'Mixed', positivePercent: 65 },
+    ]
+    const value = normalizeCalendar(JSON.parse(JSON.stringify({ tba: reviews.map((reviews) => ({ ...recommendation('review'), reviews })) })))
+    expect(value.tba.map((item) => item.reviews)).toEqual(reviews)
+  })
+
+  it.each([
+    null, [], 'Very Positive', {},
+    { ...reviewFixture, band: 'unknown' },
+    { ...reviewFixture, positivePercent: undefined },
+    { ...reviewFixture, positivePercent: null },
+    { ...reviewFixture, positivePercent: -1 },
+    { ...reviewFixture, positivePercent: 101 },
+    { ...reviewFixture, positivePercent: 91.5 },
+    { ...reviewFixture, positivePercent: '91' },
+    { ...reviewFixture, total: -1 },
+    { ...reviewFixture, total: 1.5 },
+    { ...reviewFixture, total: Number.MAX_SAFE_INTEGER + 1 },
+    { ...reviewFixture, total: 0 },
+    { ...reviewFixture, label: '' },
+    { ...reviewFixture, label: ' '.repeat(3) },
+    { ...reviewFixture, label: 'a'.repeat(65) },
+    { ...reviewFixture, label: '<b>Very Positive</b>' },
+    { ...reviewFixture, label: 'Very\u0000Positive' },
+    { ...reviewFixture, observedAt: undefined },
+    { ...reviewFixture, observedAt: 'yesterday' },
+    { ...reviewFixture, observedAt: '2026-02-30T03:14:15Z' },
+    { ...reviewFixture, band: 'unrated', positivePercent: null },
+    { ...reviewFixture, band: 'unrated', total: 0 },
+  ].map((reviews) => ({ reviews })))('omits an invalid review object entirely ($reviews)', ({ reviews }) => {
+    const raw = JSON.parse(JSON.stringify({ ...recommendation('invalid-review'), reviews }))
+    const value = normalizeCalendar({ tba: [raw] }).tba[0]
+    expect(value).not.toHaveProperty('reviews')
+    expect(value.name).toBe('invalid-review')
+  })
+
   it('requests the overview with credentials and the caller abort signal', async () => {
     const payload = overviewFixture(8, 8)
     const fetch = vi.fn(async () => new Response(JSON.stringify(payload)))

@@ -9,6 +9,7 @@ import { CompactGameIdentity } from './CompactGameIdentity'
 import { safeRecommendationEvidenceText, safeRecommendationExplanationText } from '../api/client'
 import { isEvidenceKind } from '../api/types'
 import type { FeedbackPresentationOrigin } from './FeedbackWorkflowContext'
+import { reviewLabel } from '../ui/reviews'
 
 const precisionLabels: Record<string, string> = { month: 'В течение месяца', quarter: 'В течение квартала', year: 'В течение года', coming_soon: 'Скоро', unknown: 'Дата уточняется' }
 const knownRawLabels: Record<string, string> = { 'coming soon': 'Скоро', tba: 'Дата уточняется' }
@@ -66,6 +67,7 @@ export default function RecommendationCard({ item, featured = false, compact = f
   const aiEvidence = aiVisible ? substantiveEvidence.filter((entry) => entry.text !== explanation) : []
   const disliked = workflow.tombstoned && workflow.action === 'dislike'
   const showLikeEffect = workflow.likeEffectActive && !disliked
+  const reviews = reviewLabel(item.reviews)
   const surface = (includeFeedback: boolean) => <>
     {showCover ? (
       <div className="cover-panel cover-panel--image">
@@ -89,6 +91,7 @@ export default function RecommendationCard({ item, featured = false, compact = f
         )) : <span className="compatibility-badge">Платформы неизвестны</span>}
         <span className={`compatibility-badge compatibility-badge--${item.deckCompatibility}`}>{deckLabels[item.deckCompatibility]}</span>
       </div>
+      {reviews && <p className="review-summary" role="note" aria-label={`Отзывы игроков в Steam: ${reviews}`}>{reviews}</p>}
       <div className="score-row"><strong>{Math.round(item.score)}</strong><span>совпадение</span><span className="confidence-dot">{Math.round(item.confidence * 100)}% уверенность</span></div>
       <a className="store-link" href={item.storeUrl} target="_blank" rel="noopener noreferrer">Открыть в Steam <span aria-hidden="true">↗</span></a>
       {aiVisible && <p className="reason">{explanation}</p>}
@@ -111,6 +114,7 @@ export default function RecommendationCard({ item, featured = false, compact = f
         <span className={`compatibility-badge compatibility-badge--${item.deckCompatibility}`}>{deckLabels[item.deckCompatibility]}</span>
       </div>
       <span>{Math.round(item.score)} · совпадение</span>
+      {reviews && <p className="review-summary" role="note" aria-label={`Отзывы игроков в Steam: ${reviews}`}>{reviews}</p>}
       {feedbackEnabled && <FeedbackLauncher item={item} gameId={item.gameId} recommendationId={item.id} rankingVersion={item.rankingVersion} gameName={item.name} coverImageUrl={item.coverImageUrl} presentationOrigin={presentationOrigin} readOnly={readOnly} />}
     </div>
   </article>

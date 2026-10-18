@@ -4,10 +4,30 @@ import RecommendationCard, { releaseLabel } from './RecommendationCard'
 import type { Recommendation } from '../api/types'
 import { FeedbackWorkflowContext } from './FeedbackWorkflowContext'
 import type { PublicFeedbackWorkflowState } from './feedbackWorkflowMachine'
+import { reviewFixture } from '../test/overviewFixture'
 
 const item = { id: 'r', gameId: 'g', steamAppId: 480, name: 'Signal', coverImageUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/480/header.jpg', storeUrl: 'https://store.steampowered.com/app/480/', deckCompatibility: 'unknown', profileVersion: 1, rankingVersion: 1, algorithmVersion: 'v1', score: 80, confidence: .8, factors: {}, weights: {}, release: { precision: 'unknown' }, explanation: 'Почему', evidence: [], explanationSource: 'ai', generatedExplanation: true, latestFeedbackAction: null, latestFeedbackReasons: null, createdAt: '2026-10-17T00:00:00Z' } as Recommendation
 
 describe('RecommendationCard', () => {
+  it.each([false, true])('shows Steam reviews separately from personal match (compact: %s)', (compact) => {
+    render(<RecommendationCard item={{ ...item, reviews: reviewFixture }} compact={compact} />)
+    expect(screen.getByLabelText('Отзывы игроков в Steam: 91% положительных · 1 284 отзыва')).toHaveTextContent('91% положительных · 1 284 отзыва')
+    expect(screen.getByText(/совпадение/)).toBeInTheDocument()
+    expect(screen.queryByText(/отзывы.*(?:повысили|совпадение|персональн)/i)).not.toBeInTheDocument()
+  })
+
+  it('shows explicit unrated copy and omits unavailable reviews', () => {
+    const { rerender } = render(<RecommendationCard item={{ ...item, reviews: { ...reviewFixture, band: 'unrated', label: 'No user reviews', positivePercent: null, total: 0 } }} />)
+    expect(screen.getByText('Пока нет отзывов')).toBeInTheDocument()
+    rerender(<RecommendationCard item={{ ...item, release: { precision: 'coming_soon' } }} />)
+    expect(screen.queryByLabelText(/^Отзывы игроков в Steam:/)).not.toBeInTheDocument()
+  })
+
+  it.each([[1, '1 отзыв'], [2, '2 отзыва'], [5, '5 отзывов'], [11, '11 отзывов'], [21, '21 отзыв'], [112, '112 отзывов']])('uses the Russian review count form for %s', (total, label) => {
+    render(<RecommendationCard item={{ ...item, reviews: { ...reviewFixture, total: Number(total) } }} />)
+    expect(screen.getByText(`91% положительных · ${label}`)).toBeInTheDocument()
+  })
+
 	it('renders one inert sand surface and a fixed decorative particle layer without duplicate accessible controls during dislike exit', () => {
 		const workflow = {
 			stateFor: () => ({ phase: 'polling' as const, accepted: true, acceptedOrigin: null, diff: null, error: '', canRetry: false, busy: true, tombstoned: true, action: 'dislike' as const, likeEffectActive: true, likeEffectStartedAt: Date.now() - 320, likeEffectAnimationDelayMs: -320 }),

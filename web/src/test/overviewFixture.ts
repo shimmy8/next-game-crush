@@ -1,4 +1,8 @@
-import type { PreferenceProfileData, Recommendation, RecommendationOverview } from '../api/types'
+import type { PreferenceProfileData, Recommendation, RecommendationOverview, ReviewSummary } from '../api/types'
+
+export const reviewFixture: ReviewSummary = {
+  band: 'positive', label: 'Very Positive', positivePercent: 91, total: 1284, observedAt: '2026-10-18T03:14:15Z',
+}
 
 export function recommendation(id: string, wishlist = false): Recommendation {
   return {

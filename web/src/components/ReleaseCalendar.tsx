@@ -2,6 +2,7 @@ import type { Recommendation } from '../api/types'
 import { bucketRelease } from '../calendar/dateBuckets'
 import { CompactGameIdentity } from './CompactGameIdentity'
 import FeedbackLauncher from './FeedbackLauncher'
+import { reviewLabel } from '../ui/reviews'
 
 const WEEKDAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
 
@@ -35,7 +36,12 @@ export default function ReleaseCalendar({ month, items, feedbackEnabled = false 
           const label = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }).format(date).replace(' г.', '')
           return <td className="calendar-day" aria-label={label} key={key}>
             <span className="calendar-day__number">{day}</span>
-            {(byDate.get(key) ?? []).map((item) => <div className="calendar-event" key={item.id}><CompactGameIdentity item={item} size="grid" /><span>{Math.round(item.score)}%</span>{feedbackEnabled && <FeedbackLauncher item={item} gameId={item.gameId} recommendationId={item.id} rankingVersion={item.rankingVersion} gameName={item.name} coverImageUrl={item.coverImageUrl} presentationOrigin={{ surface: 'calendar', recommendationId: item.id }} />}</div>)}
+            {(byDate.get(key) ?? []).map((item) => {
+              const reviews = reviewLabel(item.reviews)
+              return <div className="calendar-event" key={item.id}><CompactGameIdentity item={item} size="grid" /><span>{Math.round(item.score)}%</span>
+                {reviews && <details className="calendar-reviews"><summary>Отзывы Steam</summary><p className="review-summary" role="note" aria-label={`Отзывы игроков в Steam: ${reviews}`}>{reviews}</p></details>}
+                {feedbackEnabled && <FeedbackLauncher item={item} gameId={item.gameId} recommendationId={item.id} rankingVersion={item.rankingVersion} gameName={item.name} coverImageUrl={item.coverImageUrl} presentationOrigin={{ surface: 'calendar', recommendationId: item.id }} />}</div>
+            })}
           </td>
         })}</tr>)}</tbody>
       </table>

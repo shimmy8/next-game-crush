@@ -1,5 +1,5 @@
 import { isEvidenceKind } from './types'
-import type { CurrentUser, DeckCompatibility, Evidence, ExplanationSource, PlatformSupport, PreflightResponse, Recommendation, RecommendationOverview } from './types'
+import type { CurrentUser, DeckCompatibility, Evidence, ExplanationSource, PlatformSupport, PreflightResponse, Recommendation, RecommendationOverview, ReviewSummary } from './types'
 
 export type { CurrentUser } from './types'
 
@@ -125,10 +125,31 @@ function normalizeLatestFeedbackReasons(value: unknown): string[] | null {
   return [...new Set(value)]
 }
 
+function normalizeReviews(value: unknown): ReviewSummary | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const { band, label, positivePercent, total, observedAt } = value as Record<string, unknown>
+  if (band !== 'positive' && band !== 'mixed_or_below' && band !== 'unrated') return undefined
+  if (typeof label !== 'string' || !label.trim() || [...label].length > 64 || /[<>]/.test(label)
+    || [...label].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) return undefined
+  if (typeof total !== 'number' || !Number.isSafeInteger(total) || total < 0) return undefined
+  if (band === 'unrated') {
+    if (total !== 0 || positivePercent !== null) return undefined
+  } else if (total === 0 || typeof positivePercent !== 'number' || !Number.isInteger(positivePercent) || positivePercent < 0 || positivePercent > 100) return undefined
+  if (typeof observedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(observedAt)
+    || !Number.isFinite(Date.parse(observedAt))) return undefined
+  // Date.parse rolls impossible month days forward; reject those rather than presenting a successful observation.
+  const date = observedAt.slice(0, 10)
+  if (new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date) return undefined
+  return { band, label: label.trim(), positivePercent: positivePercent as number | null, total, observedAt }
+}
+
 function normalizeRecommendation(item: Recommendation): Recommendation {
+  const { reviews: rawReviews, ...rest } = item
+  const reviews = normalizeReviews(rawReviews)
   const explanationSource = normalizeExplanationSource(item.explanationSource)
   return {
-    ...item,
+    ...rest,
+    ...(reviews ? { reviews } : {}),
     platforms: normalizePlatforms(item.platforms),
     deckCompatibility: normalizeDeckCompatibility(item.deckCompatibility),
     latestFeedbackAction: normalizeLatestFeedbackAction(item.latestFeedbackAction),

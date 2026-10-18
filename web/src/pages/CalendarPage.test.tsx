@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import CalendarPage from './CalendarPage'
 import type { CalendarResponse, Recommendation } from '../api/types'
+import { reviewFixture } from '../test/overviewFixture'
 
 const exact = {
   id: 'r-day', gameId: 'g-day', steamAppId: 480, name: 'Night Signal', storeUrl: 'https://store.steampowered.com/app/480/', profileVersion: 2, rankingVersion: 3,
@@ -43,6 +44,13 @@ const mixedCalendar = Object.fromEntries(releaseBuckets.map(([bucket, release]) 
 afterEach(() => vi.unstubAllGlobals())
 
 describe('CalendarPage', () => {
+  it('shows review summaries for exact list entries and imprecise release buckets', () => {
+    render(<CalendarPage calendar={{ ...calendar, exactDates: [{ ...exact, reviews: reviewFixture }], month: [{ ...calendar.month[0], reviews: reviewFixture }] }} month={new Date('2026-10-01T12:00:00Z')} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Список' }))
+    expect(within(screen.getByTestId('release-list')).getByText('91% положительных · 1 284 отзыва')).toBeInTheDocument()
+    expect(within(screen.getByTestId('release-bucket-month')).getByText('91% положительных · 1 284 отзыва')).toBeInTheDocument()
+  })
+
   it.each([
     ['month', 'Месяц', 'calendar-grid'],
     ['list', 'Список', 'release-list'],

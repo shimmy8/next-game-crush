@@ -103,6 +103,11 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .evidence summary { color: #dbd9e5; cursor: pointer; font-size: .83rem; font-weight: 650; }
 .evidence ul { color: var(--muted); padding-left: 18px; line-height: 1.55; font-size: .8rem; }
 .source-note { color: var(--quiet); font-size: .72rem; }
+.review-summary { margin: 8px 0; color: var(--muted); font-size: .76rem; line-height: 1.5; overflow-wrap: anywhere; }
+.calendar-reviews { color: var(--muted); }
+.calendar-reviews > summary { cursor: pointer; }
+.calendar-reviews .review-summary { font-size: inherit; }
+.compact-release-card__details .review-summary { margin: 0; }
 .reaction-row { display: flex; gap: 7px; margin-top: 18px; }
 .reaction-row button { border: 1px solid #3a4050; background: transparent; border-radius: 8px; padding: 8px 10px; font-size: .76rem; }
 .reaction-row button[aria-pressed="true"] { border-color: var(--violet); background: var(--violet-soft); }

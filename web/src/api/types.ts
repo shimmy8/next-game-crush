@@ -51,6 +51,14 @@ export type PlatformSupport = { windows: boolean; mac: boolean; linux: boolean }
 export type DeckCompatibility = 'verified' | 'playable' | 'unsupported' | 'unknown'
 export type DirectFeedbackAction = 'like' | 'dislike'
 
+export type ReviewSummary = {
+  band: 'positive' | 'mixed_or_below' | 'unrated'
+  label: string
+  positivePercent: number | null
+  total: number
+  observedAt: string
+}
+
 export type Recommendation = {
   id: string
   gameId: string
@@ -66,6 +74,7 @@ export type Recommendation = {
   score: number
   confidence: number
   wishlisted?: boolean
+  reviews?: ReviewSummary
   factors: RecommendationFactors
   weights: RecommendationWeights
   release: ReleaseWindow
