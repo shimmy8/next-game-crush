@@ -4,22 +4,81 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	if os.Getenv("TEST_HARNESS_MODE") != "1" {
+		return errors.New("e2e fake server requires TEST_HARNESS_MODE=1")
+	}
+	addr := os.Getenv("E2E_FAKE_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:18090"
+	}
+	return http.ListenAndServe(addr, newE2EFakeHandler(true))
+}
+
+type catalogFixtureState struct {
+	mu                 sync.Mutex
+	fixtureDay         time.Time
+	searchMode         string
+	reviewMode         string
+	searchRequests     map[string]int
+	appDetailsRequests map[int64]int
+	aiRequests         int
+	aiByApp            map[int64]int
+}
+
+func newCatalogFixtureState(now time.Time) *catalogFixtureState {
+	year, month, day := now.UTC().Date()
+	return &catalogFixtureState{
+		fixtureDay:         time.Date(year, month, day, 0, 0, 0, 0, time.UTC),
+		searchMode:         "healthy",
+		reviewMode:         "initial",
+		searchRequests:     make(map[string]int),
+		appDetailsRequests: make(map[int64]int),
+		aiByApp:            make(map[int64]int),
+	}
+}
+
+func (s *catalogFixtureState) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.searchMode = "healthy"
+	s.reviewMode = "initial"
+	s.searchRequests = make(map[string]int)
+	s.appDetailsRequests = make(map[int64]int)
+	s.aiRequests = 0
+	s.aiByApp = make(map[int64]int)
+}
+
+func newE2EFakeHandler(testHarness bool) http.Handler {
+	return newE2EFakeHandlerAt(testHarness, time.Now())
+}
+
+func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 	var steamPrivacy atomic.Int32
 	var wishlistMode atomic.Int32
 	var catalogMode atomic.Int32
 	var catalogRequests atomic.Int32
 	var explanationMode atomic.Int32
 	var achievementMode atomic.Int32
+	catalogFixture := newCatalogFixtureState(now)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	mux.HandleFunc("/__test/reset", func(w http.ResponseWriter, r *http.Request) {
@@ -33,7 +92,61 @@ func main() {
 		catalogRequests.Store(0)
 		explanationMode.Store(0)
 		achievementMode.Store(0)
+		catalogFixture.reset()
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/__test/search-mode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		mode := r.URL.Query().Get("mode")
+		switch mode {
+		case "healthy", "popular_parser_broken", "popular_rate_limited", "tail_rate_limited":
+		default:
+			http.Error(w, "unknown fixture mode", http.StatusBadRequest)
+			return
+		}
+		catalogFixture.mu.Lock()
+		catalogFixture.searchMode = mode
+		catalogFixture.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/__test/search-reviews", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		mode := r.URL.Query().Get("mode")
+		if mode != "initial" && mode != "changed" {
+			http.Error(w, "unknown fixture mode", http.StatusBadRequest)
+			return
+		}
+		catalogFixture.mu.Lock()
+		catalogFixture.reviewMode = mode
+		catalogFixture.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/__test/catalog-counters", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		catalogFixture.mu.Lock()
+		defer catalogFixture.mu.Unlock()
+		search := make(map[string]int, len(catalogFixture.searchRequests))
+		for feed, count := range catalogFixture.searchRequests {
+			search[feed] = count
+		}
+		appDetails := make(map[string]int, len(catalogFixture.appDetailsRequests))
+		for appID, count := range catalogFixture.appDetailsRequests {
+			appDetails[strconv.FormatInt(appID, 10)] = count
+		}
+		aiByApp := make(map[string]int, len(catalogFixture.aiByApp))
+		for appID, count := range catalogFixture.aiByApp {
+			aiByApp[strconv.FormatInt(appID, 10)] = count
+		}
+		writeJSON(w, map[string]any{"fixtureDate": catalogFixture.fixtureDay.Format(time.DateOnly), "search": search, "appdetails": appDetails, "ai": catalogFixture.aiRequests, "aiByApp": aiByApp})
 	})
 	mux.HandleFunc("/__test/openai-explanation-mode", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -242,11 +355,62 @@ func main() {
 		}
 		writeJSON(w, map[string]any{"response": map[string]any{"apps": apps, "last_appid": 424246, "have_more_results": true, "success": true}})
 	})
+	mux.HandleFunc("/search/results/", func(w http.ResponseWriter, r *http.Request) {
+		filter := r.URL.Query().Get("filter")
+		if r.URL.Query().Get("category1") != "998" || r.URL.Query().Get("ignore_preferences") != "1" || r.URL.Query().Get("infinite") != "1" {
+			http.Error(w, "invalid search fixture request", http.StatusBadRequest)
+			return
+		}
+		start, startErr := strconv.Atoi(r.URL.Query().Get("start"))
+		count, countErr := strconv.Atoi(r.URL.Query().Get("count"))
+		if startErr != nil || countErr != nil || start < 0 || count < 1 || count > 200 {
+			http.Error(w, "invalid search fixture pagination", http.StatusBadRequest)
+			return
+		}
+		catalogFixture.mu.Lock()
+		catalogFixture.searchRequests[filter]++
+		mode, reviewMode := catalogFixture.searchMode, catalogFixture.reviewMode
+		catalogFixture.mu.Unlock()
+		if filter == "popularcomingsoon" && mode == "popular_rate_limited" {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if (filter == "recent" || filter == "comingsoon") && mode == "tail_rate_limited" {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if filter == "popularcomingsoon" && mode == "popular_parser_broken" {
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(w, map[string]any{"success": 1, "start": start, "pagesize": count, "total_count": 1, "results_html": `<div class="fixture-layout-changed">parser must reject this</div>`})
+			return
+		}
+		items, ok := catalogSearchItems(filter, reviewMode, catalogFixture.fixtureDay)
+		if !ok {
+			http.Error(w, "unknown search feed", http.StatusBadRequest)
+			return
+		}
+		pageStart := start
+		if pageStart > len(items) {
+			pageStart = len(items)
+		}
+		end := min(pageStart+count, len(items))
+		var markup strings.Builder
+		for _, item := range items[pageStart:end] {
+			markup.WriteString(catalogSearchRow(item))
+		}
+		writeJSON(w, map[string]any{"success": 1, "start": start, "pagesize": end - pageStart, "total_count": len(items), "results_html": markup.String()})
+	})
 	mux.HandleFunc("/api/appdetails", func(w http.ResponseWriter, r *http.Request) {
 		id, _ := strconv.ParseInt(r.URL.Query().Get("appids"), 10, 64)
-		date := "Dec 12, 2026"
+		catalogFixture.mu.Lock()
+		catalogFixture.appDetailsRequests[id]++
+		catalogFixture.mu.Unlock()
+		fixtureDay := catalogFixture.fixtureDay
+		date := fixtureStoreDate(fixtureDay.AddDate(0, 0, 25))
 		if id%3 == 0 {
-			date = "December 2026"
+			date = fixtureStoreMonth(fixtureDay.AddDate(0, 0, 25))
 		}
 		gameType, comingSoon := "game", true
 		categories := []any{map[string]any{"id": 2, "description": "Single-player"}}
@@ -257,16 +421,36 @@ func main() {
 		case 11:
 			name, date, comingSoon = "Fixture Endless Realm", "Jan 1, 2021", false
 		case 424242:
-			name, date = "Fixture Discovered Co-op", "Nov 15, 2026"
+			name, date = "Fixture Discovered Co-op", fixtureStoreDate(fixtureDay.AddDate(0, 0, 28))
 			categories = []any{map[string]any{"id": 9, "description": "Co-op"}}
 		case 424243:
 			gameType = "dlc"
 		case 424244:
-			comingSoon, date = false, "Oct 1, 2026"
+			comingSoon, date = false, fixtureStoreDate(fixtureDay.AddDate(0, 0, -17))
 		case 424245:
 			gameType = "software"
 		case 424246:
-			date = "Dec 12, 2030"
+			date = fixtureStoreDate(fixtureDay.AddDate(4, 0, 0))
+		case 510001:
+			name, date = "Fixture Popular Upcoming", fixtureStoreDate(fixtureDay.AddDate(0, 0, 28))
+		case 510002:
+			name, date = "Fixture Popular Upcoming Tail", fixtureStoreMonth(fixtureDay.AddDate(0, 0, 29))
+		case 520001:
+			name, date, comingSoon = "Fixture Positive Released", fixtureStoreDate(fixtureDay.AddDate(0, 0, -6)), false
+		case 520002:
+			name, date, comingSoon = "Fixture Unrated Day Seven", fixtureStoreDate(fixtureDay.AddDate(0, 0, -7)), false
+		case 520003:
+			name, date, comingSoon = "Fixture Mixed Released", fixtureStoreDate(fixtureDay.AddDate(0, 0, -6)), false
+		case 520004:
+			name, date, comingSoon = "Fixture Unrated Day Eight", fixtureStoreDate(fixtureDay.AddDate(0, 0, -8)), false
+		case 530001:
+			name, date, comingSoon = "Fixture Recent Positive", fixtureStoreDate(fixtureDay.AddDate(0, 0, -1)), false
+		case 530002:
+			name, date, comingSoon = "Fixture Recent Tail", fixtureStoreDate(fixtureDay.AddDate(0, 0, -17)), false
+		case 540001:
+			name, date = "Fixture Coming Soon", fixtureStoreDate(fixtureDay.AddDate(0, 0, 2))
+		case 540002:
+			name, date = "Fixture Coming Soon Tail", fixtureStoreDate(fixtureDay.AddDate(0, 0, 29))
 		case 300001, 300002:
 			categories = []any{map[string]any{"id": 9, "description": "Co-op"}}
 		case 300003:
@@ -285,7 +469,22 @@ func main() {
 		}
 		writeJSON(w, map[string]any{"success": 1, "results": map[string]any{"resolved_category": (id / 10) % 4}})
 	})
-	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		catalogFixture.mu.Lock()
+		catalogFixture.aiRequests++
+		for _, input := range body.Input {
+			for appID, fixtureName := range fixtureCatalogNames() {
+				if strings.Contains(input, fixtureName) {
+					catalogFixture.aiByApp[appID]++
+					break
+				}
+			}
+		}
+		catalogFixture.mu.Unlock()
 		vector := make([]float64, 1536)
 		vector[0] = 1
 		writeJSON(w, map[string]any{"data": []any{map[string]any{"index": 0, "embedding": vector}}})
@@ -301,6 +500,16 @@ func main() {
 				name, _ = format["name"].(string)
 			}
 		}
+		catalogFixture.mu.Lock()
+		catalogFixture.aiRequests++
+		if name == "game_features_v1" {
+			if gameName, ok := input["name"].(string); ok {
+				if appID := fixtureCatalogAppID(gameName); appID != 0 {
+					catalogFixture.aiByApp[appID]++
+				}
+			}
+		}
+		catalogFixture.mu.Unlock()
 		var out any
 		switch name {
 		case "game_features_v1":
@@ -354,13 +563,86 @@ func main() {
 		encoded, _ := json.Marshal(out)
 		writeJSON(w, map[string]any{"status": "completed", "output": []any{map[string]any{"type": "message", "content": []any{map[string]any{"type": "output_text", "text": string(encoded)}}}}})
 	})
-	addr := os.Getenv("E2E_FAKE_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:18090"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/__test/") && !testHarness {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+type catalogSearchItem struct {
+	appID, name, release, review string
+}
+
+func catalogSearchItems(filter, reviewMode string, fixtureDay time.Time) ([]catalogSearchItem, bool) {
+	positive := `Very Positive&lt;br&gt;91% of the 1,284 user reviews for this game are positive.`
+	if reviewMode == "changed" {
+		positive = `Mixed&lt;br&gt;62% of the 1,500 user reviews for this game are positive.`
 	}
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		panic(err)
+	switch filter {
+	case "popularcomingsoon":
+		return []catalogSearchItem{
+			{"510001", "Fixture Popular Upcoming", fixtureSearchDate(fixtureDay.AddDate(0, 0, 28)), ""},
+			{"510002", "Fixture Popular Upcoming Tail", fixtureStoreMonth(fixtureDay.AddDate(0, 0, 29)), ""},
+		}, true
+	case "popularnew":
+		return []catalogSearchItem{
+			{"520001", "Fixture Positive Released", fixtureSearchDate(fixtureDay.AddDate(0, 0, -6)), positive},
+			{"520002", "Fixture Unrated Day Seven", fixtureSearchDate(fixtureDay.AddDate(0, 0, -7)), `No user reviews`},
+			{"520003", "Fixture Mixed Released", fixtureSearchDate(fixtureDay.AddDate(0, 0, -6)), `Mixed&lt;br&gt;55% of the 320 user reviews for this game are positive.`},
+			{"520004", "Fixture Unrated Day Eight", fixtureSearchDate(fixtureDay.AddDate(0, 0, -8)), `No user reviews`},
+		}, true
+	case "recent":
+		return []catalogSearchItem{
+			{"530001", "Fixture Recent Positive", fixtureSearchDate(fixtureDay.AddDate(0, 0, -1)), `Positive&lt;br&gt;88% of the 80 user reviews for this game are positive.`},
+			{"530002", "Fixture Recent Tail", fixtureSearchDate(fixtureDay.AddDate(0, 0, -17)), `Very Positive&lt;br&gt;92% of the 600 user reviews for this game are positive.`},
+		}, true
+	case "comingsoon":
+		return []catalogSearchItem{
+			{"540001", "Fixture Coming Soon", fixtureSearchDate(fixtureDay.AddDate(0, 0, 2)), ""},
+			{"540002", "Fixture Coming Soon Tail", fixtureSearchDate(fixtureDay.AddDate(0, 0, 29)), ""},
+		}, true
+	default:
+		return nil, false
 	}
+}
+
+func fixtureSearchDate(day time.Time) string { return day.Format("2 Jan, 2006") }
+func fixtureStoreDate(day time.Time) string  { return day.Format("Jan 2, 2006") }
+func fixtureStoreMonth(day time.Time) string { return day.Format("January 2006") }
+
+func fixtureCatalogAppID(name string) int64 {
+	for appID, fixtureName := range fixtureCatalogNames() {
+		if name == fixtureName {
+			return appID
+		}
+	}
+	return 0
+}
+
+func fixtureCatalogNames() map[int64]string {
+	return map[int64]string{
+		510001: "Fixture Popular Upcoming",
+		510002: "Fixture Popular Upcoming Tail",
+		520001: "Fixture Positive Released",
+		520002: "Fixture Unrated Day Seven",
+		520003: "Fixture Mixed Released",
+		520004: "Fixture Unrated Day Eight",
+		530001: "Fixture Recent Positive",
+		530002: "Fixture Recent Tail",
+		540001: "Fixture Coming Soon",
+		540002: "Fixture Coming Soon Tail",
+	}
+}
+
+func catalogSearchRow(item catalogSearchItem) string {
+	review := ""
+	if item.review != "" {
+		review = `<span class="search_review_summary" data-tooltip-html="` + item.review + `"></span>`
+	}
+	return `<a class="search_result_row" data-ds-appid="` + item.appID + `" href="https://store.steampowered.com/app/` + item.appID + `/"><span class="title">` + item.name + `</span><div class="search_released">` + item.release + `</div>` + review + `</a>`
 }
 
 func fixtureAchievementClass(apiName string) string {
