@@ -49,8 +49,12 @@ done
   fail 'Nginx example must contain exactly one server_name directive'
 assert_contains "$nginx_file" '^[[:space:]]*server_name[[:space:]]+nextgamecrush\.site;' \
   'Nginx example must name only nextgamecrush.site'
-assert_contains "$nginx_file" 'proxy_pass[[:space:]]+http://127\.0\.0\.1:8080;' \
+assert_contains "$nginx_file" 'proxy_pass[[:space:]]+http://127\.0\.0\.1:18080;' \
   'Nginx example must proxy to the loopback app port'
+assert_contains "$operations_guide" '127\.0\.0\.1:18080' \
+  'operations guide must use the production host port'
+assert_contains "$setup_guide" 'Do not add `18080`' \
+  'VPS guide must keep the production app port off the firewall'
 assert_contains "$nginx_file" 'proxy_set_header[[:space:]]+Host[[:space:]]+\$host;' \
   'Nginx example must forward Host'
 assert_contains "$nginx_file" 'proxy_set_header[[:space:]]+X-Real-IP[[:space:]]+\$remote_addr;' \

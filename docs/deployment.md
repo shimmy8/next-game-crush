@@ -160,7 +160,7 @@ the matching check below:
   a failed startup migration.
 - **Public health failed:** run `sudo nginx -t`, inspect the Nginx journal, and
   test the loopback endpoint on the VPS with
-  `curl --fail http://127.0.0.1:8080/api/health` before testing HTTPS again.
+  `curl --fail http://127.0.0.1:18080/api/health` before testing HTTPS again.
 
 Useful host checks:
 
@@ -169,12 +169,13 @@ df -h / /var/lib/docker /opt/next-game-crush
 sudo systemctl status docker nginx --no-pager
 sudo -iu ngc-deploy docker ps -a --filter label=com.docker.compose.project=next-game-crush
 sudo ss -lntp
-curl --fail --silent --show-error http://127.0.0.1:8080/api/health
+curl --fail --silent --show-error http://127.0.0.1:18080/api/health
 curl --fail --silent --show-error https://nextgamecrush.site/api/health
 ```
 
-Port `8080` must listen only on `127.0.0.1`; ports `5432`, `8025`, and `1025`
-must not be published on the host.
+The application host port `18080` must listen only on `127.0.0.1`. The
+container still listens on its internal port `8080`; ports `5432`, `8025`, and
+`1025` must not be published on the host.
 
 ## Manual database restore
 

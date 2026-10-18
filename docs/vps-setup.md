@@ -153,9 +153,10 @@ sudo ufw status verbose
 ```
 
 The resulting inbound rules should cover only ports `22`, `80`, and `443`
-(plus matching IPv6 rules when IPv6 is enabled). Do not add `8080`, `5432`,
-`8025`, or `1025`: the app binds to loopback and the other services have no
-host ports. Docker-published ports can bypass ordinary UFW policy, so this
+(plus matching IPv6 rules when IPv6 is enabled). Do not add `18080`, `8080`,
+`5432`, `8025`, or `1025`: the app binds to loopback, ISPmanager may reserve
+`8080` for Apache, and the other services have no host ports. Docker-published
+ports can bypass ordinary UFW policy, so this
 Compose topology—not an extra firewall rule—is what keeps PostgreSQL and
 Mailpit off the host network.
 
@@ -312,6 +313,10 @@ empty `location /` with the proxy settings from
 panel-managed includes, and separate HTTP-to-HTTPS redirect unchanged. Do not
 paste a second complete `server` block. There must be only one enabled HTTPS
 server block for this hostname.
+
+The example deliberately proxies to `127.0.0.1:18080`: ISPmanager's Apache
+backend commonly owns `127.0.0.1:8080`, while the application container keeps
+using `8080` only inside Docker.
 
 Validate the complete configuration before reloading:
 

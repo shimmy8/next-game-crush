@@ -37,7 +37,7 @@ Use GitHub Actions, GitHub Container Registry (GHCR), SSH, and Docker Compose:
 4. The deploy job connects to the VPS over SSH and deploys that exact image
    tag with the production Compose file.
 5. Nginx continues to terminate TLS and proxies the application to
-   `127.0.0.1:8080`.
+   `127.0.0.1:18080`, avoiding ISPmanager's Apache listener on `8080`.
 
 This is preferred over building source on the VPS because it produces an
 immutable, identifiable artifact and makes application rollback simple. A
@@ -69,7 +69,8 @@ point and is not repurposed for production.
 The production Compose project contains:
 
 - `app`: the GHCR image for one exact Git commit, bound only to
-  `127.0.0.1:8080` and configured with `restart: unless-stopped`.
+  `127.0.0.1:18080` on the host and port `8080` in the container, configured
+  with `restart: unless-stopped`.
 - `db`: the pinned PostgreSQL 16 plus pgvector image, reachable only on the
   internal Compose network and backed by a named volume.
 - `mailpit`: an internal SMTP sink required by the current application
@@ -191,7 +192,7 @@ acceptable for the single-user study deployment.
 ## 10. Nginx and Network Security
 
 The existing Nginx and TLS certificate remain in place. The site configuration
-proxies all paths for `nextgamecrush.site` to `http://127.0.0.1:8080` and sets
+proxies all paths for `nextgamecrush.site` to `http://127.0.0.1:18080` and sets
 the normal `Host`, client-address, and forwarded-protocol headers.
 
 The VPS firewall permits only SSH, HTTP, and HTTPS. Docker does not publish the

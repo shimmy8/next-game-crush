@@ -113,10 +113,10 @@ if len(ports) != 1:
 port = ports[0]
 if not (
     port.get("host_ip") == "127.0.0.1"
-    and str(port.get("published")) == "8080"
+    and str(port.get("published")) == "18080"
     and port.get("target") == 8080
 ):
-    fail("app must bind only 127.0.0.1:8080:8080")
+    fail("app must bind only 127.0.0.1:18080:8080")
 
 if db.get("ports"):
     fail("db must not publish host ports")
