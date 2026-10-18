@@ -1,0 +1,59 @@
+services:
+  app:
+    image: ${APP_IMAGE_REF:?APP_IMAGE_REF is required}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      APP_BASE_URL: ${APP_BASE_URL:?APP_BASE_URL is required}
+      HTTP_ADDR: ":8080"
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+      CATALOG_DISCOVERY_ENABLED: ${CATALOG_DISCOVERY_ENABLED:-0}
+      CATALOG_HORIZON_DAYS: ${CATALOG_HORIZON_DAYS:-90}
+      CATALOG_DISCOVERY_INTERVAL_HOURS: ${CATALOG_DISCOVERY_INTERVAL_HOURS:-1}
+      CATALOG_DISCOVERY_HOURLY_BUDGET: ${CATALOG_DISCOVERY_HOURLY_BUDGET:-200}
+      CATALOG_DISCOVERY_UNKNOWN_FRESHNESS_DAYS: ${CATALOG_DISCOVERY_UNKNOWN_FRESHNESS_DAYS:-180}
+      CATALOG_DISCOVERY_PAGE_SIZE: ${CATALOG_DISCOVERY_PAGE_SIZE:-100}
+      ALLOWED_STEAM_ID: ${ALLOWED_STEAM_ID:?ALLOWED_STEAM_ID is required}
+      STEAM_WEB_API_KEY: ${STEAM_WEB_API_KEY:?STEAM_WEB_API_KEY is required}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6-luna}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      SMTP_URL: ${SMTP_URL:?SMTP_URL is required}
+      EMAIL_ACTION_SECRET: ${EMAIL_ACTION_SECRET:?EMAIL_ACTION_SECRET is required}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      TEST_HARNESS_MODE: "0"
+    depends_on:
+      db:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    stop_grace_period: 15s
+
+  db:
+    image: pgvector/pgvector:0.8.7-pg16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
