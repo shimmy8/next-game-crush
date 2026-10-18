@@ -224,4 +224,27 @@ export type DiscoveryDiagnostics = {
   pendingQualifications: number
   reason?: string
 }
-export type DiagnosticsData = { status: string; components: Record<string, ComponentHealth>; catalogDiscovery?: DiscoveryDiagnostics; jobs: JobDiagnostic[] }
+export type SearchRunDiagnostic = { kind: 'scheduled' | 'manual' | 'initial' | 'reconciliation'; status: 'complete' | 'partial' | 'failed'; occurredAt: string; completedAt: string | null; reason?: string }
+export type SearchFeedDiagnostic = { status: string; pages: number; discovered: number; deduplicated: number; active: number; boundaryStop: boolean; safetyCap?: string; reason?: string }
+export type LaneDiagnostic = { queued: number; running: number; deferred: number; failed: number }
+export type BudgetDiagnostic = { used: number; remaining: number; limit: number }
+export type ThrottleDiagnostic = { concurrency: number; nextAt: string | null }
+export type SearchDiagnostics = {
+  status: 'ready' | 'backfilling' | 'stale' | 'unavailable' | 'disabled'
+  lastScheduledOccurrenceAt: string | null
+  lastCompleteRun: SearchRunDiagnostic | null
+  lastPartialRun: SearchRunDiagnostic | null
+  lastFailedRun: SearchRunDiagnostic | null
+  feeds: Record<'popular_upcoming' | 'popular_new' | 'recent' | 'coming_soon', SearchFeedDiagnostic>
+  lanes: { interactive: LaneDiagnostic; catalog: LaneDiagnostic }
+  budgets: { store: BudgetDiagnostic & { deferred: number }; ai: BudgetDiagnostic }
+  throttles: Record<'store' | 'steam_api' | 'openai', ThrottleDiagnostic>
+  admitted: { upcoming: number; released: number }
+  rejections: { reviewRejected: number; unratedGrace: number; outsideWindow: number; unavailable: number; failed: number }
+  cache: { metadataEntries: number; aiEntries: number }
+  due: { count: number; nextAt: string | null }
+  rebuild: { dirtyRevision: number; pendingWakeups: number }
+  lastReconciliationAt: string | null
+  freshAt: string | null
+}
+export type DiagnosticsData = { status: string; components: Record<string, ComponentHealth>; catalogDiscovery?: DiscoveryDiagnostics; catalogSearch?: SearchDiagnostics; jobs: JobDiagnostic[] }

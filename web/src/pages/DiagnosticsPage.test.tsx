@@ -97,3 +97,47 @@ test('keeps diagnostics unchanged when explanation aggregates are absent', async
   expect(await screen.findByText('Ошибок фоновых заданий нет.')).toBeInTheDocument()
   expect(screen.queryByText('Объяснения рекомендаций')).not.toBeInTheDocument()
 })
+
+test('shows fixed Steam Search aggregates without claiming cache hits or AI deferrals', async () => {
+  render(<DiagnosticsPage csrfToken="csrf" onDeleted={() => undefined} load={async () => ({
+    status: 'ready', components: {}, jobs: [], catalogSearch: {
+      status: 'ready', lastScheduledOccurrenceAt: '2026-10-19T00:00:00Z', lastCompleteRun: { kind: 'scheduled', status: 'complete', occurredAt: '2026-10-19T00:00:00Z', completedAt: '2026-10-19T00:15:00Z' }, lastPartialRun: { kind: 'manual', status: 'partial', occurredAt: '2026-10-18T12:00:00Z', completedAt: '2026-10-18T12:15:00Z' }, lastFailedRun: { kind: 'initial', status: 'failed', occurredAt: '2026-10-17T12:00:00Z', completedAt: '2026-10-17T12:01:00Z' },
+      feeds: {
+        popular_upcoming: { status: 'complete', pages: 2, discovered: 10, deduplicated: 8, active: 7, boundaryStop: false },
+        popular_new: { status: 'complete', pages: 1, discovered: 7, deduplicated: 6, active: 5, boundaryStop: false },
+        recent: { status: 'complete', pages: 3, discovered: 15, deduplicated: 12, active: 10, boundaryStop: true },
+        coming_soon: { status: 'partial', pages: 4, discovered: 20, deduplicated: 18, active: 14, boundaryStop: true, safetyCap: 'page_limit' },
+      },
+      lanes: { interactive: { queued: 1, running: 1, deferred: 0, failed: 0 }, catalog: { queued: 5, running: 2, deferred: 3, failed: 0 } },
+      budgets: { store: { used: 42, remaining: 958, limit: 1000, deferred: 3 }, ai: { used: 7, remaining: 93, limit: 100 } },
+      throttles: { store: { concurrency: 4, nextAt: null }, steam_api: { concurrency: 4, nextAt: null }, openai: { concurrency: 2, nextAt: null } },
+      admitted: { upcoming: 11, released: 9 }, rejections: { reviewRejected: 4, unratedGrace: 2, outsideWindow: 5, unavailable: 1, failed: 0 },
+      cache: { metadataEntries: 31, aiEntries: 17 }, due: { count: 6, nextAt: '2026-10-19T13:00:00Z' }, rebuild: { dirtyRevision: 3, pendingWakeups: 1 },
+      lastReconciliationAt: '2026-10-18T04:00:00Z', freshAt: '2026-10-19T11:00:00Z',
+    },
+  })} loadAdjustments={vi.fn().mockResolvedValue([])} />)
+  expect(await screen.findByText('Поиск релизов Steam')).toBeInTheDocument()
+  expect(screen.getByText('Поиск релизов обновлён')).toBeInTheDocument()
+  expect(screen.getByText(/плановое обновление/)).toBeInTheDocument()
+  expect(screen.getByText(/ручное обновление/)).toBeInTheDocument()
+  expect(screen.getByText(/начальное наполнение/)).toBeInTheDocument()
+  expect(screen.getByText('Последняя сверка со Steam')).toBeInTheDocument()
+  expect(screen.getByText('42 из 1000 · осталось 958 · отложено 3')).toBeInTheDocument()
+  expect(screen.getByText('7 из 100 · осталось 93')).toBeInTheDocument()
+  expect(screen.getByText('завершена · 2 стр. · 10 найдено · 8 уникальных · 7 активных')).toBeInTheDocument()
+  expect(screen.getByText(/завершена частично.*достигнут лимит страниц/)).toBeInTheDocument()
+  expect(screen.getByText('31')).toBeInTheDocument()
+  expect(screen.getByText('17')).toBeInTheDocument()
+  expect(screen.queryByText(/попадани[йя] в кэш/i)).not.toBeInTheDocument()
+  expect(screen.queryByText(/AI.*отлож/i)).not.toBeInTheDocument()
+  expect(screen.getByText('Steam недоступен')).toBeInTheDocument()
+  expect(screen.getByText('Ошибки обработки')).toBeInTheDocument()
+  expect(screen.getByText('Ограничение запросов')).toBeInTheDocument()
+  expect(screen.getAllByText(/4 одновременно/)).toHaveLength(2)
+  expect(screen.getByText('Ревизия пересборки')).toBeInTheDocument()
+  expect(screen.getByText('Ожидают пересборки')).toBeInTheDocument()
+  expect(screen.queryByText('popular_upcoming')).not.toBeInTheDocument()
+  expect(screen.queryByText('store.steampowered.com')).not.toBeInTheDocument()
+  expect(screen.queryByText('scheduled')).not.toBeInTheDocument()
+  expect(screen.queryByText('page_limit')).not.toBeInTheDocument()
+})

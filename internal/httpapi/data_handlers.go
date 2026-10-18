@@ -29,6 +29,7 @@ type HealthReport struct {
 	Components       map[string]ComponentHealth    `json:"components"`
 	DemoEnabled      bool                          `json:"demoEnabled"`
 	CatalogDiscovery *catalog.DiscoveryDiagnostics `json:"catalogDiscovery,omitempty"`
+	CatalogSearch    *catalog.SearchDiagnostics    `json:"catalogSearch,omitempty"`
 }
 
 type JobDiagnostic struct {
@@ -68,6 +69,10 @@ type DataService interface {
 	Health(context.Context) HealthReport
 }
 
+type CatalogSearchDiagnosticsReader interface {
+	Diagnostics(context.Context) (catalog.SearchDiagnostics, error)
+}
+
 type SQLDataService struct {
 	store          *store.Store
 	aiEnabled      bool
@@ -76,6 +81,11 @@ type SQLDataService struct {
 	discovery      interface {
 		Diagnostics(context.Context) (catalog.DiscoveryDiagnostics, error)
 	}
+	searchDiagnostics CatalogSearchDiagnosticsReader
+}
+
+func (s *SQLDataService) SetSearchDiagnosticsReader(reader CatalogSearchDiagnosticsReader) {
+	s.searchDiagnostics = reader
 }
 
 func (s *SQLDataService) SetDiscoveryDiagnosticsReader(reader interface {
@@ -258,6 +268,14 @@ func (s *SQLDataService) Health(ctx context.Context) HealthReport {
 			diagnostics = catalog.DiscoveryDiagnostics{PresentationStatus: catalog.PresentationStatus{Status: "degraded"}, ActiveBySource: map[string]int64{}, Reason: "diagnostics_unavailable"}
 		}
 		result.CatalogDiscovery = &diagnostics
+	}
+	if s.searchDiagnostics != nil {
+		diagnostics, err := s.searchDiagnostics.Diagnostics(ctx)
+		if err != nil {
+			result.Status = "degraded"
+			diagnostics = catalog.UnavailableSearchDiagnostics()
+		}
+		result.CatalogSearch = &diagnostics
 	}
 	var steamFresh, aiFresh, emailFresh *time.Time
 	steamErr := s.store.Pool.QueryRow(ctx, `SELECT max(last_successful_fetch_at) FROM user_source_states`).Scan(&steamFresh)

@@ -13,7 +13,24 @@ it('normalizes absent catalog diagnostics from older health responses', async ()
       latestRun: { discovered: 0, evaluated: 0, admitted: 0, skipped: 0, failed: 0 },
       pendingQualifications: 0,
     },
+    catalogSearch: { status: 'disabled', feeds: { popular_upcoming: { pages: 0 } }, budgets: { store: { deferred: 0 } } },
   })
+})
+
+it('normalizes malformed partial Search diagnostics to a complete safe shape', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(url === '/api/jobs' ? [] : {
+    status: 'degraded', components: {}, catalogSearch: {
+      status: 'private-provider-status', feeds: { popular_upcoming: { pages: -4, active: 2 } },
+      budgets: { store: { used: 7, deferred: 'secret' } }, lanes: null, throttles: { store: { concurrency: 3, nextAt: 'not-a-date' } },
+      admitted: { upcoming: 5 }, rejections: { unavailable: 2 }, due: {}, rebuild: {},
+    },
+  }))))
+  await expect(getDiagnostics()).resolves.toMatchObject({ catalogSearch: {
+    status: 'unavailable', feeds: { popular_upcoming: { pages: 0, active: 2 }, popular_new: { pages: 0 }, recent: { pages: 0 }, coming_soon: { pages: 0 } },
+    lanes: { interactive: { queued: 0 }, catalog: { deferred: 0 } }, budgets: { store: { used: 7, deferred: 0 }, ai: { remaining: 0 } },
+    throttles: { store: { concurrency: 3, nextAt: null }, steam_api: { concurrency: 0 }, openai: { concurrency: 0 } },
+    admitted: { upcoming: 5, released: 0 }, rejections: { unavailable: 2, failed: 0 }, due: { count: 0 }, rebuild: { dirtyRevision: 0 },
+  } })
 })
 
 describe('preference adjustments', () => {

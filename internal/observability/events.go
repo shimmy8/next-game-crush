@@ -129,6 +129,23 @@ type CatalogDiscoveryEvent struct {
 	Reason       Reason
 }
 
+// CatalogSearchEvent records only bounded workflow aggregates. Candidate
+// identifiers and upstream content deliberately have no representation here.
+type CatalogSearchEvent struct {
+	Correlation  Correlation
+	Lane         string
+	Feed         string
+	Stage        string
+	Pages        int
+	Discovered   int
+	Deduplicated int
+	Admitted     int
+	Rejected     int
+	Deferred     int
+	Duration     time.Duration
+	Reason       Reason
+}
+
 type Logger struct {
 	logger *slog.Logger
 }
@@ -296,6 +313,35 @@ func (l *Logger) CatalogDiscovery(ctx context.Context, event CatalogDiscoveryEve
 	l.logger.LogAttrs(safeContext(ctx), level, "catalog discovery", attrs...)
 }
 
+func (l *Logger) CatalogSearch(ctx context.Context, event CatalogSearchEvent) {
+	if l == nil || l.logger == nil {
+		return
+	}
+	stage := allow(event.Stage, catalogSearchStages)
+	level := slog.LevelInfo
+	if reason := safeReason(event.Reason); reason != "" {
+		level = slog.LevelWarn
+	}
+	attrs := []slog.Attr{
+		slog.String("event", "catalog_search"),
+		slog.String("stage", stage),
+		slog.String("lane", allow(event.Lane, values("catalog"))),
+		slog.String("feed", allow(event.Feed, catalogSearchFeeds)),
+		slog.Int("pages", nonnegative(event.Pages)),
+		slog.Int("discovered", nonnegative(event.Discovered)),
+		slog.Int("deduplicated", nonnegative(event.Deduplicated)),
+		slog.Int("admitted", nonnegative(event.Admitted)),
+		slog.Int("rejected", nonnegative(event.Rejected)),
+		slog.Int("deferred", nonnegative(event.Deferred)),
+		durationAttr("duration_ms", event.Duration),
+	}
+	attrs = appendCorrelation(attrs, event.Correlation)
+	if reason := safeReason(event.Reason); reason != "" {
+		attrs = append(attrs, slog.String("reason", reason))
+	}
+	l.logger.LogAttrs(safeContext(ctx), level, "catalog search", attrs...)
+}
+
 func appendCorrelation(attrs []slog.Attr, correlation Correlation) []slog.Attr {
 	if correlation.WorkflowID != uuid.Nil {
 		attrs = append(attrs, slog.String("workflow_id", correlation.WorkflowID.String()))
@@ -363,9 +409,11 @@ var jobStages = values("started", "heartbeat", "deferred", "succeeded", "retry_s
 var sourceStages = values("started", "finished")
 var workerStages = values("started", "stopped", "claim_failed", "completion_failed", "failure_record_failed", "renewal_failed")
 var reasons = values("timeout", "rate_limited", "upstream_unavailable", "upstream_rejected", "malformed_response", "invalid_evidence", "invalid_output", "lease_lost", "persistence_failed", "internal_error")
-var jobKinds = values("steam.sync", "catalog.refresh", "catalog.refresh_game", "catalog.discovery.tick", "catalog.discover.incremental", "catalog.discover.backfill", "catalog.qualify", "catalog.rebuild_wakeup", "achievements.sync", "achievement.classify", "completion.project", "ai.features", "ai.embedding", "ai.profile_summary", "profile.rebuild", "recommendations.rebuild", "feedback.classify", "notifications.digest.send")
-var logicalStages = values("steam", "catalog", "catalog_discovery_tick", "catalog_discovery", "catalog_qualify", "achievements", "achievement_classification", "completion_projection", "ai_features", "ai_embedding", "profile_summary", "profile", "recommendations", "feedback", "digest")
+var jobKinds = values("steam.sync", "catalog.refresh", "catalog.refresh_game", "catalog.discovery.tick", "catalog.discover.incremental", "catalog.discover.backfill", "catalog.qualify", "catalog.rebuild_wakeup", "catalog.search.run", "catalog.search.page", "catalog.search.qualify", "catalog.deck_refresh", "achievements.sync", "achievement.classify", "completion.project", "ai.features", "ai.embedding", "ai.profile_summary", "profile.rebuild", "recommendations.rebuild", "feedback.classify", "notifications.digest.send")
+var logicalStages = values("steam", "catalog", "catalog_discovery_tick", "catalog_discovery", "catalog_qualify", "catalog_search_run", "catalog_search_page", "catalog_search_qualify", "catalog_deck_refresh", "achievements", "achievement_classification", "completion_projection", "ai_features", "ai_embedding", "profile_summary", "profile", "recommendations", "feedback", "digest")
 var sources = values("owned_games", "recently_played", "wishlist", "achievements")
 var availabilities = values("available", "unavailable", "request_failed", "not_modified")
 var discoverySources = values("steam")
 var discoveryModes = values("incremental", "backfill")
+var catalogSearchStages = values("scheduled", "scan", "qualify", "reconciliation", "rebuild")
+var catalogSearchFeeds = values("popular_upcoming", "popular_new", "recent", "coming_soon", "reconciliation")

@@ -239,6 +239,79 @@ export function sendTestDigest(csrfToken: string, signal?: AbortSignal) {
   })
 }
 
+const searchFeeds = ['popular_upcoming', 'popular_new', 'recent', 'coming_soon'] as const
+const throttleNames = ['store', 'steam_api', 'openai'] as const
+
+function safeDiagnosticCount(value: unknown): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0
+}
+
+function safeDiagnosticTime(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' && Number.isFinite(Date.parse(value)) ? value : null
+}
+
+function diagnosticObject(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function normalizeSearchDiagnostics(value: unknown, present: boolean): import('./types').SearchDiagnostics {
+  const raw = diagnosticObject(value)
+  const statuses = new Set(['ready', 'backfilling', 'stale', 'unavailable', 'disabled'])
+  const status = typeof raw.status === 'string' && statuses.has(raw.status) ? raw.status as import('./types').SearchDiagnostics['status'] : present ? 'unavailable' : 'disabled'
+  const rawFeeds = diagnosticObject(raw.feeds)
+  const feeds = Object.fromEntries(searchFeeds.map((feed) => {
+    const item = diagnosticObject(rawFeeds[feed])
+    const feedStatus = item.status === 'complete' || item.status === 'partial' || item.status === 'failed' || item.status === 'running' || item.status === 'queued' ? item.status : 'queued'
+    const safetyCap = item.safetyCap === 'page_limit' || item.safetyCap === 'new_app_limit' ? item.safetyCap : undefined
+    return [feed, {
+      status: feedStatus,
+      pages: safeDiagnosticCount(item.pages), discovered: safeDiagnosticCount(item.discovered), deduplicated: safeDiagnosticCount(item.deduplicated), active: safeDiagnosticCount(item.active),
+      boundaryStop: item.boundaryStop === true,
+      ...(safetyCap ? { safetyCap } : {}),
+    }]
+  })) as import('./types').SearchDiagnostics['feeds']
+  const rawLanes = diagnosticObject(raw.lanes)
+  const lane = (name: 'interactive' | 'catalog') => {
+    const item = diagnosticObject(rawLanes[name])
+    return { queued: safeDiagnosticCount(item.queued), running: safeDiagnosticCount(item.running), deferred: safeDiagnosticCount(item.deferred), failed: safeDiagnosticCount(item.failed) }
+  }
+  const rawBudgets = diagnosticObject(raw.budgets)
+  const budget = (name: 'store' | 'ai') => {
+    const item = diagnosticObject(rawBudgets[name])
+    return { used: safeDiagnosticCount(item.used), remaining: safeDiagnosticCount(item.remaining), limit: safeDiagnosticCount(item.limit) }
+  }
+  const rawThrottles = diagnosticObject(raw.throttles)
+  const throttles = Object.fromEntries(throttleNames.map((name) => {
+    const item = diagnosticObject(rawThrottles[name])
+    return [name, { concurrency: safeDiagnosticCount(item.concurrency), nextAt: safeDiagnosticTime(item.nextAt) }]
+  })) as import('./types').SearchDiagnostics['throttles']
+  const admitted = diagnosticObject(raw.admitted)
+  const rejected = diagnosticObject(raw.rejections)
+  const cache = diagnosticObject(raw.cache)
+  const due = diagnosticObject(raw.due)
+  const rebuild = diagnosticObject(raw.rebuild)
+  const store = diagnosticObject(rawBudgets.store)
+  const normalizeRun = (value: unknown): import('./types').SearchRunDiagnostic | null => {
+    const item = diagnosticObject(value)
+    if ((item.kind !== 'scheduled' && item.kind !== 'manual' && item.kind !== 'initial')
+      || (item.status !== 'complete' && item.status !== 'partial' && item.status !== 'failed')
+      || !safeDiagnosticTime(item.occurredAt)) return null
+    return { kind: item.kind, status: item.status, occurredAt: item.occurredAt as string, completedAt: safeDiagnosticTime(item.completedAt) }
+  }
+  return {
+    status, lastScheduledOccurrenceAt: safeDiagnosticTime(raw.lastScheduledOccurrenceAt),
+    lastCompleteRun: normalizeRun(raw.lastCompleteRun), lastPartialRun: normalizeRun(raw.lastPartialRun), lastFailedRun: normalizeRun(raw.lastFailedRun),
+    feeds, lanes: { interactive: lane('interactive'), catalog: lane('catalog') },
+    budgets: { store: { ...budget('store'), deferred: safeDiagnosticCount(store.deferred) }, ai: budget('ai') }, throttles,
+    admitted: { upcoming: safeDiagnosticCount(admitted.upcoming), released: safeDiagnosticCount(admitted.released) },
+    rejections: { reviewRejected: safeDiagnosticCount(rejected.reviewRejected), unratedGrace: safeDiagnosticCount(rejected.unratedGrace), outsideWindow: safeDiagnosticCount(rejected.outsideWindow), unavailable: safeDiagnosticCount(rejected.unavailable), failed: safeDiagnosticCount(rejected.failed) },
+    cache: { metadataEntries: safeDiagnosticCount(cache.metadataEntries), aiEntries: safeDiagnosticCount(cache.aiEntries) },
+    due: { count: safeDiagnosticCount(due.count), nextAt: safeDiagnosticTime(due.nextAt) },
+    rebuild: { dirtyRevision: safeDiagnosticCount(rebuild.dirtyRevision), pendingWakeups: safeDiagnosticCount(rebuild.pendingWakeups) },
+    lastReconciliationAt: safeDiagnosticTime(raw.lastReconciliationAt), freshAt: safeDiagnosticTime(raw.freshAt),
+  }
+}
+
 export async function getDiagnostics(signal?: AbortSignal): Promise<import('./types').DiagnosticsData> {
   const [health, jobs] = await Promise.all([
     requestJSON<Omit<import('./types').DiagnosticsData, 'jobs'>>('/api/health', { signal }),
@@ -251,6 +324,7 @@ export async function getDiagnostics(signal?: AbortSignal): Promise<import('./ty
       backfillCursor: 0, latestRun: { discovered: 0, evaluated: 0, admitted: 0, skipped: 0, failed: 0 },
       activeBySource: {}, pendingQualifications: 0, reason: 'disabled',
     },
+    catalogSearch: normalizeSearchDiagnostics(health.catalogSearch, Object.prototype.hasOwnProperty.call(health, 'catalogSearch')),
     jobs,
   }
 }

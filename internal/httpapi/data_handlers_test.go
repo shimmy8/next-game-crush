@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,7 +12,17 @@ import (
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/auth"
+	"next-game-crush/internal/catalog"
 )
+
+type fakeSearchDiagnosticsReader struct {
+	value catalog.SearchDiagnostics
+	err   error
+}
+
+func (f fakeSearchDiagnosticsReader) Diagnostics(context.Context) (catalog.SearchDiagnostics, error) {
+	return f.value, f.err
+}
 
 type fakeDataService struct {
 	deleted uuid.UUID
@@ -102,5 +113,63 @@ func TestExpandedHealthReportsComponentsAndFreshness(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"database"`) || !strings.Contains(recorder.Body.String(), `"checkedAt"`) {
 		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestDiagnosticsExposeAggregateSearchStateOnly(t *testing.T) {
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	service := NewSQLDataService(nil, false, false)
+	service.SetSearchDiagnosticsReader(fakeSearchDiagnosticsReader{value: catalog.SearchDiagnostics{
+		Status:    catalog.SearchDiagnosticsReady,
+		Feeds:     map[string]catalog.SearchFeedDiagnostic{"popular_upcoming": {Status: "complete", Pages: 2, Discovered: 8, Deduplicated: 7}},
+		Lanes:     catalog.SearchLaneDiagnostics{Catalog: catalog.LaneDiagnostic{Queued: 3}},
+		Budgets:   catalog.SearchBudgetDiagnostics{Store: catalog.StoreBudgetDiagnostic{BudgetDiagnostic: catalog.BudgetDiagnostic{Used: 9, Remaining: 991, Limit: 1000}}},
+		Throttles: map[string]catalog.ThrottleDiagnostic{"store": {Concurrency: 4}},
+		FreshAt:   &now,
+	}})
+	// Health normally also reads component freshness. Use a fake DataService at
+	// the HTTP boundary to pin the additive, privacy-safe JSON contract.
+	report := HealthReport{Status: "ok", Components: map[string]ComponentHealth{}, CatalogSearch: func() *catalog.SearchDiagnostics {
+		value, err := service.searchDiagnostics.Diagnostics(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &value
+	}()}
+	recorder := httptest.NewRecorder()
+	NewRouter(Dependencies{Data: &fakeDataService{health: report}}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{`"catalogSearch"`, `"popular_upcoming"`, `"remaining":991`, `"concurrency":4`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %s: %s", want, body)
+		}
+	}
+	for _, forbidden := range []string{"steamAppId", "appId", "payload", "rawBody", "gameName"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("leaked %q: %s", forbidden, body)
+		}
+	}
+}
+
+func TestSearchDiagnosticsFailureReturnsCompleteSafeFallback(t *testing.T) {
+	db := openHTTPTestStore(t)
+	service := NewSQLDataService(db, false, false)
+	service.SetSearchDiagnosticsReader(fakeSearchDiagnosticsReader{err: errors.New("database detail that must not escape")})
+	report := service.Health(context.Background())
+	if report.Status != "degraded" || report.CatalogSearch == nil || report.CatalogSearch.Status != catalog.SearchDiagnosticsUnavailable {
+		t.Fatalf("report=%+v", report)
+	}
+	if len(report.CatalogSearch.Feeds) != len(catalog.SearchDiagnosticFeeds) || len(report.CatalogSearch.Throttles) != 3 {
+		t.Fatalf("incomplete fallback=%+v", report.CatalogSearch)
+	}
+	encoded, err := json.Marshal(report.CatalogSearch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "database detail") || !strings.Contains(string(encoded), `"budgets"`) || !strings.Contains(string(encoded), `"lanes"`) {
+		t.Fatalf("unsafe fallback=%s", encoded)
 	}
 }

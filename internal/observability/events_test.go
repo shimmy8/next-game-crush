@@ -187,7 +187,7 @@ func TestNilLoggerAndNilSinkDoNotPanic(t *testing.T) {
 }
 
 func TestPublicEventsCannotCarryRawErrorsPayloadsOrAttributes(t *testing.T) {
-	for _, value := range []any{SyncRequestEvent{}, JobAttemptEvent{}, SyncSourceEvent{}, WorkerEvent{}, CatalogDiscoveryEvent{}} {
+	for _, value := range []any{SyncRequestEvent{}, JobAttemptEvent{}, SyncSourceEvent{}, WorkerEvent{}, CatalogDiscoveryEvent{}, CatalogSearchEvent{}} {
 		typeOf := reflect.TypeOf(value)
 		for i := 0; i < typeOf.NumField(); i++ {
 			field := typeOf.Field(i)
@@ -196,6 +196,32 @@ func TestPublicEventsCannotCarryRawErrorsPayloadsOrAttributes(t *testing.T) {
 				t.Fatalf("%s exposes unsafe field %s", typeOf.Name(), field.Name)
 			}
 		}
+	}
+}
+
+func TestCatalogSearchLogsOnlyAllowlistedAggregates(t *testing.T) {
+	var output bytes.Buffer
+	logger := New(slog.New(slog.NewJSONHandler(&output, nil)))
+	logger.CatalogSearch(context.Background(), CatalogSearchEvent{
+		Lane: "catalog", Feed: "reconciliation", Stage: "reconciliation",
+		Pages: 2, Discovered: 9, Deduplicated: 7, Admitted: 4, Rejected: 3, Deferred: 1,
+	})
+	event := decodeEvents(t, output.String())[0]
+	for key, want := range map[string]any{"event": "catalog_search", "feed": "reconciliation", "stage": "reconciliation", "lane": "catalog", "deduplicated": float64(7)} {
+		if event[key] != want {
+			t.Fatalf("%s=%v want %v: %#v", key, event[key], want, event)
+		}
+	}
+	for _, forbidden := range []string{"app_id", "name", "payload", "raw_body"} {
+		if _, ok := event[forbidden]; ok {
+			t.Fatalf("unsafe attribute %q: %#v", forbidden, event)
+		}
+	}
+	output.Reset()
+	logger.CatalogSearch(context.Background(), CatalogSearchEvent{Lane: "interactive", Feed: "private-app", Stage: "raw-body"})
+	event = decodeEvents(t, output.String())[0]
+	if event["lane"] != "unknown" || event["feed"] != "unknown" || event["stage"] != "unknown" {
+		t.Fatalf("unallowlisted values escaped: %#v", event)
 	}
 }
 
