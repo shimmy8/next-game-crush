@@ -81,7 +81,7 @@ This document supersedes the following decisions in
 | Only unreleased games can enter the shared catalog. | Exact and suitably precise releases from the inclusive `-30/+30` window can enter; released games also pass the review gate. |
 | Default horizon is 90 future days. | Default exact-date window is 30 days back and 30 days forward. |
 | Incremental scan runs hourly and backfill uses 200 unique qualifications per hour. | A cron-configured daily search scan drives ingestion; Store metadata defaults to 1,000 calls/hour and catalog AI to 100 calls/hour. |
-| Backfill walks the complete game-only App List. | Search stops at the release-window boundary and safety caps; reconciliation may walk App List slowly but cannot delay priority feeds. |
+| Backfill walks the complete game-only App List. | Monotonic-validated `recent`/`comingsoon` feeds may stop at the release-window boundary; popular feeds require natural end for authority, and all feeds retain safety caps. Reconciliation may walk App List slowly but cannot delay priority feeds. |
 | Unknown/Coming Soon candidates use a 180-day App List modification freshness rule. | Year, Coming Soon, and unknown candidates require current Popular Upcoming or wishlist provenance and use their own refresh policy. |
 | One priority-ordered worker pool handles all jobs. | Interactive and catalog workers claim only their own durable queue lane. |
 
@@ -114,8 +114,17 @@ The catalog adapter reads four non-personal Steam Store search surfaces:
 1. **Popular Upcoming** — highest-priority upcoming candidates;
 2. **Popular New Releases** (`popularnew`) — highest-priority released
    candidates and the only source of the no-review grace exception;
-3. **Recent releases** (`recent`), ordered from newest to oldest;
-4. **Coming soon** (`comingsoon`), ordered from nearest release to furthest.
+3. **Recent releases** (`recent`), requested with newest-to-oldest release
+   ordering;
+4. **Coming soon** (`comingsoon`), requested with nearest-to-furthest release
+   ordering.
+
+Release-boundary termination is allowed only for `recent` and `comingsoon`,
+and only after the adapter has validated monotonic release ordering across all
+committed pages in that run. Popular Upcoming and Popular New are popularity-
+ordered surfaces: their dates may be out of order, so they must reach their
+natural end to become authoritative. A popular feed that hits a safety cap,
+fails, or stops early is `partial` and cannot publish Popular-only membership.
 
 The adapter requests a fixed locale and country (`l=english`, `cc=us`), ignores
 account preferences where the Store surface supports it, and sends no browser
@@ -276,12 +285,15 @@ Mixed-or-below candidates, released unrated candidates without a valid
 Popular-New grace, unchanged candidates within TTL, and unchanged exclusion
 tombstones.
 
-The ordinary `recent` and `comingsoon` scans page only until their stable
-release ordering has crossed the configured boundary. Every run also has a
-validated maximum page count and maximum new-AppID count; reaching a safety cap
-marks the run `partial` rather than `complete`. Popular feeds are processed
-first even when a safety cap prevents reaching the long tail. These caps are
-operational guards, not a claim that Steam honors an exact page-size contract.
+The ordinary `recent` and `comingsoon` scans may stop after their validated
+monotonic release ordering crosses the configured boundary. A regression,
+unparseable ordering key, or out-of-order item disables boundary termination
+for that feed run; it must continue to natural end or become `partial` at a
+safety cap. Every run also has a validated maximum page count and maximum
+new-AppID count; reaching a safety cap marks the run `partial` rather than
+`complete`. Popular feeds are processed first even when a safety cap prevents
+reaching the long tail. These caps are operational guards, not a claim that
+Steam honors an exact page-size contract.
 
 ## 7. Scheduling and process architecture
 
@@ -398,8 +410,8 @@ persists its normalized observations, next cursor, counts, and worklist changes
 before it completes. A crash can replay the page.
 
 Popular feeds run first. Their page observations remain provisional until that
-individual feed reaches its natural end or release boundary without exhausting
-a safety cap. Each committed popular page may immediately enqueue candidates
+individual feed reaches its natural end without exhausting a safety cap. Each
+committed popular page may immediately enqueue candidates
 that qualify without popularity: exact/month/quarter upcoming entries and
 positive reviewed releases. Feed completion atomically makes membership
 authoritative and then enqueues candidates that depend on the Popular Upcoming
@@ -411,10 +423,38 @@ also enqueue explicitly dated/reviewed candidates immediately. This allows
 popular work to qualify before the ordinary long tail finishes without
 treating an incomplete popular feed as complete.
 
-A run is `complete` only after every configured feed reached its release
-boundary or natural end and all page manifests were persisted. Safety-cap
-exhaustion is `partial`; a parse, transport, or persistence error is `failed`
-or `degraded` under the retry policy below.
+A run is `complete` only after both popular feeds reached their natural ends,
+each ordinary feed reached its natural end or a validated monotonic release
+boundary, and all page manifests were persisted. Safety-cap exhaustion is
+`partial`; a parse, transport, or persistence error is
+`failed` or `degraded` under the retry policy below.
+
+### 8.1 Monotonic revision fencing
+
+Runs may overlap: a daily run can coexist with a manual run, startup catch-up,
+or an old retry. The design does not serialize them. PostgreSQL allocates a
+strictly increasing `run_revision` when the logical run row is created. Every
+retry generation for that logical run retains the original revision; it does
+not become newer merely because it finished later.
+
+Each committed page also receives a transactionally allocated observation
+ordinal. The tuple `(run_revision, observation_ordinal)` is the monotonic
+revision of every per-AppID search observation. Current review, search
+fingerprint, eligibility, and candidate projections update only when that tuple
+is greater than the tuple already published for the AppID. Historical rows may
+still record a stale completion, but it cannot change current state or enqueue
+work from superseded inputs.
+
+Each feed's authoritative membership projection stores
+`published_run_revision`. Feed completion publishes membership, absence, and
+omission counters only with a compare-and-set requiring
+`run_revision > published_run_revision`. The publication and its per-AppID
+membership/omission changes are one transaction. Therefore a retry from an
+older run finishing after a newer successful run cannot restore old
+membership, replace reviews, or increment omission counts. Downstream
+`appdetails` persistence rechecks the candidate revision under the same fence
+before changing current catalog eligibility; optional stale results may remain
+as history only.
 
 At least two consecutive complete scans that both omit a prior ordinary feed
 membership are required before absence deactivates that membership. Popular
@@ -431,10 +471,15 @@ discovery tables, but the resulting model must represent these concepts:
 ### Search runs and feed progress
 
 - unique scheduled/manual run identity and configuration snapshot;
+- strictly increasing logical `run_revision`, retained by all retry
+  generations;
 - retry generation and next retry time for a terminal occurrence;
 - per-feed status, cursor, first/last page, and aggregate counts;
+- per-feed `published_run_revision` fencing authoritative membership and
+  omission counters;
 - `complete`, `partial`, `failed`, and successful timestamps;
-- release boundary and safety-cap reason without raw response content.
+- monotonic-order validation, release boundary, and safety-cap reason without
+  raw response content.
 
 ### Per-AppID ingestion state
 
@@ -443,6 +488,8 @@ discovery tables, but the resulting model must represent these concepts:
 - normalized search release text/precision and search fingerprint;
 - normalized review band, displayed label, nullable positive percentage,
   total count, and successful observation time;
+- latest `(run_revision, observation_ordinal)` used by current-state
+  compare-and-set writes;
 - last successful `appdetails` time and `next_refresh_at`;
 - last canonical semantic content hash;
 - active state, exclusion tombstone reason, and retry state.
@@ -584,16 +631,26 @@ The overview may read a fresher review summary for an already published game
 without changing that ranking version because reviews are presentation data,
 not factor snapshots.
 
-Every clock- or review-driven hard eligibility rule is also applied by the
-overview and calendar read query using the current UTC date: release-window
-exit, day-eight unrated-grace expiry, authoritative product/phase invalidation,
-and `mixed_or_below`. This suppresses an expired or rejected previously
-published row immediately, even while discovery is disabled or unavailable.
-The debounced rebuild removes it from the next immutable recommendation run;
-stored historical ranking rows are not rewritten. The scheduler also marks
-the candidate set dirty when a persisted `next_eligibility_change_at` becomes
-due, so read-time filtering does not become a permanent substitute for a new
-published ranking.
+A single server-side current-eligibility predicate applies every clock- or
+review-driven hard rule using the current UTC date: release-window exit,
+day-eight unrated-grace expiry, authoritative product/phase invalidation, and
+`mixed_or_below`. Every recommendation delivery path must use that predicate:
+
+- `GET /api/recommendations/overview`;
+- `GET /api/calendar`;
+- `GET /api/recommendations/{id}`, which returns not found for an ineligible
+  published row;
+- digest input selection used by `POST /api/digests/test` and scheduled digest
+  composition.
+
+The gate suppresses an expired or rejected previously published row
+immediately, even while discovery is disabled or unavailable. No endpoint or
+digest repository may bypass it by reading published recommendation rows
+directly. The debounced rebuild removes the row from the next immutable
+recommendation run; stored historical ranking rows are not rewritten. The
+scheduler also marks the candidate set dirty when a persisted
+`next_eligibility_change_at` becomes due, so read-time filtering does not
+become a permanent substitute for a new published ranking.
 
 ## 13. API and UI contract
 
@@ -732,6 +789,13 @@ and public review history are not destructively rolled back.
   scan.
 - A safety-capped popular feed admits independently eligible dated/reviewed
   games but grants no Popular-only TBA or unrated exception.
+- An out-of-order Popular fixture places an in-window result after an
+  out-of-window result and proves the adapter does not stop at that date;
+  Popular authority requires the natural end.
+- `recent` and `comingsoon` fixtures prove boundary termination only after
+  monotonic ordering is validated across page boundaries; an ordering
+  regression disables the early stop and produces a natural-end or partial
+  outcome.
 - Store `appdetails` remains authoritative for `type`, phase, and release text.
 
 ### Eligibility
@@ -744,6 +808,9 @@ and public review history are not destructively rolled back.
 - Every Mixed-or-below released game is absent from active catalog,
   recommendations, calendar, and API results regardless of popularity or
   wishlist membership.
+- Overview, calendar, recommendation detail, test digest, and scheduled digest
+  contract tests all apply the same hard review eligibility gate; detail
+  returns not found and digests omit the rejected row.
 - A zero-review exact release in current Popular New is admitted through day
   seven and removed on day eight unless it gains a positive review band.
 - Published rows are suppressed on clock-driven window/grace expiry even when
@@ -775,6 +842,9 @@ and public review history are not destructively rolled back.
   all feed provenance.
 - Replay after a crash resumes the page without duplicate game, observation,
   Store, AI, or rebuild work.
+- An older run retry finishing after a newer successful run cannot replace
+  current feed membership, reviews, eligibility, or omission counters, and
+  cannot enqueue work from its superseded observation.
 - Review-count-only changes update the card data without `appdetails`, AI, or a
   ranking-version change.
 - Unchanged semantic content, reactivation, and model/prompt-version changes
