@@ -66,7 +66,7 @@ func (r *SQLRepository) DisableAndEnqueue(ctx context.Context, userID, adjustmen
 			return DisableAccepted{}, errors.New("published ranking is required")
 		}
 		payload, _ := json.Marshal(DisablePayload{Version: 1, AdjustmentID: adjustmentID})
-		accepted.RebuildJobID, err = jobs.EnqueueInTx(ctx, queries, jobs.Spec{Kind: DisableJobKind, Stage: "preferences", UserID: userID, Priority: 100, Required: true, IdempotencyKey: "adjustment:" + adjustmentID.String() + ":disable:v1", Payload: payload, MaxAttempts: 3})
+		accepted.RebuildJobID, err = jobs.EnqueueInTx(ctx, queries, jobs.Spec{Lane: jobs.LaneInteractive, Kind: DisableJobKind, Stage: "preferences", UserID: userID, Priority: 100, Required: true, IdempotencyKey: "adjustment:" + adjustmentID.String() + ":disable:v1", Payload: payload, MaxAttempts: 3})
 		if err != nil {
 			return DisableAccepted{}, err
 		}

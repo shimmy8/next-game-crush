@@ -80,6 +80,7 @@ type SyncRequestEvent struct {
 }
 
 type JobAttemptEvent struct {
+	Lane         string
 	Stage        JobStage
 	Correlation  Correlation
 	Kind         string
@@ -107,6 +108,7 @@ type SyncSourceEvent struct {
 }
 
 type WorkerEvent struct {
+	Lane        string
 	Stage       WorkerStage
 	Correlation Correlation
 	Reason      Reason
@@ -200,6 +202,7 @@ func (l *Logger) JobAttempt(ctx context.Context, event JobAttemptEvent) {
 	attrs := []slog.Attr{slog.String("event", "job_attempt"), slog.String("stage", stage)}
 	attrs = appendCorrelation(attrs, event.Correlation)
 	attrs = append(attrs,
+		slog.String("lane", allow(event.Lane, values("interactive", "catalog"))),
 		slog.String("kind", allow(event.Kind, jobKinds)),
 		slog.String("logical_stage", allow(event.LogicalStage, logicalStages)),
 		slog.Int("attempt", nonnegative(event.Attempt)),
@@ -256,7 +259,7 @@ func (l *Logger) Worker(ctx context.Context, event WorkerEvent) {
 			level = slog.LevelWarn
 		}
 	}
-	attrs := []slog.Attr{slog.String("event", "worker"), slog.String("stage", stage)}
+	attrs := []slog.Attr{slog.String("event", "worker"), slog.String("stage", stage), slog.String("lane", allow(event.Lane, values("interactive", "catalog")))}
 	attrs = appendCorrelation(attrs, event.Correlation)
 	if reason := safeReason(event.Reason); reason != "" {
 		attrs = append(attrs, slog.String("reason", reason))

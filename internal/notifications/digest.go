@@ -116,7 +116,7 @@ func (s *Service) SendTestDigest(ctx context.Context, userID uuid.UUID) (uuid.UU
 		return uuid.Nil, fmt.Errorf("create digest delivery: %w", err)
 	}
 	payload, _ := json.Marshal(map[string]any{"version": 1, "delivery_id": delivery.ID})
-	if _, err := s.scheduler.Enqueue(ctx, jobs.Spec{Kind: JobKind, Stage: "digest", Required: true, IdempotencyKey: "digest-delivery:" + delivery.ID.String(), Payload: payload, MaxAttempts: 3}); err != nil {
+	if _, err := s.scheduler.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: JobKind, Stage: "digest", Required: true, IdempotencyKey: "digest-delivery:" + delivery.ID.String(), Payload: payload, MaxAttempts: 3}); err != nil {
 		return uuid.Nil, fmt.Errorf("enqueue digest delivery: %w", err)
 	}
 	if err := s.repository.ReviveFailedDeliveryJob(ctx, delivery.ID); err != nil {

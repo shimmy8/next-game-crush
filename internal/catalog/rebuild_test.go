@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"next-game-crush/internal/jobs"
 )
 
 func markCatalogDirty(t *testing.T, service *DiscoveryService, at time.Time) {
@@ -76,7 +77,7 @@ func TestCatalogRebuildDebounceAndNoop(t *testing.T) {
 	if _, err := service.repo.store.Pool.Exec(ctx, `UPDATE sync_jobs SET available_at=now() WHERE kind=$1`, RebuildWakeJobKind); err != nil {
 		t.Fatal(err)
 	}
-	wake, err := service.queue.Claim(ctx, "rebuild-wakeup-test", time.Minute)
+	wake, err := service.queue.Claim(ctx, jobs.LaneInteractive, "rebuild-wakeup-test", time.Minute)
 	if err != nil || wake == nil || wake.Kind != RebuildWakeJobKind {
 		t.Fatalf("wake claim=%+v err=%v", wake, err)
 	}

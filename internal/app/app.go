@@ -98,7 +98,7 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
-	worker := jobs.NewWorker(queue, workerID, jobs.WithLogger(eventLogger), jobs.WithConcurrency(cfg.WorkerConcurrency))
+	worker := jobs.NewWorker(queue, jobs.LaneInteractive, workerID, jobs.WithLogger(eventLogger), jobs.WithConcurrency(cfg.WorkerConcurrency))
 	if err := syncService.RegisterHandlers(worker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register synchronization handlers: %w", err)

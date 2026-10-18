@@ -13,8 +13,9 @@ import (
 
 const claimJob = `-- name: ClaimJob :one
 WITH candidate AS (
-    SELECT id FROM sync_jobs
-    WHERE attempts < max_attempts
+    SELECT sync_jobs.id FROM sync_jobs
+    WHERE sync_jobs.lane = $1
+      AND attempts < max_attempts
       AND available_at <= now()
       AND (status IN ('queued', 'retryable') OR (status = 'running' AND lease_until <= now()))
     ORDER BY priority DESC, available_at, created_at, id
@@ -23,9 +24,9 @@ WITH candidate AS (
 ), claimed AS (
     UPDATE sync_jobs j SET
         attempts = attempts + 1,
-        status = 'running', worker_id = $1,
-        fencing_token = $2,
-        lease_until = now() + $3::interval,
+        status = 'running', worker_id = $2,
+        fencing_token = $3,
+        lease_until = now() + $4::interval,
         last_error = NULL,
         updated_at = now()
     FROM candidate c WHERE j.id = c.id
@@ -35,6 +36,7 @@ SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, avail
 `
 
 type ClaimJobParams struct {
+	Lane          string          `json:"lane"`
 	WorkerID      pgtype.Text     `json:"worker_id"`
 	FencingToken  pgtype.UUID     `json:"fencing_token"`
 	LeaseDuration pgtype.Interval `json:"lease_duration"`
@@ -65,7 +67,12 @@ type ClaimJobRow struct {
 }
 
 func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (ClaimJobRow, error) {
-	row := q.db.QueryRow(ctx, claimJob, arg.WorkerID, arg.FencingToken, arg.LeaseDuration)
+	row := q.db.QueryRow(ctx, claimJob,
+		arg.Lane,
+		arg.WorkerID,
+		arg.FencingToken,
+		arg.LeaseDuration,
+	)
 	var i ClaimJobRow
 	err := row.Scan(
 		&i.ID,
@@ -154,9 +161,10 @@ func (q *Queries) DeferJobUntil(ctx context.Context, arg DeferJobUntilParams) (i
 }
 
 const enqueueJob = `-- name: EnqueueJob :one
-INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id, priority)
-VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8, $9, $10, $11)
+INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id, priority, lane)
+VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8, $9, $10, $11, $12)
 ON CONFLICT (idempotency_key) DO UPDATE SET priority = GREATEST(sync_jobs.priority, EXCLUDED.priority)
+WHERE sync_jobs.lane = EXCLUDED.lane
 RETURNING id
 `
 
@@ -172,6 +180,7 @@ type EnqueueJobParams struct {
 	Stage          string             `json:"stage"`
 	UserID         pgtype.UUID        `json:"user_id"`
 	Priority       int16              `json:"priority"`
+	Lane           string             `json:"lane"`
 }
 
 func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (pgtype.UUID, error) {
@@ -187,6 +196,7 @@ func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (pgtype.
 		arg.Stage,
 		arg.UserID,
 		arg.Priority,
+		arg.Lane,
 	)
 	var id pgtype.UUID
 	err := row.Scan(&id)
@@ -351,6 +361,17 @@ func (q *Queries) GetJobChildren(ctx context.Context, parentJobID pgtype.UUID) (
 		return nil, err
 	}
 	return items, nil
+}
+
+const getJobLane = `-- name: GetJobLane :one
+SELECT lane FROM sync_jobs WHERE id = $1
+`
+
+func (q *Queries) GetJobLane(ctx context.Context, id pgtype.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, getJobLane, id)
+	var lane string
+	err := row.Scan(&lane)
+	return lane, err
 }
 
 const getJobWorkflowID = `-- name: GetJobWorkflowID :one

@@ -87,7 +87,7 @@ func (service *Service) PlanGameFeatureJob(_ context.Context, gameID uuid.UUID, 
 		return jobs.Spec{}, err
 	}
 	payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID, Execution: &GameExecution{ContentHash: contentHash, TextModel: service.model, EmbeddingModel: service.embeddingModel, Key: key}})
-	return jobs.Spec{Kind: FeaturesJobKind, Stage: "ai_features", Priority: priority, IdempotencyKey: key, Payload: payload, MaxAttempts: 3}, nil
+	return jobs.Spec{Lane: jobs.LaneInteractive, Kind: FeaturesJobKind, Stage: "ai_features", Priority: priority, IdempotencyKey: key, Payload: payload, MaxAttempts: 3}, nil
 }
 
 func (service *Service) PlanFeatureJobs(ctx context.Context, userID uuid.UUID, rootKey string) ([]jobs.Spec, error) {
@@ -101,7 +101,7 @@ func (service *Service) PlanFeatureJobs(ctx context.Context, userID uuid.UUID, r
 	specs := make([]jobs.Spec, 0, len(gameIDs))
 	for _, gameID := range gameIDs {
 		payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID})
-		specs = append(specs, jobs.Spec{Kind: FeaturesJobKind, Stage: "ai_features", Required: true, IdempotencyKey: rootKey + ":ai.features:v1:" + gameID.String(), Payload: payload, MaxAttempts: 3, Priority: 100, UserID: userID})
+		specs = append(specs, jobs.Spec{Lane: jobs.LaneInteractive, Kind: FeaturesJobKind, Stage: "ai_features", Required: true, IdempotencyKey: rootKey + ":ai.features:v1:" + gameID.String(), Payload: payload, MaxAttempts: 3, Priority: 100, UserID: userID})
 	}
 	return specs, nil
 }
@@ -144,7 +144,7 @@ func (service *Service) handleFeatures(ctx context.Context, lease jobs.Lease) er
 		return service.notifyCatalogChanged(ctx, lease, payload.GameID, "feature", changed || catalogChangePending(lease.Result))
 	}
 	embeddingPayload, _ := json.Marshal(payload)
-	ready, err := service.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: EmbeddingJobKind, Stage: "ai_embedding", Required: true, IdempotencyKey: lease.IdempotencyKey + ":embedding:v1", Payload: embeddingPayload, MaxAttempts: 3, Priority: lease.Priority}})
+	ready, err := service.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: EmbeddingJobKind, Stage: "ai_embedding", Required: true, IdempotencyKey: lease.IdempotencyKey + ":embedding:v1", Payload: embeddingPayload, MaxAttempts: 3, Priority: lease.Priority}})
 	if err != nil {
 		return err
 	}

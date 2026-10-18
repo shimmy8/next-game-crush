@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -26,7 +27,7 @@ func (discoveryEnrichmentClient) Embed(context.Context, []string) ([][]float32, 
 func finishDiscoveryEnrichment(t *testing.T, s *DiscoveryService, enrichment *ai.Service) {
 	t.Helper()
 	enrichment.SetQueue(s.queue)
-	worker := jobs.NewWorker(s.queue, "cached-enrichment", jobs.WithPollInterval(time.Millisecond))
+	worker := jobs.NewWorker(s.queue, jobs.LaneInteractive, "cached-enrichment", jobs.WithPollInterval(time.Millisecond))
 	if err := enrichment.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +121,50 @@ func TestDiscoveryUnchangedRevisionPlansMissingAndNewModelEnrichment(t *testing.
 	}
 	if textModels != 2 || embeddingModels != 2 {
 		t.Fatal("new model versions did not produce persisted features and embeddings")
+	}
+}
+
+func TestDiscoveryRetiredTickKeysCannotBlockInteractiveSuccessors(t *testing.T) {
+	s, _ := discoveryFixture(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Hour).Add(time.Minute)
+	for _, at := range []time.Time{now.Truncate(time.Hour), now.Truncate(time.Hour).Add(time.Hour)} {
+		payload, _ := json.Marshal(tickPayload{1, at})
+		if _, err := s.repo.store.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,idempotency_key,lane,status,payload,available_at,last_error,result)
+			VALUES($1,$2,$3,'catalog','dead',$4,$5,'superseded_catalog_workflow','{"audit":true}')`, uuid.New(), TickJobKind, fmt.Sprintf("catalog.discovery.tick:v1:%d", at.Unix()), payload, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for generation := range 3 {
+		current := now.Add(time.Duration(generation) * time.Hour)
+		s.now = func() time.Time { return current }
+		for range 5 {
+			if err := s.EnsureScheduled(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var currentID uuid.UUID
+		if err := s.repo.store.Pool.QueryRow(ctx, `SELECT id FROM sync_jobs WHERE kind=$1 AND lane='interactive' AND status='queued' AND available_at=$2`, TickJobKind, current.Truncate(time.Hour)).Scan(&currentID); err != nil {
+			t.Fatal(err)
+		}
+		lease := leaseDiscoveryID(t, s, currentID)
+		if err := s.handleTick(ctx, lease); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.queue.Complete(ctx, lease); err != nil {
+			t.Fatal(err)
+		}
+		var retired, live, successors int
+		if err := s.repo.store.Pool.QueryRow(ctx, `SELECT
+			count(*) FILTER(WHERE lane='catalog' AND status='dead' AND last_error='superseded_catalog_workflow' AND result='{"audit":true}'),
+			count(*) FILTER(WHERE lane='interactive' AND status NOT IN ('succeeded','dead')),
+			count(*) FILTER(WHERE lane='interactive' AND status='queued' AND available_at=$2)
+			FROM sync_jobs WHERE kind=$1`, TickJobKind, current.Truncate(time.Hour).Add(time.Hour)).Scan(&retired, &live, &successors); err != nil {
+			t.Fatal(err)
+		}
+		if retired != 2 || live != 1 || successors != 1 {
+			t.Fatalf("generation %d retired=%d live=%d successors=%d", generation, retired, live, successors)
+		}
 	}
 }
 

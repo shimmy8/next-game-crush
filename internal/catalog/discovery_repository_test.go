@@ -222,7 +222,7 @@ func TestDiscoveryDiagnosticsAreAggregateAndSafe(t *testing.T) {
 	queue := jobs.NewQueue(s)
 	for _, appID := range []int64{42, 44, 45} {
 		payload, _ := json.Marshal(QualificationPayload{Version: 1, App: DiscoveredApp{AppID: appID, Name: "fixture", LastModified: now}, BudgetHour: now, Priority: 50})
-		jobID, err := queue.Enqueue(ctx, jobs.Spec{Kind: QualifyJobKind, IdempotencyKey: fmt.Sprintf("completed-%d", appID), Payload: payload})
+		jobID, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: QualifyJobKind, IdempotencyKey: fmt.Sprintf("completed-%d", appID), Payload: payload})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -231,11 +231,11 @@ func TestDiscoveryDiagnosticsAreAggregateAndSafe(t *testing.T) {
 		}
 	}
 	pendingRetry, _ := json.Marshal(QualificationPayload{Version: 1, App: DiscoveredApp{AppID: 42, Name: "fixture", LastModified: now}, RetryGeneration: 1, BudgetHour: now, Priority: 50})
-	if _, err := queue.Enqueue(ctx, jobs.Spec{Kind: QualifyJobKind, IdempotencyKey: "pending-newer-retry", Payload: pendingRetry}); err != nil {
+	if _, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: QualifyJobKind, IdempotencyKey: "pending-newer-retry", Payload: pendingRetry}); err != nil {
 		t.Fatal(err)
 	}
 	for _, key := range []string{"pending-a", "pending-b"} {
-		if _, err := queue.Enqueue(ctx, jobs.Spec{Kind: QualifyJobKind, IdempotencyKey: key}); err != nil {
+		if _, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: QualifyJobKind, IdempotencyKey: key}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -275,7 +275,7 @@ func TestDiscoveryDiagnosticsCountInvalidManifestItemsAsSkipped(t *testing.T) {
 	}{{71, "admitted"}, {72, "unavailable"}} {
 		app := DiscoveredApp{AppID: item.appID, LastModified: hour.Add(time.Duration(index+1) * time.Second)}
 		payload, _ := json.Marshal(QualificationPayload{Version: 1, App: app, BudgetHour: hour, Priority: 50})
-		jobID, err := queue.Enqueue(ctx, jobs.Spec{Kind: QualifyJobKind, IdempotencyKey: fmt.Sprintf("diagnostic-mixed-%d", item.appID), Payload: payload})
+		jobID, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: QualifyJobKind, IdempotencyKey: fmt.Sprintf("diagnostic-mixed-%d", item.appID), Payload: payload})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -289,7 +289,7 @@ func TestDiscoveryDiagnosticsCountInvalidManifestItemsAsSkipped(t *testing.T) {
 	manifest := PageManifest{Version: 1, Mode: DiscoveryIncremental, ScanStartedAt: hour, Items: []PageItem{{Ordinal: 0, Invalid: true}, {App: DiscoveredApp{AppID: 71, LastModified: hour.Add(time.Second)}, Ordinal: 1}, {App: DiscoveredApp{AppID: 72, LastModified: hour.Add(2 * time.Second)}, Ordinal: 2}}}
 	result, _ := json.Marshal(manifest)
 	payload, _ := json.Marshal(ScanPayload{Version: 1, Mode: DiscoveryIncremental, ScanStartedAt: hour, BudgetHour: hour})
-	scanID, err := queue.Enqueue(ctx, jobs.Spec{Kind: IncrementalJobKind, IdempotencyKey: "diagnostic-mixed-page", Payload: payload})
+	scanID, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: IncrementalJobKind, IdempotencyKey: "diagnostic-mixed-page", Payload: payload})
 	if err != nil {
 		t.Fatal(err)
 	}

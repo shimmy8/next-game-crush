@@ -22,13 +22,14 @@ type retryDelayProvider interface {
 }
 
 type workerQueue interface {
-	Claim(context.Context, string, time.Duration) (*Lease, error)
+	Claim(context.Context, Lane, string, time.Duration) (*Lease, error)
 	Renew(context.Context, Lease, time.Duration) error
 	Complete(context.Context, Lease) error
 	Fail(context.Context, Lease, error, time.Time) (FailureOutcome, error)
 }
 
 type Worker struct {
+	lane            Lane
 	queue           workerQueue
 	workerID        string
 	concurrency     int
@@ -73,16 +74,16 @@ func WithConcurrency(concurrency int) WorkerOption {
 	return func(worker *Worker) { worker.concurrency = concurrency }
 }
 
-func NewWorker(queue *Queue, workerID string, options ...WorkerOption) *Worker {
+func NewWorker(queue *Queue, lane Lane, workerID string, options ...WorkerOption) *Worker {
 	if queue == nil {
-		return newWorker(nil, workerID, options...)
+		return newWorker(nil, lane, workerID, options...)
 	}
-	return newWorker(queue, workerID, options...)
+	return newWorker(queue, lane, workerID, options...)
 }
 
-func newWorker(queue workerQueue, workerID string, options ...WorkerOption) *Worker {
+func newWorker(queue workerQueue, lane Lane, workerID string, options ...WorkerOption) *Worker {
 	worker := &Worker{
-		queue: queue, workerID: workerID, concurrency: 1, pollInterval: 250 * time.Millisecond,
+		lane: lane, queue: queue, workerID: workerID, concurrency: 1, pollInterval: 250 * time.Millisecond,
 		leaseDuration: 30 * time.Second, retryBase: time.Second, handlers: make(map[string]Handler),
 		shutdownTimeout: 10 * time.Second, heartbeat: 15 * time.Second, logger: observability.New(nil),
 	}
@@ -112,6 +113,9 @@ func (worker *Worker) Register(kind string, handler Handler) error {
 }
 
 func (worker *Worker) Run(ctx context.Context) error {
+	if !worker.lane.valid() {
+		return errors.New("worker lane must be interactive or catalog")
+	}
 	if worker.queue == nil {
 		return errors.New("job queue is required")
 	}
@@ -142,18 +146,18 @@ func (worker *Worker) Run(ctx context.Context) error {
 }
 
 func (worker *Worker) runLane(ctx context.Context, workerID string) error {
-	worker.logger.Worker(ctx, observability.WorkerEvent{Stage: observability.WorkerStarted})
-	defer worker.logger.Worker(context.WithoutCancel(ctx), observability.WorkerEvent{Stage: observability.WorkerStopped})
+	worker.logger.Worker(ctx, observability.WorkerEvent{Lane: string(worker.lane), Stage: observability.WorkerStarted})
+	defer worker.logger.Worker(context.WithoutCancel(ctx), observability.WorkerEvent{Lane: string(worker.lane), Stage: observability.WorkerStopped})
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
-		lease, err := worker.queue.Claim(ctx, workerID, worker.leaseDuration)
+		lease, err := worker.queue.Claim(ctx, worker.lane, workerID, worker.leaseDuration)
 		if err != nil {
 			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 				return nil
 			}
-			worker.logger.Worker(ctx, observability.WorkerEvent{Stage: observability.WorkerClaimFailed, Reason: observability.ReasonPersistenceFailed})
+			worker.logger.Worker(ctx, observability.WorkerEvent{Lane: string(worker.lane), Stage: observability.WorkerClaimFailed, Reason: observability.ReasonPersistenceFailed})
 			return err
 		}
 		if lease == nil {
@@ -218,7 +222,7 @@ func (worker *Worker) process(ctx context.Context, lease Lease) error {
 			completeErr := worker.queue.Complete(operationCtx, lease)
 			if completeErr != nil {
 				reason := persistenceReason(completeErr)
-				worker.logger.Worker(operationCtx, observability.WorkerEvent{Stage: observability.WorkerCompletionFailed, Correlation: correlation, Reason: reason})
+				worker.logger.Worker(operationCtx, observability.WorkerEvent{Lane: string(worker.lane), Stage: observability.WorkerCompletionFailed, Correlation: correlation, Reason: reason})
 				if errors.Is(completeErr, ErrLeaseLost) {
 					worker.logAttempt(operationCtx, lease, observability.JobLeaseLost, time.Since(started), 0, reason)
 				}
@@ -234,7 +238,7 @@ func (worker *Worker) process(ctx context.Context, lease Lease) error {
 					return worker.waitForCancellation(ctx, lease, result, started)
 				}
 				reason := persistenceReason(err)
-				worker.logger.Worker(ctx, observability.WorkerEvent{Stage: observability.WorkerRenewalFailed, Correlation: correlation, Reason: reason})
+				worker.logger.Worker(ctx, observability.WorkerEvent{Lane: string(worker.lane), Stage: observability.WorkerRenewalFailed, Correlation: correlation, Reason: reason})
 				if errors.Is(err, ErrLeaseLost) {
 					worker.logAttempt(ctx, lease, observability.JobLeaseLost, time.Since(started), 0, reason)
 					cancelHandler()
@@ -279,7 +283,7 @@ func (worker *Worker) failWithTimeout(ctx context.Context, lease Lease, cause er
 	outcome, err := worker.queue.Fail(operationCtx, lease, cause, time.Now().Add(retryDelay))
 	if err != nil {
 		reason := persistenceReason(err)
-		worker.logger.Worker(operationCtx, observability.WorkerEvent{Stage: observability.WorkerFailureRecordFailed, Correlation: observability.Correlation{WorkflowID: lease.WorkflowID, JobID: lease.ID, ParentJobID: lease.ParentJobID}, Reason: reason})
+		worker.logger.Worker(operationCtx, observability.WorkerEvent{Lane: string(worker.lane), Stage: observability.WorkerFailureRecordFailed, Correlation: observability.Correlation{WorkflowID: lease.WorkflowID, JobID: lease.ID, ParentJobID: lease.ParentJobID}, Reason: reason})
 		if errors.Is(err, ErrLeaseLost) {
 			worker.logAttempt(operationCtx, lease, observability.JobLeaseLost, time.Since(started), 0, reason)
 		}
@@ -298,7 +302,7 @@ func (worker *Worker) failWithTimeout(ctx context.Context, lease Lease, cause er
 func (worker *Worker) logAttempt(ctx context.Context, lease Lease, stage observability.JobStage, duration, retryDelay time.Duration, reason observability.Reason) {
 	worker.logger.JobAttempt(ctx, observability.JobAttemptEvent{
 		Stage: stage, Correlation: observability.Correlation{WorkflowID: lease.WorkflowID, JobID: lease.ID, ParentJobID: lease.ParentJobID},
-		Kind: lease.Kind, LogicalStage: lease.Stage, Attempt: lease.Attempts, MaxAttempts: lease.MaxAttempts,
+		Lane: string(lease.Lane), Kind: lease.Kind, LogicalStage: lease.Stage, Attempt: lease.Attempts, MaxAttempts: lease.MaxAttempts,
 		Required: lease.Required, Duration: duration, RetryDelay: retryDelay, Reason: reason,
 	})
 }

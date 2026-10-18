@@ -64,7 +64,7 @@ func TestCatalogChangedHookReplaysAfterPostCommitFailure(t *testing.T) {
 				return nil
 			})
 			payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID})
-			lease := jobs.Lease{Kind: kind, IdempotencyKey: "catalog:hook-replay:" + kind, Payload: payload, Attempts: 1}
+			lease := jobs.Lease{Lane: jobs.LaneInteractive, Kind: kind, IdempotencyKey: "catalog:hook-replay:" + kind, Payload: payload, Attempts: 1}
 			run := service.handleFeatures
 			if kind == EmbeddingJobKind {
 				run = service.handleEmbedding
@@ -107,11 +107,11 @@ func TestCatalogChangedHookFailureDefersOwnedLease(t *testing.T) {
 		return nil
 	})
 	payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID})
-	jobID, err := queue.Enqueue(context.Background(), jobs.Spec{Kind: EmbeddingJobKind, IdempotencyKey: "catalog:hook-replay:" + EmbeddingJobKind, Payload: payload, MaxAttempts: 3})
+	jobID, err := queue.Enqueue(context.Background(), jobs.Spec{Lane: jobs.LaneInteractive, Kind: EmbeddingJobKind, IdempotencyKey: "catalog:hook-replay:" + EmbeddingJobKind, Payload: payload, MaxAttempts: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := queue.Claim(context.Background(), "hook-replay", time.Minute)
+	lease, err := queue.Claim(context.Background(), jobs.LaneInteractive, "hook-replay", time.Minute)
 	if err != nil || lease == nil || lease.ID != jobID {
 		t.Fatalf("claim=%+v err=%v", lease, err)
 	}
@@ -121,7 +121,7 @@ func TestCatalogChangedHookFailureDefersOwnedLease(t *testing.T) {
 	if _, err := db.Pool.Exec(context.Background(), `UPDATE sync_jobs SET available_at=now() WHERE id=$1`, jobID); err != nil {
 		t.Fatal(err)
 	}
-	retry, err := queue.Claim(context.Background(), "hook-replay", time.Minute)
+	retry, err := queue.Claim(context.Background(), jobs.LaneInteractive, "hook-replay", time.Minute)
 	if err != nil || retry == nil || retry.ID != jobID || retry.Attempts != 1 {
 		t.Fatalf("retry=%+v err=%v", retry, err)
 	}
@@ -153,11 +153,11 @@ func TestFeatureParentNotifiesCatalogOnceAfterEmbeddingChild(t *testing.T) {
 				return nil
 			})
 			payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID})
-			parentID, err := queue.Enqueue(context.Background(), jobs.Spec{Kind: FeaturesJobKind, IdempotencyKey: "catalog:feature-lifecycle", Payload: payload})
+			parentID, err := queue.Enqueue(context.Background(), jobs.Spec{Lane: jobs.LaneInteractive, Kind: FeaturesJobKind, IdempotencyKey: "catalog:feature-lifecycle", Payload: payload})
 			if err != nil {
 				t.Fatal(err)
 			}
-			parent, err := queue.Claim(context.Background(), "feature-lifecycle", time.Minute)
+			parent, err := queue.Claim(context.Background(), jobs.LaneInteractive, "feature-lifecycle", time.Minute)
 			if err != nil || parent == nil || parent.ID != parentID {
 				t.Fatalf("parent=%+v err=%v", parent, err)
 			}
@@ -165,7 +165,7 @@ func TestFeatureParentNotifiesCatalogOnceAfterEmbeddingChild(t *testing.T) {
 				t.Fatalf("first parent=%v hooks=%d", err, hookCalls)
 			}
 			repository.cachedEmbedding = true
-			child, err := queue.Claim(context.Background(), "feature-lifecycle", time.Minute)
+			child, err := queue.Claim(context.Background(), jobs.LaneInteractive, "feature-lifecycle", time.Minute)
 			if err != nil || child == nil || child.Kind != EmbeddingJobKind {
 				t.Fatalf("child=%+v err=%v", child, err)
 			}
@@ -175,7 +175,7 @@ func TestFeatureParentNotifiesCatalogOnceAfterEmbeddingChild(t *testing.T) {
 			if err := queue.Complete(context.Background(), *child); err != nil {
 				t.Fatal(err)
 			}
-			parent, err = queue.Claim(context.Background(), "feature-lifecycle", time.Minute)
+			parent, err = queue.Claim(context.Background(), jobs.LaneInteractive, "feature-lifecycle", time.Minute)
 			if err != nil || parent == nil || parent.ID != parentID {
 				t.Fatalf("resumed parent=%+v err=%v", parent, err)
 			}
@@ -187,7 +187,7 @@ func TestFeatureParentNotifiesCatalogOnceAfterEmbeddingChild(t *testing.T) {
 				if _, err := db.Pool.Exec(context.Background(), `UPDATE sync_jobs SET available_at=now() WHERE id=$1`, parentID); err != nil {
 					t.Fatal(err)
 				}
-				parent, err = queue.Claim(context.Background(), "feature-lifecycle", time.Minute)
+				parent, err = queue.Claim(context.Background(), jobs.LaneInteractive, "feature-lifecycle", time.Minute)
 				if err != nil || parent == nil || parent.ID != parentID {
 					t.Fatalf("hook retry parent=%+v err=%v", parent, err)
 				}
@@ -209,7 +209,7 @@ func TestFeatureParentNotifiesCatalogOnceAfterEmbeddingChild(t *testing.T) {
 
 func TestRegisterHandlersRegistersAllVersionedKinds(t *testing.T) {
 	service, _ := NewService(&fakeRepository{}, &fakeClient{}, "gpt-6-luna", "text-embedding-3-small")
-	worker := jobs.NewWorker(nil, "registration-only")
+	worker := jobs.NewWorker(nil, jobs.LaneInteractive, "registration-only")
 	if err := service.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}

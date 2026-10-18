@@ -85,10 +85,10 @@ func TestLegacyFeatureHandlerCannotPublishAfterContentOrLeaseChanges(t *testing.
 			}
 			queue := jobs.NewQueue(db)
 			raw, _ := json.Marshal(JobPayload{Version: 1, GameID: gameID})
-			if _, err = queue.Enqueue(ctx, jobs.Spec{Kind: FeaturesJobKind, IdempotencyKey: "foreground:legacy", Payload: raw}); err != nil {
+			if _, err = queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: FeaturesJobKind, IdempotencyKey: "foreground:legacy", Payload: raw}); err != nil {
 				t.Fatal(err)
 			}
-			lease, err := queue.Claim(ctx, "legacy-execution", time.Minute)
+			lease, err := queue.Claim(ctx, jobs.LaneInteractive, "legacy-execution", time.Minute)
 			if err != nil || lease == nil {
 				t.Fatal("legacy job was not claimable")
 			}

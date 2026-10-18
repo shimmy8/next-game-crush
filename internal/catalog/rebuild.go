@@ -105,7 +105,7 @@ func (s *DiscoveryService) ScheduleRebuilds(ctx context.Context) error {
 			UserID  uuid.UUID `json:"user_id"`
 		}{Version: 1, UserID: row.userID})
 		key := fmt.Sprintf("catalog:recommendations.rebuild:v1:%s:%d", row.userID, row.dirtyRevision)
-		jobID, err := jobs.EnqueueInTx(ctx, q, jobs.Spec{Kind: "recommendations.rebuild", Stage: "recommendations", IdempotencyKey: key, Payload: payload, AvailableAt: availableAt, MaxAttempts: 3, Priority: 50, UserID: row.userID})
+		jobID, err := jobs.EnqueueInTx(ctx, q, jobs.Spec{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", IdempotencyKey: key, Payload: payload, AvailableAt: availableAt, MaxAttempts: 3, Priority: 50, UserID: row.userID})
 		if err != nil {
 			return err
 		}
@@ -119,6 +119,7 @@ func (s *DiscoveryService) ScheduleRebuilds(ctx context.Context) error {
 func enqueueRebuildWakeup(ctx context.Context, q *dbgen.Queries, row dirtyRow, now time.Time) error {
 	payload, _ := json.Marshal(rebuildWakePayload{Version: 1, UserID: row.userID, Revision: row.dirtyRevision})
 	_, err := jobs.EnqueueInTx(ctx, q, jobs.Spec{
+		Lane: jobs.LaneInteractive,
 		Kind: RebuildWakeJobKind, Stage: "recommendations", UserID: row.userID, Priority: 50, MaxAttempts: 3,
 		IdempotencyKey: fmt.Sprintf("catalog:rebuild-wakeup:v1:%s:%d", row.userID, row.dirtyRevision),
 		Payload:        payload, AvailableAt: now.Add(catalogRebuildWakePoll),

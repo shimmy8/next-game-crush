@@ -340,7 +340,7 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 		}
 		encoded, _ := json.Marshal(payload)
 		if !hasProfile {
-			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "profile.rebuild", Stage: "profile", Required: true, IdempotencyKey: lease.IdempotencyKey + ":profile:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID}})
+			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "profile.rebuild", Stage: "profile", Required: true, IdempotencyKey: lease.IdempotencyKey + ":profile:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID}})
 			if err != nil {
 				return err
 			}
@@ -349,7 +349,7 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 			}
 		}
 		if !hasRecommendations {
-			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: lease.IdempotencyKey + ":recommendations:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID}})
+			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: lease.IdempotencyKey + ":recommendations:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID}})
 			if err != nil {
 				return err
 			}
@@ -367,8 +367,8 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 	}
 	encoded, _ := json.Marshal(payload)
 	childSpecs := []jobs.Spec{
-		{Kind: "catalog.refresh", Stage: "catalog", Required: true, IdempotencyKey: lease.IdempotencyKey + ":catalog:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID},
-		{Kind: "achievements.sync", Stage: "achievements", Required: true, IdempotencyKey: lease.IdempotencyKey + ":achievements:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID},
+		{Lane: jobs.LaneInteractive, Kind: "catalog.refresh", Stage: "catalog", Required: true, IdempotencyKey: lease.IdempotencyKey + ":catalog:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID},
+		{Lane: jobs.LaneInteractive, Kind: "achievements.sync", Stage: "achievements", Required: true, IdempotencyKey: lease.IdempotencyKey + ":achievements:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID},
 	}
 	ready, err := s.queue.AwaitChildren(ctx, lease, childSpecs)
 	if err != nil {
@@ -392,7 +392,7 @@ func (s *Service) handleCatalogRefresh(ctx context.Context, lease jobs.Lease) er
 	specs := make([]jobs.Spec, 0, len(targets))
 	for _, target := range targets {
 		raw, _ := json.Marshal(catalogRefreshGamePayload{Version: 1, AppID: target.AppID})
-		specs = append(specs, jobs.Spec{Kind: "catalog.refresh_game", Stage: "catalog", Required: true,
+		specs = append(specs, jobs.Spec{Lane: jobs.LaneInteractive, Kind: "catalog.refresh_game", Stage: "catalog", Required: true,
 			IdempotencyKey: fmt.Sprintf("%s:game:v1:%d", lease.IdempotencyKey, target.AppID), Payload: raw,
 			MaxAttempts: 3, Priority: target.Priority, UserID: payload.UserID})
 	}

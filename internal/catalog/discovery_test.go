@@ -26,7 +26,7 @@ type discoveryPlanner struct{ calls int }
 
 func (p *discoveryPlanner) PlanGameFeatureJob(_ context.Context, id uuid.UUID, hash string, priority int) (jobs.Spec, error) {
 	p.calls++
-	return jobs.Spec{Kind: "feature.test", IdempotencyKey: "feature:" + id.String() + ":" + hash, Priority: priority}, nil
+	return jobs.Spec{Lane: jobs.LaneInteractive, Kind: "feature.test", IdempotencyKey: "feature:" + id.String() + ":" + hash, Priority: priority}, nil
 }
 func TestDiscoveryFeaturePlanningUsesContentAndModel(t *testing.T) {
 	s, m := discoveryFixture(t)
@@ -217,11 +217,11 @@ func TestDiscoveryDeckFetchIsLimitedToAdmission(t *testing.T) {
 func qualificationLease(t *testing.T, s *DiscoveryService, app DiscoveredApp, generation int) jobs.Lease {
 	t.Helper()
 	raw, _ := json.Marshal(QualificationPayload{Version: 1, App: app, RetryGeneration: generation, BudgetHour: s.now().UTC().Truncate(time.Hour), Priority: 50})
-	_, err := s.queue.Enqueue(context.Background(), jobs.Spec{Kind: QualifyJobKind, IdempotencyKey: qualificationKey(app, generation), Payload: raw})
+	_, err := s.queue.Enqueue(context.Background(), jobs.Spec{Lane: jobs.LaneInteractive, Kind: QualifyJobKind, IdempotencyKey: qualificationKey(app, generation), Payload: raw})
 	if err != nil {
 		t.Fatal(err)
 	}
-	l, err := s.queue.Claim(context.Background(), uuid.NewString(), time.Minute)
+	l, err := s.queue.Claim(context.Background(), jobs.LaneInteractive, uuid.NewString(), time.Minute)
 	if err != nil || l == nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -338,10 +338,10 @@ func TestDiscoveryDisabledAndUnavailableRetainSeedCandidates(t *testing.T) {
 					t.Fatal(err)
 				}
 				queue := jobs.NewQueue(db)
-				if _, err := queue.Enqueue(ctx, jobs.Spec{Kind: BackfillJobKind, IdempotencyKey: scanKey(payload), Payload: raw, Priority: 10}); err != nil {
+				if _, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: BackfillJobKind, IdempotencyKey: scanKey(payload), Payload: raw, Priority: 10}); err != nil {
 					t.Fatal(err)
 				}
-				lease, err := queue.Claim(ctx, "discovery-unavailable-test", time.Minute)
+				lease, err := queue.Claim(ctx, jobs.LaneInteractive, "discovery-unavailable-test", time.Minute)
 				if err != nil || lease == nil {
 					t.Fatalf("claim unavailable scan: lease=%#v err=%v", lease, err)
 				}

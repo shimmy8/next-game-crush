@@ -44,7 +44,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 		childPayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": workflow.UserID})
 		prefix := "adjustment:" + workflow.AdjustmentID.String() + ":disable:"
 		for _, stage := range []struct{ kind, stage, key string }{{"profile.rebuild", "profile", "profile:v1"}, {"recommendations.rebuild", "recommendations", "ranking:v1"}} {
-			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: stage.kind, Stage: stage.stage, UserID: workflow.UserID, Priority: 100, Required: true, IdempotencyKey: prefix + stage.key, Payload: childPayload, MaxAttempts: 3}})
+			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: stage.kind, Stage: stage.stage, UserID: workflow.UserID, Priority: 100, Required: true, IdempotencyKey: prefix + stage.key, Payload: childPayload, MaxAttempts: 3}})
 			if err != nil {
 				return err
 			}

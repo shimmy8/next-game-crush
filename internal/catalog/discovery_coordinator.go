@@ -75,7 +75,7 @@ func (r *DiscoveryRepository) scheduleScan(ctx context.Context, mode DiscoveryMo
 		p.PageGeneration = lastGeneration + 1
 	}
 	raw, _ := json.Marshal(p)
-	id, err := jobs.EnqueueInTx(ctx, q, jobs.Spec{Kind: "catalog.discover." + string(mode), Stage: "catalog_discover", IdempotencyKey: scanKey(p), Payload: raw, Priority: scanPriority(mode), MaxAttempts: 3})
+	id, err := jobs.EnqueueInTx(ctx, q, jobs.Spec{Lane: jobs.LaneInteractive, Kind: "catalog.discover." + string(mode), Stage: "catalog_discover", IdempotencyKey: scanKey(p), Payload: raw, Priority: scanPriority(mode), MaxAttempts: 3})
 	if err != nil {
 		return false, err
 	}

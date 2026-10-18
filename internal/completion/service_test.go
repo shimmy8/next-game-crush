@@ -562,7 +562,7 @@ func TestClassificationHookFailureIsRetriedAfterPublication(t *testing.T) {
 	if _, err := queue.Enqueue(ctx, spec); err != nil {
 		t.Fatal(err)
 	}
-	first, err := queue.Claim(ctx, "completion-test-worker", time.Minute)
+	first, err := queue.Claim(ctx, jobs.LaneInteractive, "completion-test-worker", time.Minute)
 	if err != nil || first == nil {
 		t.Fatalf("first claim=%+v err=%v", first, err)
 	}
@@ -573,7 +573,7 @@ func TestClassificationHookFailureIsRetriedAfterPublication(t *testing.T) {
 	if _, err := queue.Fail(ctx, *first, hookErr, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	second, err := queue.Claim(ctx, "completion-test-worker", time.Minute)
+	second, err := queue.Claim(ctx, jobs.LaneInteractive, "completion-test-worker", time.Minute)
 	if err != nil || second == nil {
 		t.Fatalf("second claim=%+v err=%v", second, err)
 	}
@@ -763,7 +763,7 @@ func TestProjectionRebuildKeysIncludeTransitionIdentity(t *testing.T) {
 
 func claimKind(t *testing.T, queue *jobs.Queue, kind string) *jobs.Lease {
 	t.Helper()
-	lease, err := queue.Claim(context.Background(), "completion-projection-test", time.Minute)
+	lease, err := queue.Claim(context.Background(), jobs.LaneInteractive, "completion-projection-test", time.Minute)
 	if err != nil || lease == nil || lease.Kind != kind {
 		t.Fatalf("claim kind=%q lease=%+v err=%v", kind, lease, err)
 	}

@@ -23,7 +23,7 @@ func (permanentTestError) Retryable() bool { return false }
 
 func TestEnqueueIsIdempotent(t *testing.T) {
 	queue, _ := openTestQueue(t)
-	spec := Spec{Kind: "sync", IdempotencyKey: "sync:user:1", Payload: []byte(`{"user":"1"}`), MaxAttempts: 3}
+	spec := Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "sync:user:1", Payload: []byte(`{"user":"1"}`), MaxAttempts: 3}
 	first, err := queue.Enqueue(context.Background(), spec)
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +43,7 @@ func TestClaimOrdersPriorityThenStableTime(t *testing.T) {
 	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 	var ids []uuid.UUID
 	for i, priority := range []int{10, 100, 50, 50, 50, 50} {
-		id, err := queue.Enqueue(ctx, Spec{Kind: "priority", IdempotencyKey: fmt.Sprintf("order:%d", i), Priority: priority, AvailableAt: base})
+		id, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "priority", IdempotencyKey: fmt.Sprintf("order:%d", i), Priority: priority, AvailableAt: base})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -64,7 +64,7 @@ func TestClaimOrdersPriorityThenStableTime(t *testing.T) {
 		lastA, lastB = lastB, lastA
 	}
 	for i, want := range []uuid.UUID{ids[1], ids[2], ids[3], lastA, lastB, ids[0]} {
-		lease, err := queue.Claim(ctx, "priority-test", time.Minute)
+		lease, err := queue.Claim(ctx, LaneInteractive, "priority-test", time.Minute)
 		if err != nil || lease == nil || lease.ID != want {
 			t.Fatalf("claim %d=%#v err=%v, want %s", i, lease, err, want)
 		}
@@ -79,11 +79,11 @@ func TestReenqueueRaisesButNeverLowersPriority(t *testing.T) {
 		t.Run(terminal, func(t *testing.T) {
 			queue, db := openTestQueue(t)
 			ctx := context.Background()
-			id, err := queue.Enqueue(ctx, Spec{Kind: "original", IdempotencyKey: "duplicate", Payload: []byte(`{"original":true}`), Priority: 10, MaxAttempts: 1})
+			id, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "original", IdempotencyKey: "duplicate", Payload: []byte(`{"original":true}`), Priority: 10, MaxAttempts: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
-			lease, err := queue.Claim(ctx, "owner", time.Minute)
+			lease, err := queue.Claim(ctx, LaneInteractive, "owner", time.Minute)
 			if err != nil || lease == nil {
 				t.Fatalf("claim=%#v err=%v", lease, err)
 			}
@@ -102,7 +102,7 @@ func TestReenqueueRaisesButNeverLowersPriority(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, priority := range []int{80, 50} {
-				duplicate, err := queue.Enqueue(ctx, Spec{Kind: "replacement", IdempotencyKey: "duplicate", Payload: []byte(`{"replacement":true}`), MaxAttempts: 9, Priority: priority, AvailableAt: time.Now().Add(time.Hour)})
+				duplicate, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "replacement", IdempotencyKey: "duplicate", Payload: []byte(`{"replacement":true}`), MaxAttempts: 9, Priority: priority, AvailableAt: time.Now().Add(time.Hour)})
 				if err != nil || duplicate != id {
 					t.Fatalf("duplicate=%s err=%v", duplicate, err)
 				}
@@ -129,11 +129,11 @@ func TestEnqueueInTxRollsBackAndSharesValidation(t *testing.T) {
 	defer tx.Rollback(ctx)
 	queries := db.Queries.WithTx(tx)
 	for _, spec := range []Spec{
-		{IdempotencyKey: "invalid"}, {Kind: "test"},
-		{Kind: "test", IdempotencyKey: "invalid", Payload: []byte(`{`)},
-		{Kind: "test", IdempotencyKey: "invalid", MaxAttempts: -1},
-		{Kind: "test", IdempotencyKey: "invalid", Priority: -1},
-		{Kind: "test", IdempotencyKey: "invalid", Priority: 101},
+		{Lane: LaneInteractive, IdempotencyKey: "invalid"}, {Lane: LaneInteractive, Kind: "test"},
+		{Lane: LaneInteractive, Kind: "test", IdempotencyKey: "invalid", Payload: []byte(`{`)},
+		{Lane: LaneInteractive, Kind: "test", IdempotencyKey: "invalid", MaxAttempts: -1},
+		{Lane: LaneInteractive, Kind: "test", IdempotencyKey: "invalid", Priority: -1},
+		{Lane: LaneInteractive, Kind: "test", IdempotencyKey: "invalid", Priority: 101},
 	} {
 		if _, err := queue.Enqueue(ctx, spec); err == nil {
 			t.Fatalf("Enqueue accepted invalid spec: %#v", spec)
@@ -142,10 +142,10 @@ func TestEnqueueInTxRollsBackAndSharesValidation(t *testing.T) {
 			t.Fatalf("EnqueueInTx accepted invalid spec: %#v", spec)
 		}
 	}
-	if _, err := EnqueueInTx(ctx, nil, Spec{Kind: "test", IdempotencyKey: "nil"}); err == nil {
+	if _, err := EnqueueInTx(ctx, nil, Spec{Lane: LaneInteractive, Kind: "test", IdempotencyKey: "nil"}); err == nil {
 		t.Fatal("nil queries accepted")
 	}
-	id, err := EnqueueInTx(ctx, queries, Spec{Kind: "test", IdempotencyKey: "rollback"})
+	id, err := EnqueueInTx(ctx, queries, Spec{Lane: LaneInteractive, Kind: "test", IdempotencyKey: "rollback"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,8 +176,8 @@ func TestEnqueueInTxRollsBackAndSharesValidation(t *testing.T) {
 		name string
 		spec Spec
 	}{
-		{name: "direct user", spec: Spec{Kind: "test", IdempotencyKey: "deleted", UserID: deleted}},
-		{name: "completion projection", spec: Spec{Kind: "completion.project", IdempotencyKey: "deleted-completion", UserID: deleted, Payload: []byte(`{"version":1}`)}},
+		{name: "direct user", spec: Spec{Lane: LaneInteractive, Kind: "test", IdempotencyKey: "deleted", UserID: deleted}},
+		{name: "completion projection", spec: Spec{Lane: LaneInteractive, Kind: "completion.project", IdempotencyKey: "deleted-completion", UserID: deleted, Payload: []byte(`{"version":1}`)}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			tx, err := db.Pool.Begin(ctx)
@@ -195,7 +195,7 @@ func TestEnqueueInTxRollsBackAndSharesValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	if _, err := EnqueueInTx(ctx, dbgen.New(tx), Spec{Kind: "achievement.classify", IdempotencyKey: "shared-classification", Payload: []byte(`{"version":1}`)}); err != nil {
+	if _, err := EnqueueInTx(ctx, dbgen.New(tx), Spec{Lane: LaneInteractive, Kind: "achievement.classify", IdempotencyKey: "shared-classification", Payload: []byte(`{"version":1}`)}); err != nil {
 		t.Fatalf("shared achievement classification was incorrectly fenced: %v", err)
 	}
 }
@@ -203,15 +203,15 @@ func TestEnqueueInTxRollsBackAndSharesValidation(t *testing.T) {
 func TestAwaitChildrenPreservesPriorityAndAvailableAt(t *testing.T) {
 	queue, db := openTestQueue(t)
 	ctx := context.Background()
-	if _, err := queue.Enqueue(ctx, Spec{Kind: "parent", IdempotencyKey: "scheduled-parent"}); err != nil {
+	if _, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "parent", IdempotencyKey: "scheduled-parent"}); err != nil {
 		t.Fatal(err)
 	}
-	parent, err := queue.Claim(ctx, "parent-worker", time.Minute)
+	parent, err := queue.Claim(ctx, LaneInteractive, "parent-worker", time.Minute)
 	if err != nil || parent == nil {
 		t.Fatalf("parent=%#v err=%v", parent, err)
 	}
 	future := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
-	ready, err := queue.AwaitChildren(ctx, *parent, []Spec{{Kind: "child", IdempotencyKey: "scheduled-child", Priority: 80, AvailableAt: future, Optional: true}})
+	ready, err := queue.AwaitChildren(ctx, *parent, []Spec{{Lane: LaneInteractive, Kind: "child", IdempotencyKey: "scheduled-child", Priority: 80, AvailableAt: future, Optional: true}})
 	if err != nil || ready {
 		t.Fatalf("ready=%v err=%v", ready, err)
 	}
@@ -224,7 +224,7 @@ func TestAwaitChildrenPreservesPriorityAndAvailableAt(t *testing.T) {
 	if priority != 80 || !availableAt.Equal(future) || required {
 		t.Fatalf("child priority=%d available=%v required=%v", priority, availableAt, required)
 	}
-	if lease, err := queue.Claim(ctx, "child-worker", time.Minute); err != nil || lease != nil {
+	if lease, err := queue.Claim(ctx, LaneInteractive, "child-worker", time.Minute); err != nil || lease != nil {
 		t.Fatalf("claimed scheduled child: %#v err=%v", lease, err)
 	}
 }
@@ -232,18 +232,18 @@ func TestAwaitChildrenPreservesPriorityAndAvailableAt(t *testing.T) {
 func TestDeferUntilIsFenced(t *testing.T) {
 	queue, db := openTestQueue(t)
 	ctx := context.Background()
-	id, err := queue.Enqueue(ctx, Spec{Kind: "poll", IdempotencyKey: "poll", MaxAttempts: 2})
+	id, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "poll", IdempotencyKey: "poll", MaxAttempts: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := queue.Claim(ctx, "poller", time.Minute)
+	first, err := queue.Claim(ctx, LaneInteractive, "poller", time.Minute)
 	if err != nil || first == nil {
 		t.Fatalf("claim=%#v err=%v", first, err)
 	}
 	if _, err := queue.Fail(ctx, *first, errors.New("temporary"), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	lease, err := queue.Claim(ctx, "poller", time.Minute)
+	lease, err := queue.Claim(ctx, LaneInteractive, "poller", time.Minute)
 	if err != nil || lease == nil || lease.Attempts != 2 {
 		t.Fatalf("claim=%#v err=%v", lease, err)
 	}
@@ -290,13 +290,13 @@ func TestDeferUntilIsFenced(t *testing.T) {
 	if err := queue.Complete(ctx, *lease); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("deferred completion=%v", err)
 	}
-	if got, err := queue.Claim(ctx, "other", time.Minute); err != nil || got != nil {
+	if got, err := queue.Claim(ctx, LaneInteractive, "other", time.Minute); err != nil || got != nil {
 		t.Fatalf("early claim=%#v err=%v", got, err)
 	}
 	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET available_at=now() WHERE id=$1`, id); err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := queue.Claim(ctx, "resumed", time.Minute)
+	resumed, err := queue.Claim(ctx, LaneInteractive, "resumed", time.Minute)
 	if err != nil || resumed == nil || resumed.Attempts != 2 || resumed.FencingToken == lease.FencingToken {
 		t.Fatalf("resumed=%#v err=%v", resumed, err)
 	}
@@ -310,15 +310,15 @@ func TestDeferUntilIsFenced(t *testing.T) {
 
 func TestClaimSkipsLeasedJob(t *testing.T) {
 	queue, _ := openTestQueue(t)
-	_, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: "one"})
+	_, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "one"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := queue.Claim(context.Background(), "worker-a", time.Minute)
+	first, err := queue.Claim(context.Background(), LaneInteractive, "worker-a", time.Minute)
 	if err != nil || first == nil {
 		t.Fatalf("first claim = %#v, %v", first, err)
 	}
-	second, err := queue.Claim(context.Background(), "worker-b", time.Minute)
+	second, err := queue.Claim(context.Background(), LaneInteractive, "worker-b", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,11 +330,11 @@ func TestClaimSkipsLeasedJob(t *testing.T) {
 func TestFailureOutcomeDistinguishesRetryDeadAndLeaseLoss(t *testing.T) {
 	queue, db := openTestQueue(t)
 	ctx := context.Background()
-	id, err := queue.Enqueue(ctx, Spec{Kind: "steam.sync", IdempotencyKey: "failure-outcome", MaxAttempts: 2})
+	id, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "steam.sync", IdempotencyKey: "failure-outcome", MaxAttempts: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := queue.Claim(ctx, "worker", time.Minute)
+	first, err := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
 	if err != nil || first == nil {
 		t.Fatalf("first claim=%#v err=%v", first, err)
 	}
@@ -345,7 +345,7 @@ func TestFailureOutcomeDistinguishesRetryDeadAndLeaseLoss(t *testing.T) {
 	if _, err := db.Pool.Exec(ctx, "UPDATE sync_jobs SET available_at=now() WHERE id=$1", id); err != nil {
 		t.Fatal(err)
 	}
-	second, err := queue.Claim(ctx, "worker", time.Minute)
+	second, err := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
 	if err != nil || second == nil {
 		t.Fatalf("second claim=%#v err=%v", second, err)
 	}
@@ -364,11 +364,11 @@ func TestFailureOutcomeDistinguishesRetryDeadAndLeaseLoss(t *testing.T) {
 func TestPermanentFailureDeadLettersOnFirstAttempt(t *testing.T) {
 	queue, db := openTestQueue(t)
 	ctx := context.Background()
-	id, err := queue.Enqueue(ctx, Spec{Kind: "ai.features", IdempotencyKey: "permanent-first-attempt", MaxAttempts: 3})
+	id, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "ai.features", IdempotencyKey: "permanent-first-attempt", MaxAttempts: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := queue.Claim(ctx, "worker", time.Minute)
+	lease, err := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
 	if err != nil || lease == nil {
 		t.Fatalf("claim=%#v err=%v", lease, err)
 	}
@@ -389,11 +389,11 @@ func TestPermanentFailureDeadLettersOnFirstAttempt(t *testing.T) {
 func TestClaimClearsCurrentErrorAndPreservesAttemptHistory(t *testing.T) {
 	queue, db := openTestQueue(t)
 	ctx := context.Background()
-	id, err := queue.Enqueue(ctx, Spec{Kind: "steam.sync", IdempotencyKey: "claim-clears-error", MaxAttempts: 3})
+	id, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "steam.sync", IdempotencyKey: "claim-clears-error", MaxAttempts: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := queue.Claim(ctx, "worker-a", time.Minute)
+	first, err := queue.Claim(ctx, LaneInteractive, "worker-a", time.Minute)
 	if err != nil || first == nil {
 		t.Fatalf("first claim=%#v err=%v", first, err)
 	}
@@ -403,7 +403,7 @@ func TestClaimClearsCurrentErrorAndPreservesAttemptHistory(t *testing.T) {
 	if _, err := db.Pool.Exec(ctx, "UPDATE sync_jobs SET available_at=now() WHERE id=$1", id); err != nil {
 		t.Fatal(err)
 	}
-	second, err := queue.Claim(ctx, "worker-b", time.Minute)
+	second, err := queue.Claim(ctx, LaneInteractive, "worker-b", time.Minute)
 	if err != nil || second == nil {
 		t.Fatalf("second claim=%#v err=%v", second, err)
 	}
@@ -453,33 +453,33 @@ func TestClaimClearsCurrentErrorAndPreservesAttemptHistory(t *testing.T) {
 func TestLeaseCarriesRootWorkflowAndStoredMetadata(t *testing.T) {
 	queue, _ := openTestQueue(t)
 	ctx := context.Background()
-	_, err := queue.Enqueue(ctx, Spec{Kind: "steam.sync", IdempotencyKey: "workflow-root", Stage: "steam"})
+	_, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "steam.sync", IdempotencyKey: "workflow-root", Stage: "steam"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := queue.Claim(ctx, "worker", time.Minute)
+	root, err := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
 	if err != nil || root == nil {
 		t.Fatalf("root=%#v err=%v", root, err)
 	}
 	if root.WorkflowID != root.ID || root.ParentJobID != uuid.Nil || !root.Required || root.Stage != "steam" {
 		t.Fatalf("root metadata=%#v", root)
 	}
-	ready, err := queue.AwaitChildren(ctx, *root, []Spec{{Kind: "ai.features", IdempotencyKey: "workflow-child", Optional: true, Stage: "ai_features"}})
+	ready, err := queue.AwaitChildren(ctx, *root, []Spec{{Lane: LaneInteractive, Kind: "ai.features", IdempotencyKey: "workflow-child", Optional: true, Stage: "ai_features"}})
 	if err != nil || ready {
 		t.Fatalf("child scheduling ready=%v err=%v", ready, err)
 	}
-	child, err := queue.Claim(ctx, "worker", time.Minute)
+	child, err := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
 	if err != nil || child == nil {
 		t.Fatalf("child=%#v err=%v", child, err)
 	}
 	if child.WorkflowID != root.ID || child.ParentJobID != root.ID || child.Required || child.Stage != "ai_features" {
 		t.Fatalf("child metadata=%#v", child)
 	}
-	ready, err = queue.AwaitChildren(ctx, *child, []Spec{{Kind: "ai.embedding", IdempotencyKey: "workflow-grandchild", Required: true, Stage: "ai_embedding"}})
+	ready, err = queue.AwaitChildren(ctx, *child, []Spec{{Lane: LaneInteractive, Kind: "ai.embedding", IdempotencyKey: "workflow-grandchild", Required: true, Stage: "ai_embedding"}})
 	if err != nil || ready {
 		t.Fatalf("grandchild scheduling ready=%v err=%v", ready, err)
 	}
-	grandchild, err := queue.Claim(ctx, "worker", time.Minute)
+	grandchild, err := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
 	if err != nil || grandchild == nil {
 		t.Fatalf("grandchild=%#v err=%v", grandchild, err)
 	}
@@ -491,17 +491,17 @@ func TestLeaseCarriesRootWorkflowAndStoredMetadata(t *testing.T) {
 func TestAwaitChildrenPublishesCompleteBatchAtomically(t *testing.T) {
 	queue, db := openTestQueue(t)
 	ctx := context.Background()
-	if _, err := queue.Enqueue(ctx, Spec{Kind: "steam.sync", IdempotencyKey: "atomic-batch-root", Stage: "steam"}); err != nil {
+	if _, err := queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "steam.sync", IdempotencyKey: "atomic-batch-root", Stage: "steam"}); err != nil {
 		t.Fatal(err)
 	}
-	root, err := queue.Claim(ctx, "worker", time.Minute)
+	root, err := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
 	if err != nil || root == nil {
 		t.Fatalf("root=%#v err=%v", root, err)
 	}
 
 	_, err = queue.AwaitChildren(ctx, *root, []Spec{
-		{Kind: "ai.features", IdempotencyKey: "atomic-batch-valid", Stage: "ai_features"},
-		{Kind: "ai.features", IdempotencyKey: "atomic-batch-invalid", Stage: "ai_features", MaxAttempts: -1},
+		{Lane: LaneInteractive, Kind: "ai.features", IdempotencyKey: "atomic-batch-valid", Stage: "ai_features"},
+		{Lane: LaneInteractive, Kind: "ai.features", IdempotencyKey: "atomic-batch-invalid", Stage: "ai_features", MaxAttempts: -1},
 	})
 	if err == nil {
 		t.Fatal("AwaitChildren accepted an invalid partial batch")
@@ -522,8 +522,8 @@ func TestAwaitChildrenPublishesCompleteBatchAtomically(t *testing.T) {
 	}
 
 	ready, err := queue.AwaitChildren(ctx, *root, []Spec{
-		{Kind: "ai.features", IdempotencyKey: "atomic-batch-one", Stage: "ai_features"},
-		{Kind: "ai.features", IdempotencyKey: "atomic-batch-two", Stage: "ai_features"},
+		{Lane: LaneInteractive, Kind: "ai.features", IdempotencyKey: "atomic-batch-one", Stage: "ai_features"},
+		{Lane: LaneInteractive, Kind: "ai.features", IdempotencyKey: "atomic-batch-two", Stage: "ai_features"},
 	})
 	if err != nil || ready {
 		t.Fatalf("AwaitChildren ready=%v err=%v", ready, err)
@@ -534,7 +534,7 @@ func TestAwaitChildrenPublishesCompleteBatchAtomically(t *testing.T) {
 	if childCount != 2 {
 		t.Fatalf("published AI batch has %d children, want 2", childCount)
 	}
-	first, err := queue.Claim(ctx, "ai-worker", time.Minute)
+	first, err := queue.Claim(ctx, LaneInteractive, "ai-worker", time.Minute)
 	if err != nil || first == nil {
 		t.Fatalf("first AI claim=%#v err=%v", first, err)
 	}
@@ -551,11 +551,11 @@ func TestAwaitChildrenPublishesCompleteBatchAtomically(t *testing.T) {
 
 func TestRecordResultRequiresCurrentFencingToken(t *testing.T) {
 	queue, db := openTestQueue(t)
-	id, err := queue.Enqueue(context.Background(), Spec{Kind: "profile.rebuild", IdempotencyKey: "profile:user:1"})
+	id, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "profile.rebuild", IdempotencyKey: "profile:user:1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := queue.Claim(context.Background(), "worker-a", time.Minute)
+	lease, err := queue.Claim(context.Background(), LaneInteractive, "worker-a", time.Minute)
 	if err != nil || lease == nil {
 		t.Fatalf("claim=%#v err=%v", lease, err)
 	}
@@ -576,18 +576,18 @@ func TestRecordResultRequiresCurrentFencingToken(t *testing.T) {
 func TestNestedRequiredFailurePromotesGrandparentWhenParentIsOptional(t *testing.T) {
 	queue, db := openTestQueue(t)
 	ctx := context.Background()
-	_, _ = queue.Enqueue(ctx, Spec{Kind: "sync", IdempotencyKey: "nested-root"})
-	root, _ := queue.Claim(ctx, "worker", time.Minute)
-	ready, err := queue.AwaitChildren(ctx, *root, []Spec{{Kind: "feature", IdempotencyKey: "nested-feature", Optional: true, MaxAttempts: 1}})
+	_, _ = queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "nested-root"})
+	root, _ := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
+	ready, err := queue.AwaitChildren(ctx, *root, []Spec{{Lane: LaneInteractive, Kind: "feature", IdempotencyKey: "nested-feature", Optional: true, MaxAttempts: 1}})
 	if err != nil || ready {
 		t.Fatalf("feature wait ready=%v err=%v", ready, err)
 	}
-	feature, _ := queue.Claim(ctx, "worker", time.Minute)
-	ready, err = queue.AwaitChildren(ctx, *feature, []Spec{{Kind: "embedding", IdempotencyKey: "nested-embedding", Required: true, MaxAttempts: 1}})
+	feature, _ := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
+	ready, err = queue.AwaitChildren(ctx, *feature, []Spec{{Lane: LaneInteractive, Kind: "embedding", IdempotencyKey: "nested-embedding", Required: true, MaxAttempts: 1}})
 	if err != nil || ready {
 		t.Fatalf("embedding wait ready=%v err=%v", ready, err)
 	}
-	embedding, _ := queue.Claim(ctx, "worker", time.Minute)
+	embedding, _ := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
 	if _, err := queue.Fail(ctx, *embedding, errors.New("embedding failed"), time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -603,17 +603,17 @@ func TestNestedRequiredFailurePromotesGrandparentWhenParentIsOptional(t *testing
 func TestNestedExpiredRequiredLeasePromotesGrandparentWhenParentIsOptional(t *testing.T) {
 	queue, db := openTestQueue(t)
 	ctx := context.Background()
-	_, _ = queue.Enqueue(ctx, Spec{Kind: "sync", IdempotencyKey: "expired-root"})
-	root, _ := queue.Claim(ctx, "worker", time.Minute)
-	_, _ = queue.AwaitChildren(ctx, *root, []Spec{{Kind: "feature", IdempotencyKey: "expired-feature", Optional: true, MaxAttempts: 1}})
-	feature, _ := queue.Claim(ctx, "worker", time.Minute)
-	_, _ = queue.AwaitChildren(ctx, *feature, []Spec{{Kind: "embedding", IdempotencyKey: "expired-embedding", Required: true, MaxAttempts: 1}})
-	embedding, _ := queue.Claim(ctx, "worker", 15*time.Millisecond)
+	_, _ = queue.Enqueue(ctx, Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "expired-root"})
+	root, _ := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
+	_, _ = queue.AwaitChildren(ctx, *root, []Spec{{Lane: LaneInteractive, Kind: "feature", IdempotencyKey: "expired-feature", Optional: true, MaxAttempts: 1}})
+	feature, _ := queue.Claim(ctx, LaneInteractive, "worker", time.Minute)
+	_, _ = queue.AwaitChildren(ctx, *feature, []Spec{{Lane: LaneInteractive, Kind: "embedding", IdempotencyKey: "expired-embedding", Required: true, MaxAttempts: 1}})
+	embedding, _ := queue.Claim(ctx, LaneInteractive, "worker", 15*time.Millisecond)
 	if embedding == nil {
 		t.Fatal("embedding not claimed")
 	}
 	time.Sleep(30 * time.Millisecond)
-	reclaimed, err := queue.Claim(ctx, "next-worker", time.Minute)
+	reclaimed, err := queue.Claim(ctx, LaneInteractive, "next-worker", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -628,16 +628,16 @@ func TestNestedExpiredRequiredLeasePromotesGrandparentWhenParentIsOptional(t *te
 
 func TestExpiredLeaseCanBeReclaimed(t *testing.T) {
 	queue, _ := openTestQueue(t)
-	id, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: "reclaim"})
+	id, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "reclaim"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := queue.Claim(context.Background(), "worker-a", 20*time.Millisecond)
+	first, err := queue.Claim(context.Background(), LaneInteractive, "worker-a", 20*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(35 * time.Millisecond)
-	second, err := queue.Claim(context.Background(), "worker-b", time.Minute)
+	second, err := queue.Claim(context.Background(), LaneInteractive, "worker-b", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,21 +651,21 @@ func TestExpiredLeaseCanBeReclaimed(t *testing.T) {
 
 func TestExpiredLeasesExhaustAttempts(t *testing.T) {
 	queue, db := openTestQueue(t)
-	id, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: "crash-loop", MaxAttempts: 2})
+	id, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "crash-loop", MaxAttempts: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := queue.Claim(context.Background(), "worker-a", 15*time.Millisecond)
+	first, err := queue.Claim(context.Background(), LaneInteractive, "worker-a", 15*time.Millisecond)
 	if err != nil || first == nil {
 		t.Fatalf("first claim = %#v, %v", first, err)
 	}
 	time.Sleep(30 * time.Millisecond)
-	second, err := queue.Claim(context.Background(), "worker-b", 15*time.Millisecond)
+	second, err := queue.Claim(context.Background(), LaneInteractive, "worker-b", 15*time.Millisecond)
 	if err != nil || second == nil {
 		t.Fatalf("second claim = %#v, %v", second, err)
 	}
 	time.Sleep(30 * time.Millisecond)
-	third, err := queue.Claim(context.Background(), "worker-c", time.Minute)
+	third, err := queue.Claim(context.Background(), LaneInteractive, "worker-c", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,16 +691,16 @@ func TestExpiredLeasesExhaustAttempts(t *testing.T) {
 
 func TestStaleLeaseCannotCompleteOrFail(t *testing.T) {
 	queue, _ := openTestQueue(t)
-	_, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: "stale"})
+	_, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "stale"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	stale, err := queue.Claim(context.Background(), "worker-a", 15*time.Millisecond)
+	stale, err := queue.Claim(context.Background(), LaneInteractive, "worker-a", 15*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(30 * time.Millisecond)
-	current, err := queue.Claim(context.Background(), "worker-b", time.Minute)
+	current, err := queue.Claim(context.Background(), LaneInteractive, "worker-b", time.Minute)
 	if err != nil || current == nil {
 		t.Fatalf("reclaim = %#v, %v", current, err)
 	}
@@ -717,11 +717,11 @@ func TestStaleLeaseCannotCompleteOrFail(t *testing.T) {
 
 func TestRetryBackoffAndAttemptExhaustion(t *testing.T) {
 	queue, db := openTestQueue(t)
-	id, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: "retry", MaxAttempts: 2})
+	id, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "retry", MaxAttempts: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := queue.Claim(context.Background(), "worker", time.Minute)
+	first, err := queue.Claim(context.Background(), LaneInteractive, "worker", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -729,7 +729,7 @@ func TestRetryBackoffAndAttemptExhaustion(t *testing.T) {
 	if _, err := queue.Fail(context.Background(), *first, errors.New("temporary"), retryAt); err != nil {
 		t.Fatal(err)
 	}
-	claim, err := queue.Claim(context.Background(), "worker", time.Minute)
+	claim, err := queue.Claim(context.Background(), LaneInteractive, "worker", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -739,7 +739,7 @@ func TestRetryBackoffAndAttemptExhaustion(t *testing.T) {
 	if _, err := db.Pool.Exec(context.Background(), "UPDATE sync_jobs SET available_at=now() WHERE id=$1", id); err != nil {
 		t.Fatal(err)
 	}
-	second, err := queue.Claim(context.Background(), "worker", time.Minute)
+	second, err := queue.Claim(context.Background(), LaneInteractive, "worker", time.Minute)
 	if err != nil || second == nil {
 		t.Fatalf("second claim = %#v, %v", second, err)
 	}
@@ -754,7 +754,7 @@ func TestRetryBackoffAndAttemptExhaustion(t *testing.T) {
 	if status != "dead" || attempts != 2 {
 		t.Fatalf("status, attempts = %q, %d; want dead, 2", status, attempts)
 	}
-	claim, err = queue.Claim(context.Background(), "worker", time.Minute)
+	claim, err = queue.Claim(context.Background(), LaneInteractive, "worker", time.Minute)
 	if err != nil || claim != nil {
 		t.Fatalf("exhausted claim = %#v, %v", claim, err)
 	}
@@ -764,7 +764,7 @@ func TestParallelClaimsAreUnique(t *testing.T) {
 	queue, _ := openTestQueue(t)
 	const count = 16
 	for i := 0; i < count; i++ {
-		_, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: uuid.NewString()})
+		_, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: uuid.NewString()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -778,7 +778,7 @@ func TestParallelClaimsAreUnique(t *testing.T) {
 		go func(worker int) {
 			defer wg.Done()
 			<-start
-			lease, err := queue.Claim(context.Background(), uuid.NewString(), time.Minute)
+			lease, err := queue.Claim(context.Background(), LaneInteractive, uuid.NewString(), time.Minute)
 			if err != nil {
 				errs <- err
 				return
@@ -812,22 +812,22 @@ func TestParallelClaimsAreUnique(t *testing.T) {
 
 func TestDeferredParentPreservesItsFinalAttemptForCompletion(t *testing.T) {
 	queue, db := openTestQueue(t)
-	parentID, err := queue.Enqueue(context.Background(), Spec{Kind: "parent", IdempotencyKey: "parent-final-attempt", MaxAttempts: 2})
+	parentID, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "parent", IdempotencyKey: "parent-final-attempt", MaxAttempts: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := queue.Claim(context.Background(), "worker", time.Minute)
+	first, err := queue.Claim(context.Background(), LaneInteractive, "worker", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := queue.Fail(context.Background(), *first, errors.New("temporary"), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	second, err := queue.Claim(context.Background(), "worker", time.Minute)
+	second, err := queue.Claim(context.Background(), LaneInteractive, "worker", time.Minute)
 	if err != nil || second == nil || second.Attempts != 2 {
 		t.Fatalf("final parent attempt = %#v, %v", second, err)
 	}
-	ready, err := queue.AwaitChildren(context.Background(), *second, []Spec{{Kind: "child", IdempotencyKey: "parent-final-attempt:child", Required: true}})
+	ready, err := queue.AwaitChildren(context.Background(), *second, []Spec{{Lane: LaneInteractive, Kind: "child", IdempotencyKey: "parent-final-attempt:child", Required: true}})
 	if err != nil || ready {
 		t.Fatalf("AwaitChildren = %v, %v; want deferred", ready, err)
 	}
@@ -838,14 +838,14 @@ func TestDeferredParentPreservesItsFinalAttemptForCompletion(t *testing.T) {
 	if attempts != 1 {
 		t.Fatalf("deferred parent attempts = %d, want 1", attempts)
 	}
-	child, err := queue.Claim(context.Background(), "worker", time.Minute)
+	child, err := queue.Claim(context.Background(), LaneInteractive, "worker", time.Minute)
 	if err != nil || child == nil || child.Kind != "child" {
 		t.Fatalf("child claim = %#v, %v", child, err)
 	}
 	if err := queue.Complete(context.Background(), *child); err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := queue.Claim(context.Background(), "worker", time.Minute)
+	resumed, err := queue.Claim(context.Background(), LaneInteractive, "worker", time.Minute)
 	if err != nil || resumed == nil || resumed.ID != parentID || resumed.Attempts != 2 {
 		t.Fatalf("resumed parent = %#v, %v", resumed, err)
 	}
@@ -853,24 +853,24 @@ func TestDeferredParentPreservesItsFinalAttemptForCompletion(t *testing.T) {
 
 func TestExpiredRequiredChildFailsWaitingParent(t *testing.T) {
 	queue, db := openTestQueue(t)
-	parentID, err := queue.Enqueue(context.Background(), Spec{Kind: "parent", IdempotencyKey: "expired-child-parent"})
+	parentID, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "parent", IdempotencyKey: "expired-child-parent"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent, err := queue.Claim(context.Background(), "worker", time.Minute)
+	parent, err := queue.Claim(context.Background(), LaneInteractive, "worker", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ready, err := queue.AwaitChildren(context.Background(), *parent, []Spec{{Kind: "child", IdempotencyKey: "expired-child-parent:child", Required: true, MaxAttempts: 1}})
+	ready, err := queue.AwaitChildren(context.Background(), *parent, []Spec{{Lane: LaneInteractive, Kind: "child", IdempotencyKey: "expired-child-parent:child", Required: true, MaxAttempts: 1}})
 	if err != nil || ready {
 		t.Fatalf("AwaitChildren = %v, %v; want deferred", ready, err)
 	}
-	child, err := queue.Claim(context.Background(), "worker", 15*time.Millisecond)
+	child, err := queue.Claim(context.Background(), LaneInteractive, "worker", 15*time.Millisecond)
 	if err != nil || child == nil {
 		t.Fatalf("child claim = %#v, %v", child, err)
 	}
 	time.Sleep(30 * time.Millisecond)
-	if _, err := queue.Claim(context.Background(), "cleanup", time.Minute); err != nil {
+	if _, err := queue.Claim(context.Background(), LaneInteractive, "cleanup", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	var status, lastError string

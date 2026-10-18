@@ -121,7 +121,7 @@ func TestDiscoveryEnrichmentPublicationFencesObsoleteExecutions(t *testing.T) {
 			if stage == "queued" {
 				qualifyB()
 			}
-			worker := jobs.NewWorker(s.queue, "publication-fence", jobs.WithConcurrency(2), jobs.WithPollInterval(time.Millisecond))
+			worker := jobs.NewWorker(s.queue, jobs.LaneInteractive, "publication-fence", jobs.WithConcurrency(2), jobs.WithPollInterval(time.Millisecond))
 			if err = enrichment.RegisterHandlers(worker); err != nil {
 				t.Fatal(err)
 			}
@@ -260,7 +260,7 @@ func TestDiscoverySemanticNoopDuringExtractionRetainsPublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := leaseDiscoveryID(t, s, enqueueQualification(t, s, DiscoveredApp{AppID: 42, LastModified: now.Add(time.Second)}, 0))
-	worker := jobs.NewWorker(s.queue, "semantic-noop", jobs.WithPollInterval(time.Millisecond))
+	worker := jobs.NewWorker(s.queue, jobs.LaneInteractive, "semantic-noop", jobs.WithPollInterval(time.Millisecond))
 	if err = enrichment.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}

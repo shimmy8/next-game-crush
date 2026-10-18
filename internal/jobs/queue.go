@@ -18,7 +18,20 @@ import (
 var ErrLeaseLost = errors.New("job lease is no longer owned")
 var ErrDeferred = errors.New("job deferred")
 
+type Lane string
+
+const (
+	LaneInteractive Lane = "interactive"
+	LaneCatalog     Lane = "catalog"
+)
+
+func (lane Lane) valid() bool {
+	return lane == LaneInteractive || lane == LaneCatalog
+}
+
 type Spec struct {
+	// Lane is required for roots; children inherit their parent's lane when empty.
+	Lane           Lane
 	Kind           string
 	IdempotencyKey string
 	Payload        json.RawMessage
@@ -33,6 +46,7 @@ type Spec struct {
 }
 
 type Lease struct {
+	Lane           Lane
 	ID             uuid.UUID
 	ParentJobID    uuid.UUID
 	WorkflowID     uuid.UUID
@@ -104,6 +118,9 @@ func EnqueueInTx(ctx context.Context, queries *dbgen.Queries, spec Spec) (uuid.U
 	if queries == nil {
 		return uuid.Nil, errors.New("queue queries are required")
 	}
+	if !spec.Lane.valid() && (spec.Lane != "" || spec.ParentJobID == uuid.Nil) {
+		return uuid.Nil, errors.New("job lane must be interactive or catalog")
+	}
 	if strings.TrimSpace(spec.Kind) == "" {
 		return uuid.Nil, errors.New("job kind is required")
 	}
@@ -128,8 +145,18 @@ func EnqueueInTx(ctx context.Context, queries *dbgen.Queries, spec Spec) (uuid.U
 	if spec.Priority < 1 || spec.Priority > 100 {
 		return uuid.Nil, errors.New("priority must be between 1 and 100")
 	}
+	if spec.ParentJobID != uuid.Nil {
+		parentLane, err := queries.GetJobLane(ctx, uuidToPG(spec.ParentJobID))
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("resolve parent job lane: %w", err)
+		}
+		if !Lane(parentLane).valid() || (spec.Lane != "" && spec.Lane != Lane(parentLane)) {
+			return uuid.Nil, errors.New("child job must use its parent lane")
+		}
+		spec.Lane = Lane(parentLane)
+	}
 	if spec.ParentJobID == uuid.Nil && !spec.Required {
-		// Root jobs are required by definition; zero-value Specs remain backwards compatible.
+		// Root jobs are required by definition.
 		spec.Required = true
 	}
 	availableAt := pgtype.Timestamptz{}
@@ -140,7 +167,7 @@ func EnqueueInTx(ctx context.Context, queries *dbgen.Queries, spec Spec) (uuid.U
 		ID: uuidToPG(uuid.New()), Kind: spec.Kind, IdempotencyKey: spec.IdempotencyKey,
 		Payload: spec.Payload, MaxAttempts: int32(spec.MaxAttempts), AvailableAt: availableAt,
 		ParentJobID: nullableUUID(spec.ParentJobID), Required: spec.Required, Stage: spec.Stage,
-		UserID: nullableUUID(spec.UserID), Priority: int16(spec.Priority),
+		UserID: nullableUUID(spec.UserID), Priority: int16(spec.Priority), Lane: string(spec.Lane),
 	})
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("enqueue job: %w", err)
@@ -152,6 +179,14 @@ func EnqueueInTx(ctx context.Context, queries *dbgen.Queries, spec Spec) (uuid.U
 // parent lease. The parent is re-queued once every child is terminal and no
 // required child failed. The caller must return ErrDeferred when ready is false.
 func (q *Queue) AwaitChildren(ctx context.Context, lease Lease, specs []Spec) (ready bool, err error) {
+	if !lease.Lane.valid() {
+		return false, errors.New("parent job lane must be interactive or catalog")
+	}
+	for _, spec := range specs {
+		if spec.Lane != "" && spec.Lane != lease.Lane {
+			return false, errors.New("child job must use its parent lane")
+		}
+	}
 	if q == nil || q.store == nil {
 		return false, errors.New("queue store is required")
 	}
@@ -232,7 +267,10 @@ func (q *Queue) DeferUntil(ctx context.Context, lease Lease, availableAt time.Ti
 	return nil
 }
 
-func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration) (*Lease, error) {
+func (q *Queue) Claim(ctx context.Context, lane Lane, workerID string, lease time.Duration) (*Lease, error) {
+	if !lane.valid() {
+		return nil, errors.New("job lane must be interactive or catalog")
+	}
 	if q == nil || q.store == nil {
 		return nil, errors.New("queue store is required")
 	}
@@ -265,7 +303,7 @@ func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration)
 	}
 	token := uuid.New()
 	row, err := queries.ClaimJob(ctx, dbgen.ClaimJobParams{
-		WorkerID: textToPG(workerID), FencingToken: uuidToPG(token), LeaseDuration: durationToPG(lease),
+		Lane: string(lane), WorkerID: textToPG(workerID), FencingToken: uuidToPG(token), LeaseDuration: durationToPG(lease),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
@@ -305,7 +343,7 @@ func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration)
 		return nil, fmt.Errorf("commit claim: %w", err)
 	}
 	return &Lease{
-		ID: jobID, ParentJobID: parentJobID, WorkflowID: workflowID,
+		Lane: Lane(row.Lane), ID: jobID, ParentJobID: parentJobID, WorkflowID: workflowID,
 		Kind: row.Kind, Required: row.Required, Stage: row.Stage, UserID: userID, IdempotencyKey: row.IdempotencyKey,
 		Payload: row.Payload, Result: row.Result, Attempts: int(row.Attempts), MaxAttempts: int(row.MaxAttempts),
 		Priority: int(row.Priority),

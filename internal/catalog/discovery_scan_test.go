@@ -20,7 +20,7 @@ func scanLease(t *testing.T, s *DiscoveryService, mode DiscoveryMode, now time.T
 	}
 	p := ScanPayload{Version: 1, Mode: mode, ScanStartedAt: *state.ScanStartedAt, AfterAppID: state.CursorAppID, BudgetHour: now.UTC().Truncate(time.Hour), PageGeneration: generation}
 	raw, _ := json.Marshal(p)
-	id, err := s.queue.Enqueue(context.Background(), jobs.Spec{Kind: "catalog.discover." + string(mode), Payload: raw, IdempotencyKey: scanKey(p), Priority: scanPriority(mode)})
+	id, err := s.queue.Enqueue(context.Background(), jobs.Spec{Lane: jobs.LaneInteractive, Kind: "catalog.discover." + string(mode), Payload: raw, IdempotencyKey: scanKey(p), Priority: scanPriority(mode)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func scanLease(t *testing.T, s *DiscoveryService, mode DiscoveryMode, now time.T
 }
 func leaseDiscoveryID(t *testing.T, s *DiscoveryService, id uuid.UUID) jobs.Lease {
 	t.Helper()
-	l := jobs.Lease{ID: id, WorkerID: uuid.NewString(), FencingToken: uuid.New(), Attempts: 1, MaxAttempts: 3}
+	l := jobs.Lease{Lane: jobs.LaneInteractive, ID: id, WorkerID: uuid.NewString(), FencingToken: uuid.New(), Attempts: 1, MaxAttempts: 3}
 	err := s.repo.store.Pool.QueryRow(context.Background(), `UPDATE sync_jobs SET status='running',worker_id=$2,fencing_token=$3,lease_until=now()+interval '1 minute',attempts=GREATEST(attempts,1) WHERE id=$1 RETURNING kind,payload,idempotency_key,attempts`, id, l.WorkerID, l.FencingToken).Scan(&l.Kind, &l.Payload, &l.IdempotencyKey, &l.Attempts)
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +179,7 @@ func TestConcurrentCoordinatorsReserveOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := json.Marshal(QualificationPayload{Version: 1, App: app, RetryGeneration: 0, BudgetHour: now.Truncate(time.Hour), Priority: 50})
-	old, err := s.queue.Enqueue(ctx, jobs.Spec{Kind: QualifyJobKind, Payload: raw, IdempotencyKey: qualificationKey(app, 0)})
+	old, err := s.queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: QualifyJobKind, Payload: raw, IdempotencyKey: qualificationKey(app, 0)})
 	if err != nil {
 		t.Fatal(err)
 	}

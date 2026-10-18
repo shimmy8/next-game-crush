@@ -70,7 +70,7 @@ func TestDisableWorkflowReranksAndDiffPinsItsVersion(t *testing.T) {
 	if err != nil || accepted.PreviousRankingVersion != 2 {
 		t.Fatalf("accepted=%#v err=%v", accepted, err)
 	}
-	worker := jobs.NewWorker(queue, "disable-fixture", jobs.WithPollInterval(time.Millisecond*5))
+	worker := jobs.NewWorker(queue, jobs.LaneInteractive, "disable-fixture", jobs.WithPollInterval(time.Millisecond*5))
 	if err := profiles.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}

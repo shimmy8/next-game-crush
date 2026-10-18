@@ -92,7 +92,7 @@ func qualificationKey(app DiscoveredApp, generation int) string {
 }
 func qualificationSpec(payload QualificationPayload, parent uuid.UUID) jobs.Spec {
 	raw, _ := json.Marshal(payload)
-	return jobs.Spec{Kind: QualifyJobKind, Stage: "catalog_qualify", IdempotencyKey: qualificationKey(payload.App, payload.RetryGeneration), Payload: raw, Priority: payload.Priority, ParentJobID: parent, Optional: true, Required: false, MaxAttempts: 3}
+	return jobs.Spec{Lane: jobs.LaneInteractive, Kind: QualifyJobKind, Stage: "catalog_qualify", IdempotencyKey: qualificationKey(payload.App, payload.RetryGeneration), Payload: raw, Priority: payload.Priority, ParentJobID: parent, Optional: true, Required: false, MaxAttempts: 3}
 }
 func (s *DiscoveryService) handleQualification(ctx context.Context, lease jobs.Lease) error {
 	if !s.cfg.Enabled {
@@ -144,7 +144,10 @@ type tickPayload struct {
 func tickSpec(at time.Time) jobs.Spec {
 	at = at.UTC().Truncate(time.Hour)
 	raw, _ := json.Marshal(tickPayload{1, at})
-	return jobs.Spec{Kind: TickJobKind, Stage: "catalog_discovery_tick", IdempotencyKey: fmt.Sprintf("catalog.discovery.tick:v1:%d", at.Unix()), Payload: raw, AvailableAt: at, Priority: 50, MaxAttempts: 3}
+	// Migration 17 retains retired v1 keys on the catalog lane. A separate
+	// generation keeps the hourly interactive chain usable without changing
+	// those audit rows or bypassing the queue's lane-conflict protection.
+	return jobs.Spec{Lane: jobs.LaneInteractive, Kind: TickJobKind, Stage: "catalog_discovery_tick", IdempotencyKey: fmt.Sprintf("catalog.discovery.tick:legacy-interactive:v2:%d", at.Unix()), Payload: raw, AvailableAt: at, Priority: 50, MaxAttempts: 3}
 }
 
 // Every coordinator derives the same interval slot, including nudges in the

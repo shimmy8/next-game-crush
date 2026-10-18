@@ -60,7 +60,7 @@ func (s *Service) PlanClassificationJob(_ context.Context, gameID uuid.UUID, def
 	if err != nil {
 		return jobs.Spec{}, fmt.Errorf("encode classification job: %w", err)
 	}
-	return jobs.Spec{Kind: ClassificationJobKind, Stage: "achievement_classification", IdempotencyKey: key, Payload: payload, MaxAttempts: 3, Priority: priority, UserID: uuid.Nil}, nil
+	return jobs.Spec{Lane: jobs.LaneInteractive, Kind: ClassificationJobKind, Stage: "achievement_classification", IdempotencyKey: key, Payload: payload, MaxAttempts: 3, Priority: priority, UserID: uuid.Nil}, nil
 }
 
 func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
@@ -155,7 +155,7 @@ func (s *Service) planProjectionJob(userID, gameID uuid.UUID, generationHash str
 		return jobs.Spec{}, fmt.Errorf("encode completion projection job: %w", err)
 	}
 	keyHash := sha256.Sum256([]byte(strings.Join([]string{userID.String(), gameID.String(), generationHash, ProjectionAlgorithmVersion}, "\x00")))
-	return jobs.Spec{Kind: ProjectionJobKind, Stage: "completion_projection", IdempotencyKey: ProjectionJobKind + ":v1:" + hex.EncodeToString(keyHash[:]), Payload: payload, MaxAttempts: 3, Priority: priority, UserID: userID}, nil
+	return jobs.Spec{Lane: jobs.LaneInteractive, Kind: ProjectionJobKind, Stage: "completion_projection", IdempotencyKey: ProjectionJobKind + ":v1:" + hex.EncodeToString(keyHash[:]), Payload: payload, MaxAttempts: 3, Priority: priority, UserID: userID}, nil
 }
 
 func (s *Service) handleProjection(ctx context.Context, lease jobs.Lease) error {
@@ -200,7 +200,7 @@ func (s *Service) handleProjection(ctx context.Context, lease jobs.Lease) error 
 	profilePayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": payload.UserID})
 	keyPrefix := projectionRebuildKeyPrefix(payload.UserID, payload.GameID, payload.GenerationHash, lease.ID, result.ProjectionHash)
 	if result.Phase == "profile" {
-		ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "profile.rebuild", Stage: "profile", Required: true, IdempotencyKey: keyPrefix + ":profile:v1", Payload: profilePayload, MaxAttempts: 3, Priority: lease.Priority, UserID: payload.UserID}})
+		ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "profile.rebuild", Stage: "profile", Required: true, IdempotencyKey: keyPrefix + ":profile:v1", Payload: profilePayload, MaxAttempts: 3, Priority: lease.Priority, UserID: payload.UserID}})
 		if err != nil {
 			return err
 		}
@@ -213,7 +213,7 @@ func (s *Service) handleProjection(ctx context.Context, lease jobs.Lease) error 
 		}
 	}
 	if result.Phase == "recommendations" {
-		ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: keyPrefix + ":recommendations:v1", Payload: profilePayload, MaxAttempts: 3, Priority: lease.Priority, UserID: payload.UserID}})
+		ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: keyPrefix + ":recommendations:v1", Payload: profilePayload, MaxAttempts: 3, Priority: lease.Priority, UserID: payload.UserID}})
 		if err != nil {
 			return err
 		}

@@ -219,7 +219,7 @@ func TestLaterRebuildEnqueuesFreshIdempotentSummaryAfterDeadAttempt(t *testing.T
 	}
 	queue := jobs.NewQueue(database)
 	service.SetQueue(queue)
-	worker := jobs.NewWorker(queue, "profile-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second), jobs.WithRetryBase(time.Millisecond))
+	worker := jobs.NewWorker(queue, jobs.LaneInteractive, "profile-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second), jobs.WithRetryBase(time.Millisecond))
 	if err := service.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestLaterRebuildEnqueuesFreshIdempotentSummaryAfterDeadAttempt(t *testing.T
 	})
 
 	for _, key := range []string{"sync:first:profile:v1", "sync:later:profile:v1"} {
-		if _, err := queue.Enqueue(ctx, jobs.Spec{Kind: JobKind, IdempotencyKey: key, Payload: payload, MaxAttempts: 3}); err != nil {
+		if _, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: JobKind, IdempotencyKey: key, Payload: payload, MaxAttempts: 3}); err != nil {
 			t.Fatal(err)
 		}
 		waitForProfileJobs(t, database, key)

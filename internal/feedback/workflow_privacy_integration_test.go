@@ -45,7 +45,7 @@ func TestCompleteFeedbackWorkflowLogsOmitSensitiveInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := jobs.NewWorker(queue, "feedback-privacy-worker", jobs.WithLogger(logger), jobs.WithPollInterval(2*time.Millisecond), jobs.WithHeartbeatInterval(time.Second))
+	worker := jobs.NewWorker(queue, jobs.LaneInteractive, "feedback-privacy-worker", jobs.WithLogger(logger), jobs.WithPollInterval(2*time.Millisecond), jobs.WithHeartbeatInterval(time.Second))
 	if err := fixture.profiles.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}

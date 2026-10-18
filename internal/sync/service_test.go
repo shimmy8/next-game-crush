@@ -1005,7 +1005,7 @@ func TestReleasedWishlistGameIsNotCatalogMember(t *testing.T) {
 func TestWorkerRunsEnqueuedWorkflowToRequiredChildCompletion(t *testing.T) {
 	service, fake, db, userID := newTestService(t)
 	service.SetAIJobPlanner(testAIPlanner{})
-	worker := jobs.NewWorker(service.queue, "sync-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second))
+	worker := jobs.NewWorker(service.queue, jobs.LaneInteractive, "sync-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second))
 	if err := service.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}
@@ -1069,7 +1069,7 @@ func TestWorkerRunsEnqueuedWorkflowToRequiredChildCompletion(t *testing.T) {
 func TestAIFailureDoesNotFailSteamSynchronization(t *testing.T) {
 	service, _, db, userID := newTestService(t)
 	service.SetAIJobPlanner(failingAIPlanner{})
-	worker := jobs.NewWorker(service.queue, "ai-failure-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second), jobs.WithRetryBase(time.Millisecond))
+	worker := jobs.NewWorker(service.queue, jobs.LaneInteractive, "ai-failure-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second), jobs.WithRetryBase(time.Millisecond))
 	if err := service.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}
@@ -1108,13 +1108,13 @@ func TestAIFailureDoesNotFailSteamSynchronization(t *testing.T) {
 type testAIPlanner struct{}
 
 func (testAIPlanner) PlanFeatureJobs(_ context.Context, _ uuid.UUID, rootKey string) ([]jobs.Spec, error) {
-	return []jobs.Spec{{Kind: "ai.features", Stage: "ai_features", Required: true, IdempotencyKey: rootKey + ":ai.features:v1:test", Payload: []byte(`{"version":1}`), MaxAttempts: 3}}, nil
+	return []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "ai.features", Stage: "ai_features", Required: true, IdempotencyKey: rootKey + ":ai.features:v1:test", Payload: []byte(`{"version":1}`), MaxAttempts: 3}}, nil
 }
 
 type failingAIPlanner struct{}
 
 func (failingAIPlanner) PlanFeatureJobs(_ context.Context, _ uuid.UUID, rootKey string) ([]jobs.Spec, error) {
-	return []jobs.Spec{{Kind: "ai.features", Stage: "ai_features", IdempotencyKey: rootKey + ":ai.features:v1:failure", Payload: []byte(`{"version":1}`), MaxAttempts: 1}}, nil
+	return []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "ai.features", Stage: "ai_features", IdempotencyKey: rootKey + ":ai.features:v1:failure", Payload: []byte(`{"version":1}`), MaxAttempts: 1}}, nil
 }
 
 func TestWorkerLeavesReleasedWishlistGameOutsideCatalog(t *testing.T) {
@@ -1124,7 +1124,7 @@ func TestWorkerLeavesReleasedWishlistGameOutsideCatalog(t *testing.T) {
 	details.ReleaseDate = steam.ReleaseDate{ComingSoon: false, Raw: "1 Jan, 2020"}
 	fake.details[20] = details
 	fake.mu.Unlock()
-	worker := jobs.NewWorker(service.queue, "released-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second))
+	worker := jobs.NewWorker(service.queue, jobs.LaneInteractive, "released-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second))
 	if err := service.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}
@@ -1233,7 +1233,7 @@ func TestSyncNudgesDiscoveryOnlyAfterCompletion(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	lease, err := service.queue.Claim(context.Background(), "nudge-test", time.Minute)
+	lease, err := service.queue.Claim(context.Background(), jobs.LaneInteractive, "nudge-test", time.Minute)
 	if err != nil || lease == nil || lease.ID != jobID {
 		t.Fatalf("claim=%+v err=%v", lease, err)
 	}
@@ -1258,7 +1258,7 @@ func TestFailedSyncDoesNotNudgeDiscovery(t *testing.T) {
 		VALUES($1,'catalog.test',$2,$3,'catalog','dead',true,$4,100,'upstream_unavailable')`, uuid.New(), jobID.String()+":catalog", jobID, userID); err != nil {
 		t.Fatal(err)
 	}
-	lease, err := service.queue.Claim(context.Background(), "failed-nudge-test", time.Minute)
+	lease, err := service.queue.Claim(context.Background(), jobs.LaneInteractive, "failed-nudge-test", time.Minute)
 	if err != nil || lease == nil || lease.ID != jobID {
 		t.Fatalf("claim=%+v err=%v", lease, err)
 	}
@@ -1294,11 +1294,11 @@ func TestKnownRefreshFansOutIntoIndependentJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload, _ := json.Marshal(Payload{Version: PayloadVersion, UserID: userID})
-	id, err := service.queue.Enqueue(context.Background(), jobs.Spec{Kind: "catalog.refresh", Stage: "catalog", IdempotencyKey: "fanout:catalog:v1", Payload: payload, UserID: userID, Priority: 100})
+	id, err := service.queue.Enqueue(context.Background(), jobs.Spec{Lane: jobs.LaneInteractive, Kind: "catalog.refresh", Stage: "catalog", IdempotencyKey: "fanout:catalog:v1", Payload: payload, UserID: userID, Priority: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := service.queue.Claim(context.Background(), "fanout-test", time.Minute)
+	lease, err := service.queue.Claim(context.Background(), jobs.LaneInteractive, "fanout-test", time.Minute)
 	if err != nil || lease == nil || lease.ID != id {
 		t.Fatalf("claim=%+v err=%v", lease, err)
 	}

@@ -156,7 +156,7 @@ func (s *Service) Record(ctx context.Context, command Command) (Accepted, error)
 		return Accepted{}, ErrIdempotencyConflict
 	}
 	payload, _ := json.Marshal(jobPayload{Version: JobPayloadVersion, EventID: event.ID})
-	jobID, err := s.scheduler.Enqueue(ctx, jobs.Spec{Kind: JobKind, Stage: "feedback", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":workflow:v1", Payload: payload, MaxAttempts: 3})
+	jobID, err := s.scheduler.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: JobKind, Stage: "feedback", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":workflow:v1", Payload: payload, MaxAttempts: 3})
 	if err != nil {
 		return Accepted{}, fmt.Errorf("enqueue feedback workflow: %w", err)
 	}
@@ -314,7 +314,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 			return queue.RecordResult(ctx, lease, diff)
 		}
 		profilePayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": event.UserID})
-		ready, err := queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "profile.rebuild", Stage: "profile", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":profile:v1", Payload: profilePayload, MaxAttempts: 3}})
+		ready, err := queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "profile.rebuild", Stage: "profile", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":profile:v1", Payload: profilePayload, MaxAttempts: 3}})
 		if err != nil {
 			return err
 		}
@@ -322,7 +322,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 			return jobs.ErrDeferred
 		}
 		rankingPayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": event.UserID})
-		ready, err = queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "recommendations.rebuild", Stage: "recommendations", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":ranking:v1", Payload: rankingPayload, MaxAttempts: 3}})
+		ready, err = queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":ranking:v1", Payload: rankingPayload, MaxAttempts: 3}})
 		if err != nil {
 			return err
 		}

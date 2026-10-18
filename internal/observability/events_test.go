@@ -53,6 +53,27 @@ func TestLoggerSanitizesValuesClampsDurationsAndSelectsLevels(t *testing.T) {
 	}
 }
 
+func TestQueueLaneDiagnosticsAreAllowlisted(t *testing.T) {
+	for _, lane := range []string{"interactive", "catalog", "lane-canary"} {
+		var output bytes.Buffer
+		logger := New(slog.New(slog.NewJSONHandler(&output, nil)))
+		logger.JobAttempt(context.Background(), JobAttemptEvent{Stage: JobStarted, Lane: lane})
+		logger.Worker(context.Background(), WorkerEvent{Stage: WorkerStarted, Lane: lane})
+		want := lane
+		if lane == "lane-canary" {
+			want = "unknown"
+		}
+		for _, event := range decodeEvents(t, output.String()) {
+			if event["lane"] != want {
+				t.Fatalf("lane=%v, want %s", event["lane"], want)
+			}
+		}
+		if strings.Contains(output.String(), "canary") {
+			t.Fatal("untrusted lane leaked")
+		}
+	}
+}
+
 func TestLoggerEmitsOnlyDeclaredFields(t *testing.T) {
 	var output bytes.Buffer
 	logger := New(slog.New(slog.NewJSONHandler(&output, nil)))
@@ -60,7 +81,7 @@ func TestLoggerEmitsOnlyDeclaredFields(t *testing.T) {
 	logger.JobAttempt(context.Background(), JobAttemptEvent{Stage: JobRetryScheduled, Correlation: correlation, Kind: "steam.sync", LogicalStage: "steam", Attempt: 1, MaxAttempts: 3, Required: true, Duration: time.Second, RetryDelay: 2 * time.Second, Reason: ReasonTimeout})
 
 	event := decodeEvents(t, output.String())[0]
-	allowed := map[string]bool{"time": true, "level": true, "msg": true, "event": true, "stage": true, "workflow_id": true, "job_id": true, "parent_job_id": true, "kind": true, "logical_stage": true, "attempt": true, "max_attempts": true, "required": true, "duration_ms": true, "retry_delay_ms": true, "reason": true}
+	allowed := map[string]bool{"time": true, "level": true, "msg": true, "event": true, "stage": true, "lane": true, "workflow_id": true, "job_id": true, "parent_job_id": true, "kind": true, "logical_stage": true, "attempt": true, "max_attempts": true, "required": true, "duration_ms": true, "retry_delay_ms": true, "reason": true}
 	for key := range event {
 		if !allowed[key] {
 			t.Fatalf("unexpected field %q in %#v", key, event)

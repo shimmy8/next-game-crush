@@ -94,7 +94,7 @@ func TestDisableFailedRankingKeepsPublishedVersionAndAcceptedWorkflow(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := jobs.NewWorker(queue, "disable-failure", jobs.WithPollInterval(time.Millisecond*5))
+	worker := jobs.NewWorker(queue, jobs.LaneInteractive, "disable-failure", jobs.WithPollInterval(time.Millisecond*5))
 	if err := service.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}

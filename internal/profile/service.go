@@ -115,7 +115,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 				return err
 			}
 			summaryPayload, _ := json.Marshal(map[string]any{"version": 1, "profile_id": built.ID})
-			if _, err := s.queue.Enqueue(ctx, jobs.Spec{Kind: "ai.profile_summary", Stage: "profile_summary", Required: false, IdempotencyKey: lease.IdempotencyKey + ":summary:v1", Payload: summaryPayload, MaxAttempts: 3, UserID: payload.UserID, Priority: lease.Priority}); err != nil {
+			if _, err := s.queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: "ai.profile_summary", Stage: "profile_summary", Required: false, IdempotencyKey: lease.IdempotencyKey + ":summary:v1", Payload: summaryPayload, MaxAttempts: 3, UserID: payload.UserID, Priority: lease.Priority}); err != nil {
 				return err
 			}
 		}

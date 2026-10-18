@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 )
 
 type fakeWorkerQueue struct {
-	claim    func(context.Context, string, time.Duration) (*Lease, error)
+	claim    func(context.Context, Lane, string, time.Duration) (*Lease, error)
 	renew    func(context.Context, Lease, time.Duration) error
 	complete func(context.Context, Lease) error
 	fail     func(context.Context, Lease, error, time.Time) (FailureOutcome, error)
@@ -39,9 +40,9 @@ func (err testRetryError) Error() string             { return "retry-error-canar
 func (err testRetryError) Retryable() bool           { return err.retryable }
 func (err testRetryError) RetryDelay() time.Duration { return err.delay }
 
-func (q *fakeWorkerQueue) Claim(ctx context.Context, worker string, duration time.Duration) (*Lease, error) {
+func (q *fakeWorkerQueue) Claim(ctx context.Context, lane Lane, worker string, duration time.Duration) (*Lease, error) {
 	if q.claim != nil {
-		return q.claim(ctx, worker, duration)
+		return q.claim(ctx, lane, worker, duration)
 	}
 	return nil, nil
 }
@@ -70,7 +71,7 @@ func (q *fakeWorkerQueue) Fail(ctx context.Context, lease Lease, cause error, re
 func TestWorkerLifecycleLogsSuccessAndInjectsCorrelation(t *testing.T) {
 	var output bytes.Buffer
 	lease := testLease()
-	worker := newWorker(&fakeWorkerQueue{}, "worker-canary", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))))
+	worker := newWorker(&fakeWorkerQueue{}, LaneInteractive, "worker-canary", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))))
 	if err := worker.Register(lease.Kind, func(ctx context.Context, _ Lease) error {
 		if got := observability.CorrelationFromContext(ctx); got.WorkflowID != lease.WorkflowID || got.JobID != lease.ID || got.ParentJobID != lease.ParentJobID {
 			t.Fatalf("handler correlation=%#v", got)
@@ -91,7 +92,7 @@ func TestWorkerLifecycleLogsSuccessAndInjectsCorrelation(t *testing.T) {
 func TestWorkerHeartbeatStartsAfterFullInterval(t *testing.T) {
 	var shortOutput bytes.Buffer
 	shortLease := testLease()
-	shortWorker := newWorker(&fakeWorkerQueue{}, "worker", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&shortOutput, nil)))), WithHeartbeatInterval(30*time.Millisecond), WithLeaseDuration(time.Second))
+	shortWorker := newWorker(&fakeWorkerQueue{}, LaneInteractive, "worker", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&shortOutput, nil)))), WithHeartbeatInterval(30*time.Millisecond), WithLeaseDuration(time.Second))
 	if err := shortWorker.Register(shortLease.Kind, func(context.Context, Lease) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +106,7 @@ func TestWorkerHeartbeatStartsAfterFullInterval(t *testing.T) {
 	var output bytes.Buffer
 	lease := testLease()
 	release := make(chan struct{})
-	worker := newWorker(&fakeWorkerQueue{}, "worker", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))), WithHeartbeatInterval(15*time.Millisecond), WithLeaseDuration(time.Second))
+	worker := newWorker(&fakeWorkerQueue{}, LaneInteractive, "worker", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))), WithHeartbeatInterval(15*time.Millisecond), WithLeaseDuration(time.Second))
 	if err := worker.Register(lease.Kind, func(context.Context, Lease) error { <-release; return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +149,7 @@ func TestWorkerFailureLogsDispositionSeverityAndNoCanaries(t *testing.T) {
 			lease.IdempotencyKey = "idempotency-canary"
 			lease.WorkerID = "worker-canary"
 			queue := &fakeWorkerQueue{fail: func(context.Context, Lease, error, time.Time) (FailureOutcome, error) { return test.outcome, nil }}
-			worker := newWorker(queue, "worker-id-canary", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))))
+			worker := newWorker(queue, LaneInteractive, "worker-id-canary", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))))
 			if err := worker.Register(lease.Kind, func(context.Context, Lease) error { return errors.New("handler-error-canary") }); err != nil {
 				t.Fatal(err)
 			}
@@ -183,7 +184,7 @@ func TestWorkerFailureHonorsRetryDispositionAndProviderDelay(t *testing.T) {
 		}
 		return FailureRetryScheduled, nil
 	}}
-	worker := newWorker(queue, "worker", WithRetryBase(time.Second))
+	worker := newWorker(queue, LaneInteractive, "worker", WithRetryBase(time.Second))
 	if err := worker.failWithTimeout(context.Background(), lease, testRetryError{retryable: true, delay: 7 * time.Second}, started); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +231,7 @@ func TestWorkerLifecycleLogsDeferredAndCancellation(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var output bytes.Buffer
-			worker := newWorker(&fakeWorkerQueue{}, "worker", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))))
+			worker := newWorker(&fakeWorkerQueue{}, LaneInteractive, "worker", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))))
 			if err := test.run(worker, testLease()); err != nil {
 				t.Fatal(err)
 			}
@@ -266,7 +267,7 @@ func TestWorkerInfrastructureAndLeaseLossLogsAreBounded(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var output bytes.Buffer
-			worker := newWorker(test.queue, "worker-canary", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))), WithLeaseDuration(10*time.Millisecond), WithHeartbeatInterval(time.Second))
+			worker := newWorker(test.queue, LaneInteractive, "worker-canary", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))), WithLeaseDuration(10*time.Millisecond), WithHeartbeatInterval(time.Second))
 			lease := testLease()
 			if err := worker.Register(lease.Kind, test.handler); err != nil {
 				t.Fatal(err)
@@ -293,8 +294,10 @@ func TestWorkerInfrastructureAndLeaseLossLogsAreBounded(t *testing.T) {
 
 func TestWorkerRunLogsStartClaimFailureAndStop(t *testing.T) {
 	var output bytes.Buffer
-	queue := &fakeWorkerQueue{claim: func(context.Context, string, time.Duration) (*Lease, error) { return nil, errors.New("claim-canary") }}
-	worker := newWorker(queue, "worker-canary", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))))
+	queue := &fakeWorkerQueue{claim: func(context.Context, Lane, string, time.Duration) (*Lease, error) {
+		return nil, errors.New("claim-canary")
+	}}
+	worker := newWorker(queue, LaneInteractive, "worker-canary", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))))
 	if err := worker.Run(context.Background()); err == nil {
 		t.Fatal("Run returned nil")
 	}
@@ -315,7 +318,7 @@ func TestWorkerRunUsesConfiguredConcurrentUniqueLanes(t *testing.T) {
 	var mu sync.Mutex
 	claimedBy := make(map[string]struct{}, concurrency)
 	allLanes := make(chan struct{})
-	queue := &fakeWorkerQueue{claim: func(ctx context.Context, workerID string, _ time.Duration) (*Lease, error) {
+	queue := &fakeWorkerQueue{claim: func(ctx context.Context, _ Lane, workerID string, _ time.Duration) (*Lease, error) {
 		mu.Lock()
 		claimedBy[workerID] = struct{}{}
 		if len(claimedBy) == concurrency {
@@ -329,7 +332,7 @@ func TestWorkerRunUsesConfiguredConcurrentUniqueLanes(t *testing.T) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}}
-	worker := newWorker(queue, "worker", WithConcurrency(concurrency))
+	worker := newWorker(queue, LaneInteractive, "worker", WithConcurrency(concurrency))
 	done := make(chan error, 1)
 	go func() { done <- worker.Run(ctx) }()
 
@@ -359,7 +362,7 @@ func TestWorkerRunCancelsSiblingLanesAfterInfrastructureFailure(t *testing.T) {
 	entered := 0
 	allEntered := make(chan struct{})
 	siblingsStopped := make(chan struct{}, 2)
-	queue := &fakeWorkerQueue{claim: func(ctx context.Context, workerID string, _ time.Duration) (*Lease, error) {
+	queue := &fakeWorkerQueue{claim: func(ctx context.Context, _ Lane, workerID string, _ time.Duration) (*Lease, error) {
 		mu.Lock()
 		entered++
 		if entered == 3 {
@@ -374,7 +377,7 @@ func TestWorkerRunCancelsSiblingLanesAfterInfrastructureFailure(t *testing.T) {
 		siblingsStopped <- struct{}{}
 		return nil, ctx.Err()
 	}}
-	worker := newWorker(queue, "worker", WithConcurrency(3))
+	worker := newWorker(queue, LaneInteractive, "worker", WithConcurrency(3))
 	if err := worker.Run(context.Background()); !errors.Is(err, want) {
 		t.Fatalf("Run() error = %v, want %v", err, want)
 	}
@@ -399,7 +402,7 @@ func TestWorkerRunContinuesAfterLeaseLossAndStopsHandlerBeforeNextClaim(t *testi
 
 	claims := 0
 	queue := &fakeWorkerQueue{
-		claim: func(context.Context, string, time.Duration) (*Lease, error) {
+		claim: func(context.Context, Lane, string, time.Duration) (*Lease, error) {
 			claims++
 			switch claims {
 			case 1:
@@ -426,7 +429,7 @@ func TestWorkerRunContinuesAfterLeaseLossAndStopsHandlerBeforeNextClaim(t *testi
 			return "", errors.New("lease-lost handler failed unexpectedly")
 		},
 	}
-	worker := newWorker(queue, "worker", WithLeaseDuration(10*time.Millisecond), WithPollInterval(time.Millisecond), WithHeartbeatInterval(time.Second))
+	worker := newWorker(queue, LaneInteractive, "worker", WithLeaseDuration(10*time.Millisecond), WithPollInterval(time.Millisecond), WithHeartbeatInterval(time.Second))
 	if err := worker.Register(lease.Kind, func(ctx context.Context, _ Lease) error {
 		close(handlerStarted)
 		defer close(handlerStopped)
@@ -469,7 +472,7 @@ func TestWorkerRunBoundsLeaseLossWaitWhenHandlerIgnoresCancellation(t *testing.T
 
 	claims := 0
 	queue := &fakeWorkerQueue{
-		claim: func(context.Context, string, time.Duration) (*Lease, error) {
+		claim: func(context.Context, Lane, string, time.Duration) (*Lease, error) {
 			claims++
 			if claims == 1 {
 				return &lease, nil
@@ -479,7 +482,7 @@ func TestWorkerRunBoundsLeaseLossWaitWhenHandlerIgnoresCancellation(t *testing.T
 		},
 		renew: func(context.Context, Lease, time.Duration) error { return ErrLeaseLost },
 	}
-	worker := newWorker(queue, "worker", WithLeaseDuration(10*time.Millisecond), WithPollInterval(time.Millisecond), WithHeartbeatInterval(time.Second), WithShutdownTimeout(20*time.Millisecond))
+	worker := newWorker(queue, LaneInteractive, "worker", WithLeaseDuration(10*time.Millisecond), WithPollInterval(time.Millisecond), WithHeartbeatInterval(time.Second), WithShutdownTimeout(20*time.Millisecond))
 	if err := worker.Register(lease.Kind, func(context.Context, Lease) error {
 		close(handlerStarted)
 		<-releaseHandler
@@ -516,13 +519,13 @@ func TestWorkerRunReturnsNonLeaseProcessFailure(t *testing.T) {
 	want := errors.New("completion failed")
 	claims := 0
 	queue := &fakeWorkerQueue{
-		claim: func(context.Context, string, time.Duration) (*Lease, error) {
+		claim: func(context.Context, Lane, string, time.Duration) (*Lease, error) {
 			claims++
 			return &lease, nil
 		},
 		complete: func(context.Context, Lease) error { return want },
 	}
-	worker := newWorker(queue, "worker")
+	worker := newWorker(queue, LaneInteractive, "worker")
 	if err := worker.Register(lease.Kind, func(context.Context, Lease) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +553,7 @@ func TestWorkerCancellationWinsOverReadySuccessAndRenewal(t *testing.T) {
 			var output bytes.Buffer
 			lease := testLease()
 			release := make(chan struct{})
-			worker := newWorker(test.queue, "worker", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))), WithLeaseDuration(2*time.Millisecond), WithHeartbeatInterval(2*time.Millisecond))
+			worker := newWorker(test.queue, LaneInteractive, "worker", WithLogger(observability.New(slog.New(slog.NewJSONHandler(&output, nil)))), WithLeaseDuration(2*time.Millisecond), WithHeartbeatInterval(2*time.Millisecond))
 			if err := worker.Register(lease.Kind, func(context.Context, Lease) error { <-release; return nil }); err != nil {
 				t.Fatal(err)
 			}
@@ -575,7 +578,45 @@ func TestWorkerCancellationWinsOverReadySuccessAndRenewal(t *testing.T) {
 }
 
 func testLease() Lease {
-	return Lease{ID: uuid.New(), ParentJobID: uuid.New(), WorkflowID: uuid.New(), Kind: "steam.sync", Required: true, Stage: "steam", Attempts: 1, MaxAttempts: 3, WorkerID: "worker", FencingToken: uuid.New()}
+	return Lease{Lane: LaneInteractive, ID: uuid.New(), ParentJobID: uuid.New(), WorkflowID: uuid.New(), Kind: "steam.sync", Required: true, Stage: "steam", Attempts: 1, MaxAttempts: 3, WorkerID: "worker", FencingToken: uuid.New()}
+}
+
+func TestWorkerBindsEveryClaimToConfiguredLane(t *testing.T) {
+	for _, lane := range []Lane{LaneInteractive, LaneCatalog} {
+		t.Run(string(lane), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var calls atomic.Int32
+			queue := &fakeWorkerQueue{claim: func(ctx context.Context, got Lane, _ string, _ time.Duration) (*Lease, error) {
+				if got != lane {
+					t.Errorf("claim lane=%s, want %s", got, lane)
+				}
+				if calls.Add(1) == 4 {
+					cancel()
+				}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}}
+			if err := newWorker(queue, lane, "worker", WithConcurrency(4)).Run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if calls.Load() != 4 {
+				t.Fatalf("claims=%d, want 4", calls.Load())
+			}
+		})
+	}
+}
+
+func TestWorkerRejectsInvalidLaneBeforeClaim(t *testing.T) {
+	for _, lane := range []Lane{"", "invalid"} {
+		queue := &fakeWorkerQueue{claim: func(context.Context, Lane, string, time.Duration) (*Lease, error) {
+			t.Fatal("invalid worker reached queue")
+			return nil, nil
+		}}
+		if err := newWorker(queue, lane, "worker").Run(context.Background()); err == nil {
+			t.Fatal("invalid worker lane accepted")
+		}
+	}
 }
 
 func workerLogStages(t *testing.T, raw, eventName string) []string {
@@ -608,7 +649,7 @@ func workerLogEvents(t *testing.T, raw string) []map[string]any {
 
 func TestWorkerRegisterRejectsInvalidAndDuplicateKinds(t *testing.T) {
 	queue, _ := openTestQueue(t)
-	worker := NewWorker(queue, "test-worker", WithPollInterval(5*time.Millisecond))
+	worker := NewWorker(queue, LaneInteractive, "test-worker", WithPollInterval(5*time.Millisecond))
 	handler := func(context.Context, Lease) error { return nil }
 	if err := worker.Register("", handler); err == nil {
 		t.Fatal("empty kind registered")
@@ -626,11 +667,11 @@ func TestWorkerRegisterRejectsInvalidAndDuplicateKinds(t *testing.T) {
 
 func TestWorkerRunsRegisteredHandlerAndCompletes(t *testing.T) {
 	queue, db := openTestQueue(t)
-	id, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: "worker-complete"})
+	id, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "worker-complete"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := NewWorker(queue, "test-worker", WithPollInterval(5*time.Millisecond), WithLeaseDuration(time.Second))
+	worker := NewWorker(queue, LaneInteractive, "test-worker", WithPollInterval(5*time.Millisecond), WithLeaseDuration(time.Second))
 	handled := make(chan struct{}, 1)
 	if err := worker.Register("sync", func(context.Context, Lease) error {
 		handled <- struct{}{}
@@ -671,11 +712,11 @@ func TestWorkerRunsRegisteredHandlerAndCompletes(t *testing.T) {
 
 func TestWorkerGracefulShutdownCancelsAndWaitsForHandler(t *testing.T) {
 	queue, _ := openTestQueue(t)
-	_, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: "worker-shutdown"})
+	_, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "worker-shutdown"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := NewWorker(queue, "test-worker", WithPollInterval(time.Millisecond))
+	worker := NewWorker(queue, LaneInteractive, "test-worker", WithPollInterval(time.Millisecond))
 	started := make(chan struct{})
 	stopped := make(chan struct{})
 	if err := worker.Register("sync", func(ctx context.Context, _ Lease) error {
@@ -712,11 +753,11 @@ func TestWorkerGracefulShutdownCancelsAndWaitsForHandler(t *testing.T) {
 
 func TestWorkerShutdownIsBoundedWhenHandlerIgnoresCancellation(t *testing.T) {
 	queue, _ := openTestQueue(t)
-	_, err := queue.Enqueue(context.Background(), Spec{Kind: "sync", IdempotencyKey: "worker-bounded-shutdown"})
+	_, err := queue.Enqueue(context.Background(), Spec{Lane: LaneInteractive, Kind: "sync", IdempotencyKey: "worker-bounded-shutdown"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := NewWorker(queue, "test-worker", WithPollInterval(time.Millisecond), WithShutdownTimeout(30*time.Millisecond))
+	worker := NewWorker(queue, LaneInteractive, "test-worker", WithPollInterval(time.Millisecond), WithShutdownTimeout(30*time.Millisecond))
 	started := make(chan struct{})
 	release := make(chan struct{})
 	if err := worker.Register("sync", func(context.Context, Lease) error {

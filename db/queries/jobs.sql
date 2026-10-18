@@ -1,13 +1,18 @@
 -- name: EnqueueJob :one
-INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id, priority)
-VALUES ($1, $2, $3, $4, $5, COALESCE(sqlc.narg(available_at)::timestamptz, now()), sqlc.narg(parent_job_id), sqlc.arg(required), sqlc.arg(stage), sqlc.narg(user_id), sqlc.arg(priority))
+INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id, priority, lane)
+VALUES ($1, $2, $3, $4, $5, COALESCE(sqlc.narg(available_at)::timestamptz, now()), sqlc.narg(parent_job_id), sqlc.arg(required), sqlc.arg(stage), sqlc.narg(user_id), sqlc.arg(priority), sqlc.arg(lane))
 ON CONFLICT (idempotency_key) DO UPDATE SET priority = GREATEST(sync_jobs.priority, EXCLUDED.priority)
+WHERE sync_jobs.lane = EXCLUDED.lane
 RETURNING id;
+
+-- name: GetJobLane :one
+SELECT lane FROM sync_jobs WHERE id = $1;
 
 -- name: ClaimJob :one
 WITH candidate AS (
-    SELECT id FROM sync_jobs
-    WHERE attempts < max_attempts
+    SELECT sync_jobs.id FROM sync_jobs
+    WHERE sync_jobs.lane = sqlc.arg(lane)
+      AND attempts < max_attempts
       AND available_at <= now()
       AND (status IN ('queued', 'retryable') OR (status = 'running' AND lease_until <= now()))
     ORDER BY priority DESC, available_at, created_at, id

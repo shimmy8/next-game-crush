@@ -55,12 +55,12 @@ func TestFeatureJobEnqueuesEmbeddingAfterValidatedFeatures(t *testing.T) {
 	queue := jobs.NewQueue(database)
 	service, _ := NewService(NewSQLRepository(database), client, "gpt-6-luna", "text-embedding-3-small")
 	service.SetQueue(queue)
-	worker := jobs.NewWorker(queue, "ai-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second))
+	worker := jobs.NewWorker(queue, jobs.LaneInteractive, "ai-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second))
 	if err := service.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}
 	payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID})
-	jobID, err := queue.Enqueue(ctx, jobs.Spec{Kind: FeaturesJobKind, IdempotencyKey: "ai.features:v1:test", Payload: payload, MaxAttempts: 3})
+	jobID, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: FeaturesJobKind, IdempotencyKey: "ai.features:v1:test", Payload: payload, MaxAttempts: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
