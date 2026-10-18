@@ -718,7 +718,15 @@ func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.U
 			req.Header.Set("If-Modified-Since", validator.LastModified)
 		}
 	}
-	response, err := c.httpClient.Do(req)
+	client := c.httpClient
+	if operation == SearchOperation {
+		// Search is non-personal even when a caller supplies a client with a
+		// cookie jar. Preserve the supplied client's behavior for other APIs.
+		copy := *client
+		copy.Jar = nil
+		client = &copy
+	}
+	response, err := client.Do(req)
 	if err != nil {
 		return rawResponse{}, &RequestError{Operation: operation, Temporary: requestCtx.Err() != nil || isTemporaryTransport(err), cause: sanitizedTransportError(err)}
 	}
@@ -730,11 +738,15 @@ func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.U
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 		return rawResponse{}, &RequestError{Operation: operation, StatusCode: response.StatusCode, RetryAfter: parseRetryAfter(response.Header.Get("Retry-After"), c.now()), Temporary: retryableStatus(response.StatusCode)}
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, c.maxResponseBytes+1))
+	responseLimit := c.maxResponseBytes
+	if operation == SearchOperation && responseLimit > maxSearchResponseBytes {
+		responseLimit = maxSearchResponseBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, responseLimit+1))
 	if err != nil {
 		return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: errors.New("could not read response")}
 	}
-	if int64(len(body)) > c.maxResponseBytes {
+	if int64(len(body)) > responseLimit {
 		return rawResponse{}, &RequestError{Operation: operation, cause: ErrResponseTooLarge}
 	}
 	return rawResponse{body: body, header: response.Header.Clone(), statusCode: response.StatusCode}, nil

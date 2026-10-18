@@ -16,3 +16,5 @@ type Client interface {
 }
 
 var _ Client = (*HTTPClient)(nil)
+
+var _ SearchCatalog = (*HTTPClient)(nil)
