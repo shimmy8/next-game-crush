@@ -86,6 +86,22 @@ func TestLoggerAllowsSafeAIReasons(t *testing.T) {
 	}
 }
 
+func TestAchievementClassificationJobObservabilityIsAllowlistedAndSanitized(t *testing.T) {
+	var output bytes.Buffer
+	logger := New(slog.New(slog.NewJSONHandler(&output, nil)))
+	logger.JobAttempt(context.Background(), JobAttemptEvent{Stage: JobRetryScheduled, Kind: "achievement.classify", LogicalStage: "achievement_classification", Attempt: 1, MaxAttempts: 3, Reason: ReasonInvalidOutput})
+	event := decodeEvents(t, output.String())[0]
+	if event["kind"] != "achievement.classify" || event["logical_stage"] != "achievement_classification" || event["reason"] != "invalid_output" {
+		t.Fatalf("event=%#v", event)
+	}
+	encoded, _ := json.Marshal(event)
+	for _, canary := range []string{"steam_app_id", "api_name", "description", "prompt", "provider_body"} {
+		if strings.Contains(string(encoded), canary) {
+			t.Fatalf("sensitive classification field leaked: %s", encoded)
+		}
+	}
+}
+
 func TestSyncSourceLogsOnlyBoundedUpstreamStatusOnFinishedEvents(t *testing.T) {
 	for _, test := range []struct {
 		name       string
