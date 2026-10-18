@@ -61,6 +61,18 @@ type HostThrottle interface {
 	Limit(host string) int
 }
 
+type hostSlotThrottle interface {
+	AcquireSlot(context.Context, string) (string, error)
+	ReleaseSlot(string, string)
+}
+
+// ThrottleDeferred tells a durable catalog handler when it may safely retry
+// without converting provider backpressure into a failed queue attempt.
+type ThrottleDeferred struct{ At time.Time }
+
+func (e *ThrottleDeferred) Error() string             { return "catalog upstream is throttled" }
+func (e *ThrottleDeferred) NextEligibleAt() time.Time { return e.At.UTC() }
+
 // NewHTTPClient is an explicit constructor alias for callers that name the
 // concrete implementation rather than the Client boundary.
 func NewHTTPClient(cfg HTTPConfig) (*HTTPClient, error) { return NewClient(cfg) }
@@ -695,6 +707,11 @@ func (c *HTTPClient) getWithCache(ctx context.Context, cacheKey CacheKey, base *
 			return httpResponse{body: response.body, header: response.header}, Available, nil
 		}
 		lastError = requestErr
+		type nextEligible interface{ NextEligibleAt() time.Time }
+		var deferred nextEligible
+		if errors.As(requestErr, &deferred) {
+			return httpResponse{}, RequestFailed, requestErr
+		}
 		if !requestErr.Temporary || attempt == c.maxRetries || operationCtx.Err() != nil {
 			return httpResponse{}, RequestFailed, requestErr
 		}
@@ -710,21 +727,37 @@ type rawResponse struct {
 
 func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.URL, requestPath string, values url.Values, useCache bool) (result rawResponse, resultErr *RequestError) {
 	operation := cacheKey.Operation
+	throttleHost := c.logicalThrottleHost(base)
 	if c.hostThrottle != nil {
-		release, err := c.acquireHost(ctx, strings.ToLower(base.Hostname()))
+		if err := c.hostThrottle.Before(ctx, throttleHost); err != nil {
+			return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: err}
+		}
+		release, err := c.acquireHost(ctx, throttleHost)
 		if err != nil {
 			return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: err}
 		}
 		defer release()
-		if err := c.hostThrottle.Before(ctx, strings.ToLower(base.Hostname())); err != nil {
-			return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: err}
-		}
 	}
 	select {
 	case c.semaphore <- struct{}{}:
 		defer func() { <-c.semaphore }()
 	case <-ctx.Done():
 		return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: ctx.Err()}
+	}
+	if c.hostThrottle != nil {
+		// Another local request can establish a shared cooldown while this one
+		// waits for its permits. Recheck immediately before taking a global slot
+		// so a queued request cannot leak through a fresh Retry-After window.
+		if err := c.hostThrottle.Before(ctx, throttleHost); err != nil {
+			return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: err}
+		}
+		if global, ok := c.hostThrottle.(hostSlotThrottle); ok {
+			token, err := global.AcquireSlot(ctx, throttleHost)
+			if err != nil {
+				return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: err}
+			}
+			defer global.ReleaseSlot(throttleHost, token)
+		}
 	}
 	requestURL := *base
 	requestURL.Path = strings.TrimRight(base.Path, "/") + requestPath
@@ -765,7 +798,7 @@ func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.U
 					hint = &delay
 				}
 			}
-			c.hostThrottle.Observe(strings.ToLower(base.Hostname()), status, hint, observedError)
+			c.hostThrottle.Observe(throttleHost, status, hint, observedError)
 		}()
 	}
 	response, err := client.Do(req)
@@ -786,12 +819,26 @@ func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.U
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, responseLimit+1))
 	if err != nil {
-		return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: errors.New("could not read response")}
+		return rawResponse{}, &RequestError{Operation: operation, cause: errors.New("could not read response")}
 	}
 	if int64(len(body)) > responseLimit {
 		return rawResponse{}, &RequestError{Operation: operation, cause: ErrResponseTooLarge}
 	}
 	return rawResponse{body: body, header: response.Header.Clone(), statusCode: response.StatusCode}, nil
+}
+
+// Test harness and private proxy base URLs are transport locations, not new
+// upstream identities. Adaptive state remains keyed to the logical provider so
+// an override cannot bypass (or be rejected by) the persisted host allowlist.
+func (c *HTTPClient) logicalThrottleHost(base *url.URL) string {
+	switch base {
+	case c.storeBase:
+		return "store.steampowered.com"
+	case c.webBase, c.storeServiceBase:
+		return "api.steampowered.com"
+	default:
+		return strings.ToLower(base.Hostname())
+	}
 }
 
 func (c *HTTPClient) acquireHost(ctx context.Context, host string) (func(), error) {

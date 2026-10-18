@@ -132,6 +132,53 @@ type CatalogHostThrottle struct {
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CatalogHostThrottleSlot struct {
+	Host         string             `json:"host"`
+	Slot         int32              `json:"slot"`
+	FencingToken pgtype.UUID        `json:"fencing_token"`
+	LeaseUntil   pgtype.Timestamptz `json:"lease_until"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+type CatalogMetadataHead struct {
+	SteamAppID                 int64              `json:"steam_app_id"`
+	LatestRunRevision          int64              `json:"latest_run_revision"`
+	LatestObservationOrdinal   int64              `json:"latest_observation_ordinal"`
+	LatestFingerprint          string             `json:"latest_fingerprint"`
+	MaterialRunRevision        int64              `json:"material_run_revision"`
+	MaterialObservationOrdinal int64              `json:"material_observation_ordinal"`
+	MaterialFingerprint        string             `json:"material_fingerprint"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type CatalogMetadataIngressWork struct {
+	ID                         pgtype.UUID        `json:"id"`
+	SteamAppID                 int64              `json:"steam_app_id"`
+	IngressKind                string             `json:"ingress_kind"`
+	IngressIdentity            string             `json:"ingress_identity"`
+	RunRevision                int64              `json:"run_revision"`
+	ObservationOrdinal         int64              `json:"observation_ordinal"`
+	Fingerprint                string             `json:"fingerprint"`
+	MaterialRunRevision        int64              `json:"material_run_revision"`
+	MaterialObservationOrdinal int64              `json:"material_observation_ordinal"`
+	MaterialFingerprint        string             `json:"material_fingerprint"`
+	Priority                   int16              `json:"priority"`
+	Status                     string             `json:"status"`
+	NextEligibleAt             pgtype.Timestamptz `json:"next_eligible_at"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type CatalogMetadataProvenance struct {
+	SteamAppID         int64              `json:"steam_app_id"`
+	IngressKind        string             `json:"ingress_kind"`
+	IngressIdentity    string             `json:"ingress_identity"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	FirstSeenAt        pgtype.Timestamptz `json:"first_seen_at"`
+	LastSeenAt         pgtype.Timestamptz `json:"last_seen_at"`
+}
+
 type CatalogRebuildState struct {
 	UserID                pgtype.UUID        `json:"user_id"`
 	DirtyRevision         int64              `json:"dirty_revision"`
@@ -176,6 +223,9 @@ type CatalogSearchCurrent struct {
 	NextRetryAt                pgtype.Timestamptz `json:"next_retry_at"`
 	NextEligibilityAt          pgtype.Timestamptz `json:"next_eligibility_at"`
 	SafeError                  string             `json:"safe_error"`
+	MaterialRunRevision        pgtype.Int8        `json:"material_run_revision"`
+	MaterialObservationOrdinal pgtype.Int8        `json:"material_observation_ordinal"`
+	MaterialFingerprint        pgtype.Text        `json:"material_fingerprint"`
 }
 
 type CatalogSearchFeed struct {
@@ -265,14 +315,16 @@ type CatalogSearchRun struct {
 }
 
 type CatalogSearchWorklist struct {
-	RunID              pgtype.UUID        `json:"run_id"`
-	SteamAppID         int64              `json:"steam_app_id"`
-	RunRevision        int64              `json:"run_revision"`
-	ObservationOrdinal int64              `json:"observation_ordinal"`
-	Priority           int16              `json:"priority"`
-	Status             string             `json:"status"`
-	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
-	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	RunID                      pgtype.UUID        `json:"run_id"`
+	SteamAppID                 int64              `json:"steam_app_id"`
+	RunRevision                int64              `json:"run_revision"`
+	ObservationOrdinal         int64              `json:"observation_ordinal"`
+	Priority                   int16              `json:"priority"`
+	Status                     string             `json:"status"`
+	NextRetryAt                pgtype.Timestamptz `json:"next_retry_at"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+	MaterialRunRevision        pgtype.Int8        `json:"material_run_revision"`
+	MaterialObservationOrdinal pgtype.Int8        `json:"material_observation_ordinal"`
 }
 
 type CatalogStoreReservation struct {
@@ -288,6 +340,8 @@ type CatalogStoreReservation struct {
 	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
 	CreatedAt          pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	BudgetHour         pgtype.Timestamptz `json:"budget_hour"`
+	BudgetIdentityHash pgtype.Text        `json:"budget_identity_hash"`
 }
 
 type CatalogWorkflowState struct {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -138,6 +139,17 @@ func (s *SearchScanService) handlePage(ctx context.Context, lease jobs.Lease) er
 	if err == nil {
 		return nil
 	}
+	type nextEligible interface{ NextEligibleAt() time.Time }
+	var throttled nextEligible
+	if errors.As(err, &throttled) {
+		at := throttled.NextEligibleAt().UTC()
+		if at.After(time.Now().UTC()) {
+			if deferErr := s.queue.DeferUntil(ctx, lease, at); deferErr != nil {
+				return deferErr
+			}
+			return jobs.ErrDeferred
+		}
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -244,6 +256,10 @@ func (s *SearchScanService) commitPage(ctx context.Context, run RunRef, feed ste
 	if err != nil {
 		return err
 	}
+	runRow, err := q.GetSearchRun(ctx, catalogUUID(run.ID))
+	if err != nil {
+		return err
+	}
 	if state.CursorOffset != int32(start) || state.PageGeneration != int32(generation) || (state.Status != "queued" && state.Status != "running") {
 		if _, manifestErr := q.GetCommittedSearchPage(ctx, dbgen.GetCommittedSearchPageParams{RunID: catalogUUID(run.ID), Feed: string(feed), StartOffset: int32(start), PageGeneration: int32(generation)}); manifestErr == nil {
 			if err := tx.Commit(ctx); err != nil {
@@ -255,6 +271,23 @@ func (s *SearchScanService) commitPage(ctx context.Context, run RunRef, feed ste
 	}
 	if s.beforePagePersistHook != nil {
 		if err := s.beforePagePersistHook(); err != nil {
+			return err
+		}
+	}
+	appIDs := make([]int64, 0, len(page.Items))
+	seenAppIDs := make(map[int64]struct{}, len(page.Items))
+	for _, observation := range page.Items {
+		if observation.AppID < 1 || observation.AppID > math.MaxUint32 {
+			return errors.New("invalid search app id")
+		}
+		if _, exists := seenAppIDs[observation.AppID]; !exists {
+			seenAppIDs[observation.AppID] = struct{}{}
+			appIDs = append(appIDs, observation.AppID)
+		}
+	}
+	sort.Slice(appIDs, func(i, j int) bool { return appIDs[i] < appIDs[j] })
+	for _, appID := range appIDs {
+		if err := q.LockMetadataApp(ctx, appID); err != nil {
 			return err
 		}
 	}
@@ -274,9 +307,6 @@ func (s *SearchScanService) commitPage(ctx context.Context, run RunRef, feed ste
 	}
 	skippedForCap := false
 	for _, observation := range page.Items {
-		if observation.AppID < 1 || observation.AppID > math.MaxUint32 {
-			return errors.New("invalid search app id")
-		}
 		window := ParseReleaseDate(observation.ReleaseText, now)
 		positive := pgtype.Int4{}
 		if observation.Review.PositivePercent != nil {
@@ -300,7 +330,23 @@ func (s *SearchScanService) commitPage(ctx context.Context, run RunRef, feed ste
 		if _, err := q.InsertSearchObservation(ctx, params); err != nil {
 			return err
 		}
+		material, err := q.UpsertMetadataCandidateHead(ctx, dbgen.UpsertMetadataCandidateHeadParams{
+			SteamAppID: observation.AppID, RunRevision: run.Revision, ObservationOrdinal: ordinal,
+			Fingerprint: observation.Fingerprint, NowAt: pgtype.Timestamptz{Time: now, Valid: true},
+		})
+		if err != nil {
+			return err
+		}
 		if _, err := q.UpsertCurrentSearchObservation(ctx, dbgen.UpsertCurrentSearchObservationParams{SteamAppID: observation.AppID, RunRevision: run.Revision, ObservationOrdinal: ordinal, ReleaseText: observation.ReleaseText, Precision: string(window.Precision), ReleaseDate: releaseDate, ReleaseYear: year, ReleaseMonth: month, ReleaseQuarter: quarter, Fingerprint: observation.Fingerprint, ReviewBand: string(observation.Review.Band), ReviewLabel: observation.Review.Label, PositivePercent: positive, ReviewTotal: observation.Review.Total, ReviewObservedAt: pgtype.Timestamptz{Time: now, Valid: true}, Priority: searchFeedPriority(feed)}); err != nil {
+			return err
+		}
+		if _, err := q.SyncCurrentMaterialCandidate(ctx, dbgen.SyncCurrentMaterialCandidateParams{RunRevision: pgtype.Int8{Int64: material.MaterialRunRevision, Valid: true}, ObservationOrdinal: pgtype.Int8{Int64: material.MaterialObservationOrdinal, Valid: true}, Fingerprint: pgtype.Text{String: material.MaterialFingerprint, Valid: true}, SteamAppID: observation.AppID}); err != nil {
+			return err
+		}
+		if _, err := q.SupersedeStaleMetadataWorkForApp(ctx, dbgen.SupersedeStaleMetadataWorkForAppParams{SteamAppID: observation.AppID, RunRevision: material.MaterialRunRevision, ObservationOrdinal: material.MaterialObservationOrdinal}); err != nil {
+			return err
+		}
+		if _, err := q.SupersedeStaleMetadataIngressWork(ctx, dbgen.SupersedeStaleMetadataIngressWorkParams{SteamAppID: observation.AppID, RunRevision: material.MaterialRunRevision, ObservationOrdinal: material.MaterialObservationOrdinal, Fingerprint: material.MaterialFingerprint, NowAt: pgtype.Timestamptz{Time: now, Valid: true}}); err != nil {
 			return err
 		}
 		shouldUpsert := int(workCount) < cfg.SearchMaxNewAppsPerRun
@@ -311,8 +357,15 @@ func (s *SearchScanService) commitPage(ctx context.Context, run RunRef, feed ste
 			}
 		}
 		if shouldUpsert {
-			created, err := q.UpsertSearchWorklist(ctx, dbgen.UpsertSearchWorklistParams{RunID: catalogUUID(run.ID), SteamAppID: observation.AppID, RunRevision: run.Revision, ObservationOrdinal: ordinal, Priority: searchFeedPriority(feed)})
+			created, err := q.UpsertSearchWorklist(ctx, dbgen.UpsertSearchWorklistParams{RunID: catalogUUID(run.ID), SteamAppID: observation.AppID, RunRevision: run.Revision, ObservationOrdinal: ordinal, Priority: searchFeedPriority(feed), MaterialRunRevision: material.MaterialRunRevision, MaterialObservationOrdinal: material.MaterialObservationOrdinal})
 			if err != nil {
+				return err
+			}
+			if err := q.RecordMetadataProvenance(ctx, dbgen.RecordMetadataProvenanceParams{
+				SteamAppID: observation.AppID, IngressKind: runRow.Kind, IngressIdentity: run.ID.String(),
+				RunRevision: run.Revision, ObservationOrdinal: ordinal,
+				FirstSeenAt: pgtype.Timestamptz{Time: now, Valid: true},
+			}); err != nil {
 				return err
 			}
 			if created {

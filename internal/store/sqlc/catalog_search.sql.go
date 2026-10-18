@@ -11,19 +11,72 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acquireCatalogHostSlot = `-- name: AcquireCatalogHostSlot :one
+WITH candidate AS (
+    SELECT s.host,s.slot FROM catalog_host_throttle_slots s
+    JOIN catalog_host_throttles h ON h.host=s.host
+    WHERE s.host=$4 AND s.slot<=h.concurrency_limit
+      AND (s.fencing_token IS NULL OR s.lease_until<=$3)
+      AND (SELECT count(*) FROM catalog_host_throttle_slots active
+           WHERE active.host=s.host AND active.fencing_token IS NOT NULL
+             AND active.lease_until>$3)<h.concurrency_limit
+    ORDER BY s.slot FOR UPDATE OF s SKIP LOCKED LIMIT 1
+)
+UPDATE catalog_host_throttle_slots s SET fencing_token=$1,
+    lease_until=$2,updated_at=$3
+FROM candidate c WHERE s.host=c.host AND s.slot=c.slot
+RETURNING s.host, s.slot, s.fencing_token, s.lease_until, s.updated_at
+`
+
+type AcquireCatalogHostSlotParams struct {
+	FencingToken pgtype.UUID        `json:"fencing_token"`
+	LeaseUntil   pgtype.Timestamptz `json:"lease_until"`
+	NowAt        pgtype.Timestamptz `json:"now_at"`
+	Host         string             `json:"host"`
+}
+
+func (q *Queries) AcquireCatalogHostSlot(ctx context.Context, arg AcquireCatalogHostSlotParams) (CatalogHostThrottleSlot, error) {
+	row := q.db.QueryRow(ctx, acquireCatalogHostSlot,
+		arg.FencingToken,
+		arg.LeaseUntil,
+		arg.NowAt,
+		arg.Host,
+	)
+	var i CatalogHostThrottleSlot
+	err := row.Scan(
+		&i.Host,
+		&i.Slot,
+		&i.FencingToken,
+		&i.LeaseUntil,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const acquireStoreReservation = `-- name: AcquireStoreReservation :one
+WITH locked_current AS MATERIALIZED (
+    SELECT h.material_run_revision,h.material_observation_ordinal,c.next_refresh_at
+    FROM catalog_metadata_heads h LEFT JOIN catalog_search_current c USING(steam_app_id)
+    WHERE h.steam_app_id=$1 FOR UPDATE OF h
+)
 INSERT INTO catalog_store_reservations(steam_app_id,id,run_revision,observation_ordinal,fingerprint,fencing_token,lease_until)
 SELECT $1,$2,$3,$4,
     $5,$6,$7
-WHERE NOT EXISTS(SELECT 1 FROM catalog_search_current c WHERE c.steam_app_id=$1
-    AND (c.run_revision,c.observation_ordinal)>($3::bigint,$4::bigint))
+WHERE NOT EXISTS(SELECT 1 FROM locked_current c
+    WHERE (c.material_run_revision,c.material_observation_ordinal)>($3::bigint,$4::bigint))
+  AND (NOT EXISTS(SELECT 1 FROM catalog_store_reservations r WHERE r.steam_app_id=$1)
+       OR EXISTS(SELECT 1 FROM catalog_store_reservations r WHERE r.steam_app_id=$1
+           AND r.fingerprint<>$5)
+       OR COALESCE((SELECT next_refresh_at<=$8 FROM locked_current LIMIT 1),true))
 ON CONFLICT(steam_app_id) DO UPDATE SET id=EXCLUDED.id,run_revision=EXCLUDED.run_revision,
     observation_ordinal=EXCLUDED.observation_ordinal,fingerprint=EXCLUDED.fingerprint,
     fencing_token=EXCLUDED.fencing_token,lease_until=EXCLUDED.lease_until,status='reserved',updated_at=$8
-WHERE (catalog_store_reservations.status<>'reserved' OR catalog_store_reservations.lease_until<=$8)
+WHERE (catalog_store_reservations.status<>'reserved' OR catalog_store_reservations.lease_until<=$8
+       OR (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>(catalog_store_reservations.run_revision,catalog_store_reservations.observation_ordinal)
+          AND EXCLUDED.fingerprint<>catalog_store_reservations.fingerprint)
     AND (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
         (catalog_store_reservations.run_revision,catalog_store_reservations.observation_ordinal)
-RETURNING steam_app_id, id, run_revision, observation_ordinal, fingerprint, fencing_token, status, lease_until, retry_generation, next_retry_at, created_at, updated_at
+RETURNING steam_app_id, id, run_revision, observation_ordinal, fingerprint, fencing_token, status, lease_until, retry_generation, next_retry_at, created_at, updated_at, budget_hour, budget_identity_hash
 `
 
 type AcquireStoreReservationParams struct {
@@ -62,6 +115,8 @@ func (q *Queries) AcquireStoreReservation(ctx context.Context, arg AcquireStoreR
 		&i.NextRetryAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.BudgetHour,
+		&i.BudgetIdentityHash,
 	)
 	return i, err
 }
@@ -114,6 +169,123 @@ func (q *Queries) AllocateObservationOrdinal(ctx context.Context, id pgtype.UUID
 	var observation_ordinal int64
 	err := row.Scan(&observation_ordinal)
 	return observation_ordinal, err
+}
+
+const attachStoreReservationBudget = `-- name: AttachStoreReservationBudget :execrows
+UPDATE catalog_store_reservations SET budget_hour=$1,budget_identity_hash=$2,updated_at=$3
+WHERE steam_app_id=$4 AND id=$5 AND fencing_token=$6
+  AND status='reserved'
+`
+
+type AttachStoreReservationBudgetParams struct {
+	BudgetHour   pgtype.Timestamptz `json:"budget_hour"`
+	IdentityHash pgtype.Text        `json:"identity_hash"`
+	NowAt        pgtype.Timestamptz `json:"now_at"`
+	SteamAppID   int64              `json:"steam_app_id"`
+	ID           pgtype.UUID        `json:"id"`
+	FencingToken pgtype.UUID        `json:"fencing_token"`
+}
+
+func (q *Queries) AttachStoreReservationBudget(ctx context.Context, arg AttachStoreReservationBudgetParams) (int64, error) {
+	result, err := q.db.Exec(ctx, attachStoreReservationBudget,
+		arg.BudgetHour,
+		arg.IdentityHash,
+		arg.NowAt,
+		arg.SteamAppID,
+		arg.ID,
+		arg.FencingToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const claimMetadataIngressWork = `-- name: ClaimMetadataIngressWork :one
+SELECT w.id, w.steam_app_id, w.ingress_kind, w.ingress_identity, w.run_revision, w.observation_ordinal, w.fingerprint, w.material_run_revision, w.material_observation_ordinal, w.material_fingerprint, w.priority, w.status, w.next_eligible_at, w.created_at, w.updated_at FROM catalog_metadata_ingress_work w
+JOIN catalog_metadata_heads h USING(steam_app_id)
+WHERE w.id=$1 AND (w.status='pending'
+    OR (w.status='deferred' AND w.next_eligible_at<=$2)
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations r
+        WHERE r.steam_app_id=w.steam_app_id AND r.status='reserved'
+          AND r.lease_until<=$2)))
+  AND (w.material_run_revision,w.material_observation_ordinal,w.material_fingerprint)=
+      (h.material_run_revision,h.material_observation_ordinal,h.material_fingerprint)
+FOR UPDATE
+`
+
+type ClaimMetadataIngressWorkParams struct {
+	ID    pgtype.UUID        `json:"id"`
+	NowAt pgtype.Timestamptz `json:"now_at"`
+}
+
+func (q *Queries) ClaimMetadataIngressWork(ctx context.Context, arg ClaimMetadataIngressWorkParams) (CatalogMetadataIngressWork, error) {
+	row := q.db.QueryRow(ctx, claimMetadataIngressWork, arg.ID, arg.NowAt)
+	var i CatalogMetadataIngressWork
+	err := row.Scan(
+		&i.ID,
+		&i.SteamAppID,
+		&i.IngressKind,
+		&i.IngressIdentity,
+		&i.RunRevision,
+		&i.ObservationOrdinal,
+		&i.Fingerprint,
+		&i.MaterialRunRevision,
+		&i.MaterialObservationOrdinal,
+		&i.MaterialFingerprint,
+		&i.Priority,
+		&i.Status,
+		&i.NextEligibleAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const claimMetadataWork = `-- name: ClaimMetadataWork :one
+SELECT w.run_id,w.steam_app_id,COALESCE(w.material_run_revision,w.run_revision)::bigint AS run_revision,
+    COALESCE(w.material_observation_ordinal,w.observation_ordinal)::bigint AS observation_ordinal,w.priority,r.kind,
+    c.material_fingerprint::text AS fingerprint
+FROM catalog_search_worklist w
+JOIN catalog_search_runs r ON r.id=w.run_id
+JOIN catalog_metadata_heads c ON c.steam_app_id=w.steam_app_id
+WHERE w.run_id=$1 AND w.steam_app_id=$2
+  AND (w.status='pending' OR (w.status='deferred' AND w.next_retry_at<=$3)
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations sr
+        WHERE sr.steam_app_id=w.steam_app_id AND sr.status='reserved' AND sr.lease_until<=$3)))
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))=(c.material_run_revision,c.material_observation_ordinal)
+FOR UPDATE OF w
+`
+
+type ClaimMetadataWorkParams struct {
+	RunID      pgtype.UUID        `json:"run_id"`
+	SteamAppID int64              `json:"steam_app_id"`
+	NowAt      pgtype.Timestamptz `json:"now_at"`
+}
+
+type ClaimMetadataWorkRow struct {
+	RunID              pgtype.UUID `json:"run_id"`
+	SteamAppID         int64       `json:"steam_app_id"`
+	RunRevision        int64       `json:"run_revision"`
+	ObservationOrdinal int64       `json:"observation_ordinal"`
+	Priority           int16       `json:"priority"`
+	Kind               string      `json:"kind"`
+	Fingerprint        string      `json:"fingerprint"`
+}
+
+func (q *Queries) ClaimMetadataWork(ctx context.Context, arg ClaimMetadataWorkParams) (ClaimMetadataWorkRow, error) {
+	row := q.db.QueryRow(ctx, claimMetadataWork, arg.RunID, arg.SteamAppID, arg.NowAt)
+	var i ClaimMetadataWorkRow
+	err := row.Scan(
+		&i.RunID,
+		&i.SteamAppID,
+		&i.RunRevision,
+		&i.ObservationOrdinal,
+		&i.Priority,
+		&i.Kind,
+		&i.Fingerprint,
+	)
+	return i, err
 }
 
 const closeLegacyCatalogWorkflow = `-- name: CloseLegacyCatalogWorkflow :execrows
@@ -227,6 +399,52 @@ func (q *Queries) CreateOrGetSearchRun(ctx context.Context, arg CreateOrGetSearc
 	return i, err
 }
 
+const deferMetadataWork = `-- name: DeferMetadataWork :execrows
+UPDATE catalog_search_worklist SET status='deferred',next_retry_at=$1
+WHERE run_id=$2 AND steam_app_id=$3
+    AND status IN ('pending','reserved','deferred')
+`
+
+type DeferMetadataWorkParams struct {
+	NextRetryAt pgtype.Timestamptz `json:"next_retry_at"`
+	RunID       pgtype.UUID        `json:"run_id"`
+	SteamAppID  int64              `json:"steam_app_id"`
+}
+
+func (q *Queries) DeferMetadataWork(ctx context.Context, arg DeferMetadataWorkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferMetadataWork, arg.NextRetryAt, arg.RunID, arg.SteamAppID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const ensureCatalogHostThrottle = `-- name: EnsureCatalogHostThrottle :one
+INSERT INTO catalog_host_throttles(host,concurrency_limit)
+VALUES($1,$2)
+ON CONFLICT(host) DO UPDATE SET concurrency_limit=LEAST(catalog_host_throttles.concurrency_limit,EXCLUDED.concurrency_limit)
+RETURNING host, concurrency_limit, consecutive_failures, success_count, next_eligible_at, updated_at
+`
+
+type EnsureCatalogHostThrottleParams struct {
+	Host         string `json:"host"`
+	DefaultLimit int32  `json:"default_limit"`
+}
+
+func (q *Queries) EnsureCatalogHostThrottle(ctx context.Context, arg EnsureCatalogHostThrottleParams) (CatalogHostThrottle, error) {
+	row := q.db.QueryRow(ctx, ensureCatalogHostThrottle, arg.Host, arg.DefaultLimit)
+	var i CatalogHostThrottle
+	err := row.Scan(
+		&i.Host,
+		&i.ConcurrencyLimit,
+		&i.ConsecutiveFailures,
+		&i.SuccessCount,
+		&i.NextEligibleAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const failSearchFeedAtCursor = `-- name: FailSearchFeedAtCursor :execrows
 UPDATE catalog_search_feeds SET status='failed',completed_at=$1,safe_error=$2
 WHERE run_id=$3 AND feed=$4 AND status IN ('queued','running')
@@ -282,6 +500,24 @@ func (q *Queries) FinishSearchRunIfTerminal(ctx context.Context, arg FinishSearc
 	return result.RowsAffected(), nil
 }
 
+const getCatalogHostThrottle = `-- name: GetCatalogHostThrottle :one
+SELECT host, concurrency_limit, consecutive_failures, success_count, next_eligible_at, updated_at FROM catalog_host_throttles WHERE host=$1
+`
+
+func (q *Queries) GetCatalogHostThrottle(ctx context.Context, host string) (CatalogHostThrottle, error) {
+	row := q.db.QueryRow(ctx, getCatalogHostThrottle, host)
+	var i CatalogHostThrottle
+	err := row.Scan(
+		&i.Host,
+		&i.ConcurrencyLimit,
+		&i.ConsecutiveFailures,
+		&i.SuccessCount,
+		&i.NextEligibleAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getCatalogWorkflowState = `-- name: GetCatalogWorkflowState :one
 SELECT singleton, legacy_enqueue_enabled, legacy_cutover_at FROM catalog_workflow_state WHERE singleton
 `
@@ -327,6 +563,24 @@ func (q *Queries) GetCommittedSearchPage(ctx context.Context, arg GetCommittedSe
 	return i, err
 }
 
+const getCurrentMaterialCandidate = `-- name: GetCurrentMaterialCandidate :one
+SELECT material_run_revision,material_observation_ordinal,material_fingerprint
+FROM catalog_metadata_heads WHERE steam_app_id=$1
+`
+
+type GetCurrentMaterialCandidateRow struct {
+	MaterialRunRevision        int64  `json:"material_run_revision"`
+	MaterialObservationOrdinal int64  `json:"material_observation_ordinal"`
+	MaterialFingerprint        string `json:"material_fingerprint"`
+}
+
+func (q *Queries) GetCurrentMaterialCandidate(ctx context.Context, steamAppID int64) (GetCurrentMaterialCandidateRow, error) {
+	row := q.db.QueryRow(ctx, getCurrentMaterialCandidate, steamAppID)
+	var i GetCurrentMaterialCandidateRow
+	err := row.Scan(&i.MaterialRunRevision, &i.MaterialObservationOrdinal, &i.MaterialFingerprint)
+	return i, err
+}
+
 const getSearchRun = `-- name: GetSearchRun :one
 SELECT id, run_revision, schedule_name, occurrence_at, kind, config_snapshot, status, retry_generation, next_retry_at, observation_ordinal, new_app_count, created_at, started_at, completed_at, last_successful_at, safe_error FROM catalog_search_runs WHERE id=$1
 `
@@ -351,6 +605,32 @@ func (q *Queries) GetSearchRun(ctx context.Context, id pgtype.UUID) (CatalogSear
 		&i.CompletedAt,
 		&i.LastSuccessfulAt,
 		&i.SafeError,
+	)
+	return i, err
+}
+
+const getStoreReservation = `-- name: GetStoreReservation :one
+SELECT steam_app_id, id, run_revision, observation_ordinal, fingerprint, fencing_token, status, lease_until, retry_generation, next_retry_at, created_at, updated_at, budget_hour, budget_identity_hash FROM catalog_store_reservations WHERE steam_app_id=$1
+`
+
+func (q *Queries) GetStoreReservation(ctx context.Context, steamAppID int64) (CatalogStoreReservation, error) {
+	row := q.db.QueryRow(ctx, getStoreReservation, steamAppID)
+	var i CatalogStoreReservation
+	err := row.Scan(
+		&i.SteamAppID,
+		&i.ID,
+		&i.RunRevision,
+		&i.ObservationOrdinal,
+		&i.Fingerprint,
+		&i.FencingToken,
+		&i.Status,
+		&i.LeaseUntil,
+		&i.RetryGeneration,
+		&i.NextRetryAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.BudgetHour,
+		&i.BudgetIdentityHash,
 	)
 	return i, err
 }
@@ -407,7 +687,7 @@ func (q *Queries) InsertSearchObservation(ctx context.Context, arg InsertSearchO
 }
 
 const listDueEligibilityChanges = `-- name: ListDueEligibilityChanges :many
-SELECT steam_app_id, run_revision, observation_ordinal, first_seen_at, last_seen_at, priority, release_text, precision, release_date, release_year, release_month, release_quarter, coming_soon, fingerprint, review_band, review_label, positive_percent, review_total, review_observed_at, last_successful_appdetails_at, next_refresh_at, semantic_content_hash, active, tombstone_reason, retry_generation, retry_attempts, next_retry_at, next_eligibility_at, safe_error FROM catalog_search_current
+SELECT steam_app_id, run_revision, observation_ordinal, first_seen_at, last_seen_at, priority, release_text, precision, release_date, release_year, release_month, release_quarter, coming_soon, fingerprint, review_band, review_label, positive_percent, review_total, review_observed_at, last_successful_appdetails_at, next_refresh_at, semantic_content_hash, active, tombstone_reason, retry_generation, retry_attempts, next_retry_at, next_eligibility_at, safe_error, material_run_revision, material_observation_ordinal, material_fingerprint FROM catalog_search_current
 WHERE next_eligibility_at<=$1
 ORDER BY next_eligibility_at,steam_app_id LIMIT $2
 `
@@ -456,6 +736,9 @@ func (q *Queries) ListDueEligibilityChanges(ctx context.Context, arg ListDueElig
 			&i.NextRetryAt,
 			&i.NextEligibilityAt,
 			&i.SafeError,
+			&i.MaterialRunRevision,
+			&i.MaterialObservationOrdinal,
+			&i.MaterialFingerprint,
 		); err != nil {
 			return nil, err
 		}
@@ -535,6 +818,24 @@ func (q *Queries) ListTerminalSearchRuns(ctx context.Context) ([]ListTerminalSea
 	return items, nil
 }
 
+const lockCatalogHostThrottle = `-- name: LockCatalogHostThrottle :one
+SELECT host, concurrency_limit, consecutive_failures, success_count, next_eligible_at, updated_at FROM catalog_host_throttles WHERE host=$1 FOR UPDATE
+`
+
+func (q *Queries) LockCatalogHostThrottle(ctx context.Context, host string) (CatalogHostThrottle, error) {
+	row := q.db.QueryRow(ctx, lockCatalogHostThrottle, host)
+	var i CatalogHostThrottle
+	err := row.Scan(
+		&i.Host,
+		&i.ConcurrencyLimit,
+		&i.ConsecutiveFailures,
+		&i.SuccessCount,
+		&i.NextEligibleAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const lockCatalogWorkflowState = `-- name: LockCatalogWorkflowState :one
 SELECT singleton, legacy_enqueue_enabled, legacy_cutover_at FROM catalog_workflow_state WHERE singleton FOR UPDATE
 `
@@ -545,6 +846,79 @@ func (q *Queries) LockCatalogWorkflowState(ctx context.Context) (CatalogWorkflow
 	row := q.db.QueryRow(ctx, lockCatalogWorkflowState)
 	var i CatalogWorkflowState
 	err := row.Scan(&i.Singleton, &i.LegacyEnqueueEnabled, &i.LegacyCutoverAt)
+	return i, err
+}
+
+const lockCurrentMetadataCandidate = `-- name: LockCurrentMetadataCandidate :one
+SELECT steam_app_id, run_revision, observation_ordinal, first_seen_at, last_seen_at, priority, release_text, precision, release_date, release_year, release_month, release_quarter, coming_soon, fingerprint, review_band, review_label, positive_percent, review_total, review_observed_at, last_successful_appdetails_at, next_refresh_at, semantic_content_hash, active, tombstone_reason, retry_generation, retry_attempts, next_retry_at, next_eligibility_at, safe_error, material_run_revision, material_observation_ordinal, material_fingerprint FROM catalog_search_current WHERE steam_app_id=$1 FOR UPDATE
+`
+
+func (q *Queries) LockCurrentMetadataCandidate(ctx context.Context, steamAppID int64) (CatalogSearchCurrent, error) {
+	row := q.db.QueryRow(ctx, lockCurrentMetadataCandidate, steamAppID)
+	var i CatalogSearchCurrent
+	err := row.Scan(
+		&i.SteamAppID,
+		&i.RunRevision,
+		&i.ObservationOrdinal,
+		&i.FirstSeenAt,
+		&i.LastSeenAt,
+		&i.Priority,
+		&i.ReleaseText,
+		&i.Precision,
+		&i.ReleaseDate,
+		&i.ReleaseYear,
+		&i.ReleaseMonth,
+		&i.ReleaseQuarter,
+		&i.ComingSoon,
+		&i.Fingerprint,
+		&i.ReviewBand,
+		&i.ReviewLabel,
+		&i.PositivePercent,
+		&i.ReviewTotal,
+		&i.ReviewObservedAt,
+		&i.LastSuccessfulAppdetailsAt,
+		&i.NextRefreshAt,
+		&i.SemanticContentHash,
+		&i.Active,
+		&i.TombstoneReason,
+		&i.RetryGeneration,
+		&i.RetryAttempts,
+		&i.NextRetryAt,
+		&i.NextEligibilityAt,
+		&i.SafeError,
+		&i.MaterialRunRevision,
+		&i.MaterialObservationOrdinal,
+		&i.MaterialFingerprint,
+	)
+	return i, err
+}
+
+const lockMetadataApp = `-- name: LockMetadataApp :exec
+SELECT pg_advisory_xact_lock($1)
+`
+
+func (q *Queries) LockMetadataApp(ctx context.Context, steamAppID int64) error {
+	_, err := q.db.Exec(ctx, lockMetadataApp, steamAppID)
+	return err
+}
+
+const lockMetadataCandidateHead = `-- name: LockMetadataCandidateHead :one
+SELECT steam_app_id, latest_run_revision, latest_observation_ordinal, latest_fingerprint, material_run_revision, material_observation_ordinal, material_fingerprint, updated_at FROM catalog_metadata_heads WHERE steam_app_id=$1 FOR UPDATE
+`
+
+func (q *Queries) LockMetadataCandidateHead(ctx context.Context, steamAppID int64) (CatalogMetadataHead, error) {
+	row := q.db.QueryRow(ctx, lockMetadataCandidateHead, steamAppID)
+	var i CatalogMetadataHead
+	err := row.Scan(
+		&i.SteamAppID,
+		&i.LatestRunRevision,
+		&i.LatestObservationOrdinal,
+		&i.LatestFingerprint,
+		&i.MaterialRunRevision,
+		&i.MaterialObservationOrdinal,
+		&i.MaterialFingerprint,
+		&i.UpdatedAt,
+	)
 	return i, err
 }
 
@@ -597,6 +971,42 @@ func (q *Queries) LockSearchFeedPublication(ctx context.Context, feed string) (C
 	return i, err
 }
 
+const markMetadataWorkReserved = `-- name: MarkMetadataWorkReserved :execrows
+UPDATE catalog_search_worklist SET status='reserved',next_retry_at=NULL
+WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred')
+`
+
+type MarkMetadataWorkReservedParams struct {
+	RunID      pgtype.UUID `json:"run_id"`
+	SteamAppID int64       `json:"steam_app_id"`
+}
+
+func (q *Queries) MarkMetadataWorkReserved(ctx context.Context, arg MarkMetadataWorkReservedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markMetadataWorkReserved, arg.RunID, arg.SteamAppID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markMetadataWorkSuperseded = `-- name: MarkMetadataWorkSuperseded :execrows
+UPDATE catalog_search_worklist SET status='superseded',next_retry_at=NULL
+WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred')
+`
+
+type MarkMetadataWorkSupersededParams struct {
+	RunID      pgtype.UUID `json:"run_id"`
+	SteamAppID int64       `json:"steam_app_id"`
+}
+
+func (q *Queries) MarkMetadataWorkSuperseded(ctx context.Context, arg MarkMetadataWorkSupersededParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markMetadataWorkSuperseded, arg.RunID, arg.SteamAppID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const markSearchRunFailed = `-- name: MarkSearchRunFailed :exec
 UPDATE catalog_search_runs SET status='failed',safe_error='retry_exhausted',next_retry_at=$2
 WHERE id=$1 AND status IN ('queued','running','failed','partial')
@@ -638,6 +1048,130 @@ func (q *Queries) MarkSearchRunRunning(ctx context.Context, arg MarkSearchRunRun
 	return result.RowsAffected(), nil
 }
 
+const metadataReservationNeeded = `-- name: MetadataReservationNeeded :one
+SELECT CASE
+    WHEN COALESCE((SELECT (c.material_run_revision,c.material_observation_ordinal)>
+        ($1::bigint,$2::bigint)
+        FROM catalog_metadata_heads c WHERE c.steam_app_id=$3),false) THEN false
+    WHEN NOT EXISTS(SELECT 1 FROM catalog_store_reservations r WHERE r.steam_app_id=$3) THEN true
+    WHEN COALESCE((SELECT r.fingerprint<>$4
+        FROM catalog_store_reservations r WHERE r.steam_app_id=$3),false) THEN true
+    WHEN COALESCE((SELECT r.status='reserved' AND r.lease_until<=$5
+        FROM catalog_store_reservations r WHERE r.steam_app_id=$3),false) THEN true
+    WHEN COALESCE((SELECT r.status='released' FROM catalog_store_reservations r
+        WHERE r.steam_app_id=$3),false) THEN true
+    WHEN COALESCE((SELECT r.run_revision=$1::bigint
+            AND r.observation_ordinal=$2::bigint
+            AND r.fingerprint=$4
+        FROM catalog_store_reservations r WHERE r.steam_app_id=$3),false)
+        AND NOT EXISTS(SELECT 1 FROM catalog_search_current c
+            WHERE c.steam_app_id=$3 AND c.next_refresh_at<=$5) THEN false
+    WHEN COALESCE((SELECT c.next_refresh_at IS NULL OR c.next_refresh_at<=$5
+        FROM catalog_search_current c WHERE c.steam_app_id=$3),true)
+        AND COALESCE((SELECT r.status<>'reserved' FROM catalog_store_reservations r
+            WHERE r.steam_app_id=$3),false) THEN true
+    ELSE false END AS needed
+`
+
+type MetadataReservationNeededParams struct {
+	RunRevision          int64              `json:"run_revision"`
+	ObservationOrdinal   int64              `json:"observation_ordinal"`
+	SteamAppID           int64              `json:"steam_app_id"`
+	CandidateFingerprint string             `json:"candidate_fingerprint"`
+	NowAt                pgtype.Timestamptz `json:"now_at"`
+}
+
+func (q *Queries) MetadataReservationNeeded(ctx context.Context, arg MetadataReservationNeededParams) (bool, error) {
+	row := q.db.QueryRow(ctx, metadataReservationNeeded,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
+		arg.SteamAppID,
+		arg.CandidateFingerprint,
+		arg.NowAt,
+	)
+	var needed bool
+	err := row.Scan(&needed)
+	return needed, err
+}
+
+const peekNextMetadataIngressWork = `-- name: PeekNextMetadataIngressWork :one
+SELECT w.id, w.steam_app_id, w.ingress_kind, w.ingress_identity, w.run_revision, w.observation_ordinal, w.fingerprint, w.material_run_revision, w.material_observation_ordinal, w.material_fingerprint, w.priority, w.status, w.next_eligible_at, w.created_at, w.updated_at FROM catalog_metadata_ingress_work w
+JOIN catalog_metadata_heads h USING(steam_app_id)
+WHERE ((w.status='pending' OR (w.status='deferred' AND w.next_eligible_at<=$1)
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations r
+        WHERE r.steam_app_id=w.steam_app_id AND r.status='reserved'
+          AND r.lease_until<=$1)))
+  AND (w.material_run_revision,w.material_observation_ordinal,w.material_fingerprint)=
+      (h.material_run_revision,h.material_observation_ordinal,h.material_fingerprint))
+ORDER BY CASE WHEN w.status IN ('deferred','reserved') THEN 0 ELSE 1 END,w.priority DESC,w.created_at
+LIMIT 1
+`
+
+func (q *Queries) PeekNextMetadataIngressWork(ctx context.Context, nowAt pgtype.Timestamptz) (CatalogMetadataIngressWork, error) {
+	row := q.db.QueryRow(ctx, peekNextMetadataIngressWork, nowAt)
+	var i CatalogMetadataIngressWork
+	err := row.Scan(
+		&i.ID,
+		&i.SteamAppID,
+		&i.IngressKind,
+		&i.IngressIdentity,
+		&i.RunRevision,
+		&i.ObservationOrdinal,
+		&i.Fingerprint,
+		&i.MaterialRunRevision,
+		&i.MaterialObservationOrdinal,
+		&i.MaterialFingerprint,
+		&i.Priority,
+		&i.Status,
+		&i.NextEligibleAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const peekNextMetadataWork = `-- name: PeekNextMetadataWork :one
+SELECT w.run_id,w.steam_app_id,COALESCE(w.material_run_revision,w.run_revision)::bigint AS run_revision,
+    COALESCE(w.material_observation_ordinal,w.observation_ordinal)::bigint AS observation_ordinal,w.priority,r.kind,
+    c.material_fingerprint::text AS fingerprint
+FROM catalog_search_worklist w
+JOIN catalog_search_runs r ON r.id=w.run_id
+JOIN catalog_metadata_heads c ON c.steam_app_id=w.steam_app_id
+WHERE (w.status='pending' OR (w.status='deferred' AND w.next_retry_at<=$1)
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations sr
+        WHERE sr.steam_app_id=w.steam_app_id AND sr.status='reserved'
+          AND sr.lease_until<=$1)))
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))=(c.material_run_revision,c.material_observation_ordinal)
+ORDER BY CASE WHEN w.status IN ('deferred','reserved') THEN 0 WHEN r.kind='reconciliation' THEN 2 ELSE 1 END,
+    w.priority DESC,w.run_revision DESC,w.observation_ordinal DESC,w.created_at,w.steam_app_id
+LIMIT 1
+`
+
+type PeekNextMetadataWorkRow struct {
+	RunID              pgtype.UUID `json:"run_id"`
+	SteamAppID         int64       `json:"steam_app_id"`
+	RunRevision        int64       `json:"run_revision"`
+	ObservationOrdinal int64       `json:"observation_ordinal"`
+	Priority           int16       `json:"priority"`
+	Kind               string      `json:"kind"`
+	Fingerprint        string      `json:"fingerprint"`
+}
+
+func (q *Queries) PeekNextMetadataWork(ctx context.Context, nowAt pgtype.Timestamptz) (PeekNextMetadataWorkRow, error) {
+	row := q.db.QueryRow(ctx, peekNextMetadataWork, nowAt)
+	var i PeekNextMetadataWorkRow
+	err := row.Scan(
+		&i.RunID,
+		&i.SteamAppID,
+		&i.RunRevision,
+		&i.ObservationOrdinal,
+		&i.Priority,
+		&i.Kind,
+		&i.Fingerprint,
+	)
+	return i, err
+}
+
 const prepareSearchRunFeeds = `-- name: PrepareSearchRunFeeds :execrows
 INSERT INTO catalog_search_feeds(run_id,feed)
 SELECT $1,feed FROM unnest(ARRAY['popular_upcoming','popular_new','recent','coming_soon']) AS feed
@@ -646,6 +1180,55 @@ ON CONFLICT(run_id,feed) DO NOTHING
 
 func (q *Queries) PrepareSearchRunFeeds(ctx context.Context, runID pgtype.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, prepareSearchRunFeeds, runID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const pruneCatalogBudgets = `-- name: PruneCatalogBudgets :execrows
+DELETE FROM catalog_budget_reservations b WHERE b.hour_at<$1
+  AND NOT EXISTS(SELECT 1 FROM catalog_store_reservations r
+      WHERE r.budget_hour=b.hour_at AND (r.status='reserved'
+        OR EXISTS(SELECT 1 FROM catalog_search_worklist w WHERE w.steam_app_id=r.steam_app_id
+            AND w.status IN ('pending','reserved','deferred'))
+        OR EXISTS(SELECT 1 FROM catalog_metadata_ingress_work w WHERE w.steam_app_id=r.steam_app_id
+            AND w.status IN ('pending','reserved','deferred'))))
+`
+
+func (q *Queries) PruneCatalogBudgets(ctx context.Context, beforeAt pgtype.Timestamptz) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneCatalogBudgets, beforeAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const pruneCatalogHostSlots = `-- name: PruneCatalogHostSlots :execrows
+UPDATE catalog_host_throttle_slots SET fencing_token=NULL,lease_until=NULL,updated_at=$1
+WHERE fencing_token IS NOT NULL AND lease_until<=$1
+`
+
+func (q *Queries) PruneCatalogHostSlots(ctx context.Context, nowAt pgtype.Timestamptz) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneCatalogHostSlots, nowAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const pruneCatalogReservations = `-- name: PruneCatalogReservations :execrows
+DELETE FROM catalog_store_reservations r
+WHERE r.updated_at<$1 AND r.status<>'reserved'
+  AND NOT EXISTS(SELECT 1 FROM catalog_search_current c WHERE c.steam_app_id=r.steam_app_id)
+  AND NOT EXISTS(SELECT 1 FROM catalog_search_worklist w WHERE w.steam_app_id=r.steam_app_id
+      AND w.status IN ('pending','reserved','deferred'))
+  AND NOT EXISTS(SELECT 1 FROM catalog_metadata_ingress_work w WHERE w.steam_app_id=r.steam_app_id
+      AND w.status IN ('pending','reserved','deferred'))
+`
+
+func (q *Queries) PruneCatalogReservations(ctx context.Context, beforeAt pgtype.Timestamptz) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneCatalogReservations, beforeAt)
 	if err != nil {
 		return 0, err
 	}
@@ -695,6 +1278,119 @@ func (q *Queries) PublishFeedMembership(ctx context.Context, arg PublishFeedMemb
 	var published bool
 	err := row.Scan(&published)
 	return published, err
+}
+
+const recordCatalogThrottleFailure = `-- name: RecordCatalogThrottleFailure :one
+INSERT INTO catalog_host_throttles(host,concurrency_limit,consecutive_failures,success_count,next_eligible_at,updated_at)
+VALUES($1,GREATEST(1,$2::integer-$3::integer),1,0,$4,$5)
+ON CONFLICT(host) DO UPDATE SET
+    concurrency_limit=GREATEST(1,catalog_host_throttles.concurrency_limit-$3::integer),
+    consecutive_failures=catalog_host_throttles.consecutive_failures+1,success_count=0,
+    next_eligible_at=GREATEST(catalog_host_throttles.next_eligible_at,EXCLUDED.next_eligible_at),updated_at=EXCLUDED.updated_at
+RETURNING host, concurrency_limit, consecutive_failures, success_count, next_eligible_at, updated_at
+`
+
+type RecordCatalogThrottleFailureParams struct {
+	Host           string             `json:"host"`
+	DefaultLimit   int32              `json:"default_limit"`
+	LimitDecrement int32              `json:"limit_decrement"`
+	NextEligibleAt pgtype.Timestamptz `json:"next_eligible_at"`
+	NowAt          pgtype.Timestamptz `json:"now_at"`
+}
+
+func (q *Queries) RecordCatalogThrottleFailure(ctx context.Context, arg RecordCatalogThrottleFailureParams) (CatalogHostThrottle, error) {
+	row := q.db.QueryRow(ctx, recordCatalogThrottleFailure,
+		arg.Host,
+		arg.DefaultLimit,
+		arg.LimitDecrement,
+		arg.NextEligibleAt,
+		arg.NowAt,
+	)
+	var i CatalogHostThrottle
+	err := row.Scan(
+		&i.Host,
+		&i.ConcurrencyLimit,
+		&i.ConsecutiveFailures,
+		&i.SuccessCount,
+		&i.NextEligibleAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const recordCatalogThrottleSuccess = `-- name: RecordCatalogThrottleSuccess :one
+UPDATE catalog_host_throttles SET
+    concurrency_limit=CASE WHEN (next_eligible_at IS NULL OR next_eligible_at<=$1)
+        AND success_count+1>=$2::integer
+        THEN LEAST($3::integer,concurrency_limit+1) ELSE concurrency_limit END,
+    success_count=CASE
+        WHEN next_eligible_at>$1 THEN success_count
+        WHEN success_count+1>=$2::integer THEN 0 ELSE success_count+1 END,
+    consecutive_failures=CASE WHEN next_eligible_at>$1 THEN consecutive_failures ELSE 0 END,
+    next_eligible_at=CASE WHEN next_eligible_at<=$1 THEN NULL ELSE next_eligible_at END,
+    updated_at=$1
+WHERE host=$4
+RETURNING host, concurrency_limit, consecutive_failures, success_count, next_eligible_at, updated_at
+`
+
+type RecordCatalogThrottleSuccessParams struct {
+	NowAt              pgtype.Timestamptz `json:"now_at"`
+	SuccessesToRecover int32              `json:"successes_to_recover"`
+	MaxLimit           int32              `json:"max_limit"`
+	Host               string             `json:"host"`
+}
+
+func (q *Queries) RecordCatalogThrottleSuccess(ctx context.Context, arg RecordCatalogThrottleSuccessParams) (CatalogHostThrottle, error) {
+	row := q.db.QueryRow(ctx, recordCatalogThrottleSuccess,
+		arg.NowAt,
+		arg.SuccessesToRecover,
+		arg.MaxLimit,
+		arg.Host,
+	)
+	var i CatalogHostThrottle
+	err := row.Scan(
+		&i.Host,
+		&i.ConcurrencyLimit,
+		&i.ConsecutiveFailures,
+		&i.SuccessCount,
+		&i.NextEligibleAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const recordMetadataProvenance = `-- name: RecordMetadataProvenance :exec
+INSERT INTO catalog_metadata_provenance(steam_app_id,ingress_kind,ingress_identity,run_revision,observation_ordinal,first_seen_at,last_seen_at)
+VALUES($1,$2,$3,$4,$5,$6,$6)
+ON CONFLICT(steam_app_id,ingress_kind,ingress_identity) DO UPDATE SET
+    run_revision=GREATEST(catalog_metadata_provenance.run_revision,EXCLUDED.run_revision),
+    observation_ordinal=CASE WHEN EXCLUDED.run_revision>catalog_metadata_provenance.run_revision
+        THEN EXCLUDED.observation_ordinal
+        WHEN EXCLUDED.run_revision=catalog_metadata_provenance.run_revision
+        THEN GREATEST(catalog_metadata_provenance.observation_ordinal,EXCLUDED.observation_ordinal)
+        ELSE catalog_metadata_provenance.observation_ordinal END,
+    last_seen_at=EXCLUDED.last_seen_at
+`
+
+type RecordMetadataProvenanceParams struct {
+	SteamAppID         int64              `json:"steam_app_id"`
+	IngressKind        string             `json:"ingress_kind"`
+	IngressIdentity    string             `json:"ingress_identity"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	FirstSeenAt        pgtype.Timestamptz `json:"first_seen_at"`
+}
+
+func (q *Queries) RecordMetadataProvenance(ctx context.Context, arg RecordMetadataProvenanceParams) error {
+	_, err := q.db.Exec(ctx, recordMetadataProvenance,
+		arg.SteamAppID,
+		arg.IngressKind,
+		arg.IngressIdentity,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
+		arg.FirstSeenAt,
+	)
+	return err
 }
 
 const recordSearchFeedProgress = `-- name: RecordSearchFeedProgress :execrows
@@ -747,6 +1443,25 @@ func (q *Queries) RecordSearchFeedProgress(ctx context.Context, arg RecordSearch
 	return result.RowsAffected(), nil
 }
 
+const releaseCatalogHostSlot = `-- name: ReleaseCatalogHostSlot :execrows
+UPDATE catalog_host_throttle_slots SET fencing_token=NULL,lease_until=NULL,updated_at=$1
+WHERE host=$2 AND fencing_token=$3
+`
+
+type ReleaseCatalogHostSlotParams struct {
+	NowAt        pgtype.Timestamptz `json:"now_at"`
+	Host         string             `json:"host"`
+	FencingToken pgtype.UUID        `json:"fencing_token"`
+}
+
+func (q *Queries) ReleaseCatalogHostSlot(ctx context.Context, arg ReleaseCatalogHostSlotParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseCatalogHostSlot, arg.NowAt, arg.Host, arg.FencingToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const releaseStoreReservation = `-- name: ReleaseStoreReservation :execrows
 UPDATE catalog_store_reservations SET status='released',updated_at=$1
 WHERE steam_app_id=$2 AND id=$3 AND fencing_token=$4
@@ -767,6 +1482,54 @@ func (q *Queries) ReleaseStoreReservation(ctx context.Context, arg ReleaseStoreR
 		arg.ID,
 		arg.FencingToken,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const requeueMetadataIngressWork = `-- name: RequeueMetadataIngressWork :execrows
+UPDATE catalog_metadata_ingress_work SET status='pending',next_eligible_at=NULL,updated_at=now()
+WHERE steam_app_id=$1
+  AND material_run_revision=$2 AND material_observation_ordinal=$3
+  AND material_fingerprint=$4 AND status='reserved'
+`
+
+type RequeueMetadataIngressWorkParams struct {
+	SteamAppID         int64  `json:"steam_app_id"`
+	RunRevision        int64  `json:"run_revision"`
+	ObservationOrdinal int64  `json:"observation_ordinal"`
+	Fingerprint        string `json:"fingerprint"`
+}
+
+func (q *Queries) RequeueMetadataIngressWork(ctx context.Context, arg RequeueMetadataIngressWorkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, requeueMetadataIngressWork,
+		arg.SteamAppID,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
+		arg.Fingerprint,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const requeueMetadataWork = `-- name: RequeueMetadataWork :execrows
+UPDATE catalog_search_worklist SET status='pending',next_retry_at=NULL
+WHERE steam_app_id=$1
+  AND COALESCE(material_run_revision,run_revision)=$2::bigint
+  AND COALESCE(material_observation_ordinal,observation_ordinal)=$3::bigint AND status='reserved'
+`
+
+type RequeueMetadataWorkParams struct {
+	SteamAppID         int64 `json:"steam_app_id"`
+	RunRevision        int64 `json:"run_revision"`
+	ObservationOrdinal int64 `json:"observation_ordinal"`
+}
+
+func (q *Queries) RequeueMetadataWork(ctx context.Context, arg RequeueMetadataWorkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, requeueMetadataWork, arg.SteamAppID, arg.RunRevision, arg.ObservationOrdinal)
 	if err != nil {
 		return 0, err
 	}
@@ -852,6 +1615,137 @@ func (q *Queries) SearchWorklistContains(ctx context.Context, arg SearchWorklist
 	return column_1, err
 }
 
+const setMetadataIngressWorkState = `-- name: SetMetadataIngressWorkState :execrows
+UPDATE catalog_metadata_ingress_work SET status=$1,next_eligible_at=$2,updated_at=$3
+WHERE id=$4
+`
+
+type SetMetadataIngressWorkStateParams struct {
+	Status         string             `json:"status"`
+	NextEligibleAt pgtype.Timestamptz `json:"next_eligible_at"`
+	NowAt          pgtype.Timestamptz `json:"now_at"`
+	ID             pgtype.UUID        `json:"id"`
+}
+
+func (q *Queries) SetMetadataIngressWorkState(ctx context.Context, arg SetMetadataIngressWorkStateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setMetadataIngressWorkState,
+		arg.Status,
+		arg.NextEligibleAt,
+		arg.NowAt,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const supersedeStaleMetadataIngressWork = `-- name: SupersedeStaleMetadataIngressWork :execrows
+UPDATE catalog_metadata_ingress_work SET status='superseded',next_eligible_at=NULL,updated_at=$1
+WHERE steam_app_id=$2 AND status IN ('pending','reserved','deferred')
+  AND ((material_run_revision,material_observation_ordinal)<($3::bigint,$4::bigint)
+    OR ((material_run_revision,material_observation_ordinal)=($3::bigint,$4::bigint)
+      AND material_fingerprint<>$5))
+`
+
+type SupersedeStaleMetadataIngressWorkParams struct {
+	NowAt              pgtype.Timestamptz `json:"now_at"`
+	SteamAppID         int64              `json:"steam_app_id"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	Fingerprint        string             `json:"fingerprint"`
+}
+
+func (q *Queries) SupersedeStaleMetadataIngressWork(ctx context.Context, arg SupersedeStaleMetadataIngressWorkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, supersedeStaleMetadataIngressWork,
+		arg.NowAt,
+		arg.SteamAppID,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
+		arg.Fingerprint,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const supersedeStaleMetadataWork = `-- name: SupersedeStaleMetadataWork :execrows
+UPDATE catalog_search_worklist w SET status='superseded',next_retry_at=NULL
+FROM catalog_search_current c
+WHERE c.steam_app_id=w.steam_app_id AND w.status IN ('pending','deferred')
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))<(COALESCE(c.material_run_revision,c.run_revision),COALESCE(c.material_observation_ordinal,c.observation_ordinal))
+`
+
+func (q *Queries) SupersedeStaleMetadataWork(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, supersedeStaleMetadataWork)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const supersedeStaleMetadataWorkForApp = `-- name: SupersedeStaleMetadataWorkForApp :execrows
+UPDATE catalog_search_worklist SET status='superseded',next_retry_at=NULL
+WHERE steam_app_id=$1 AND status IN ('pending','reserved','deferred')
+  AND (COALESCE(material_run_revision,run_revision),COALESCE(material_observation_ordinal,observation_ordinal))<($2::bigint,$3::bigint)
+`
+
+type SupersedeStaleMetadataWorkForAppParams struct {
+	SteamAppID         int64 `json:"steam_app_id"`
+	RunRevision        int64 `json:"run_revision"`
+	ObservationOrdinal int64 `json:"observation_ordinal"`
+}
+
+func (q *Queries) SupersedeStaleMetadataWorkForApp(ctx context.Context, arg SupersedeStaleMetadataWorkForAppParams) (int64, error) {
+	result, err := q.db.Exec(ctx, supersedeStaleMetadataWorkForApp, arg.SteamAppID, arg.RunRevision, arg.ObservationOrdinal)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const supersedeStaleReservedMetadataWork = `-- name: SupersedeStaleReservedMetadataWork :execrows
+UPDATE catalog_search_worklist w SET status='superseded',next_retry_at=NULL
+FROM catalog_search_current c
+WHERE c.steam_app_id=w.steam_app_id AND w.status='reserved'
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))<(COALESCE(c.material_run_revision,c.run_revision),COALESCE(c.material_observation_ordinal,c.observation_ordinal))
+`
+
+func (q *Queries) SupersedeStaleReservedMetadataWork(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, supersedeStaleReservedMetadataWork)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const syncCurrentMaterialCandidate = `-- name: SyncCurrentMaterialCandidate :execrows
+UPDATE catalog_search_current SET material_run_revision=$1,
+    material_observation_ordinal=$2,material_fingerprint=$3
+WHERE steam_app_id=$4
+`
+
+type SyncCurrentMaterialCandidateParams struct {
+	RunRevision        pgtype.Int8 `json:"run_revision"`
+	ObservationOrdinal pgtype.Int8 `json:"observation_ordinal"`
+	Fingerprint        pgtype.Text `json:"fingerprint"`
+	SteamAppID         int64       `json:"steam_app_id"`
+}
+
+func (q *Queries) SyncCurrentMaterialCandidate(ctx context.Context, arg SyncCurrentMaterialCandidateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, syncCurrentMaterialCandidate,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
+		arg.Fingerprint,
+		arg.SteamAppID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateSearchRunNewAppCount = `-- name: UpdateSearchRunNewAppCount :exec
 UPDATE catalog_search_runs SET new_app_count=$2 WHERE id=$1
 `
@@ -869,7 +1763,8 @@ func (q *Queries) UpdateSearchRunNewAppCount(ctx context.Context, arg UpdateSear
 const upsertCurrentSearchObservation = `-- name: UpsertCurrentSearchObservation :execrows
 INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,release_text,precision,
     release_date,release_year,release_month,release_quarter,fingerprint,
-    review_band,review_label,positive_percent,review_total,review_observed_at,last_seen_at,priority)
+    review_band,review_label,positive_percent,review_total,review_observed_at,last_seen_at,priority,
+    material_run_revision,material_observation_ordinal,material_fingerprint)
 VALUES($1,$2,$3,$4,
     $5,
     CASE WHEN $5='day' THEN $6::date END,
@@ -879,7 +1774,7 @@ VALUES($1,$2,$3,$4,
     $10,$11,$12,
     $13,$14,
     CASE WHEN $11='unknown' THEN NULL ELSE $15::timestamptz END,
-    $15,$16)
+    $15,$16,$2,$3,$10)
 ON CONFLICT(steam_app_id) DO UPDATE SET run_revision=EXCLUDED.run_revision,observation_ordinal=EXCLUDED.observation_ordinal,
     release_text=EXCLUDED.release_text,precision=EXCLUDED.precision,fingerprint=EXCLUDED.fingerprint,
     release_date=EXCLUDED.release_date,release_year=EXCLUDED.release_year,
@@ -889,7 +1784,13 @@ ON CONFLICT(steam_app_id) DO UPDATE SET run_revision=EXCLUDED.run_revision,obser
     positive_percent=CASE WHEN EXCLUDED.review_band='unknown' THEN catalog_search_current.positive_percent ELSE EXCLUDED.positive_percent END,
     review_total=CASE WHEN EXCLUDED.review_band='unknown' THEN catalog_search_current.review_total ELSE EXCLUDED.review_total END,
     review_observed_at=CASE WHEN EXCLUDED.review_band='unknown' THEN catalog_search_current.review_observed_at ELSE EXCLUDED.review_observed_at END,
-    last_seen_at=EXCLUDED.last_seen_at,priority=GREATEST(catalog_search_current.priority,EXCLUDED.priority)
+    last_seen_at=EXCLUDED.last_seen_at,priority=GREATEST(catalog_search_current.priority,EXCLUDED.priority),
+    material_run_revision=CASE WHEN EXCLUDED.fingerprint<>catalog_search_current.fingerprint
+        THEN EXCLUDED.run_revision ELSE COALESCE(catalog_search_current.material_run_revision,catalog_search_current.run_revision) END,
+    material_observation_ordinal=CASE WHEN EXCLUDED.fingerprint<>catalog_search_current.fingerprint
+        THEN EXCLUDED.observation_ordinal ELSE COALESCE(catalog_search_current.material_observation_ordinal,catalog_search_current.observation_ordinal) END,
+    material_fingerprint=CASE WHEN EXCLUDED.fingerprint<>catalog_search_current.fingerprint
+        THEN EXCLUDED.fingerprint ELSE COALESCE(catalog_search_current.material_fingerprint,catalog_search_current.fingerprint) END
 WHERE (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>
     (catalog_search_current.run_revision,catalog_search_current.observation_ordinal)
 `
@@ -938,14 +1839,165 @@ func (q *Queries) UpsertCurrentSearchObservation(ctx context.Context, arg Upsert
 	return result.RowsAffected(), nil
 }
 
+const upsertMetadataCandidateHead = `-- name: UpsertMetadataCandidateHead :one
+INSERT INTO catalog_metadata_heads(steam_app_id,latest_run_revision,latest_observation_ordinal,latest_fingerprint,
+    material_run_revision,material_observation_ordinal,material_fingerprint,updated_at)
+VALUES($1,$2,$3,$4,
+    $2,$3,$4,$5)
+ON CONFLICT(steam_app_id) DO UPDATE SET
+    latest_run_revision=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        THEN EXCLUDED.latest_run_revision ELSE catalog_metadata_heads.latest_run_revision END,
+    latest_observation_ordinal=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        THEN EXCLUDED.latest_observation_ordinal ELSE catalog_metadata_heads.latest_observation_ordinal END,
+    latest_fingerprint=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        THEN EXCLUDED.latest_fingerprint ELSE catalog_metadata_heads.latest_fingerprint END,
+    material_run_revision=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        AND EXCLUDED.latest_fingerprint<>catalog_metadata_heads.latest_fingerprint
+        THEN EXCLUDED.latest_run_revision ELSE catalog_metadata_heads.material_run_revision END,
+    material_observation_ordinal=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        AND EXCLUDED.latest_fingerprint<>catalog_metadata_heads.latest_fingerprint
+        THEN EXCLUDED.latest_observation_ordinal ELSE catalog_metadata_heads.material_observation_ordinal END,
+    material_fingerprint=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        AND EXCLUDED.latest_fingerprint<>catalog_metadata_heads.latest_fingerprint
+        THEN EXCLUDED.latest_fingerprint ELSE catalog_metadata_heads.material_fingerprint END,
+    updated_at=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        THEN EXCLUDED.updated_at ELSE catalog_metadata_heads.updated_at END
+RETURNING steam_app_id, latest_run_revision, latest_observation_ordinal, latest_fingerprint, material_run_revision, material_observation_ordinal, material_fingerprint, updated_at
+`
+
+type UpsertMetadataCandidateHeadParams struct {
+	SteamAppID         int64              `json:"steam_app_id"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	Fingerprint        string             `json:"fingerprint"`
+	NowAt              pgtype.Timestamptz `json:"now_at"`
+}
+
+func (q *Queries) UpsertMetadataCandidateHead(ctx context.Context, arg UpsertMetadataCandidateHeadParams) (CatalogMetadataHead, error) {
+	row := q.db.QueryRow(ctx, upsertMetadataCandidateHead,
+		arg.SteamAppID,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
+		arg.Fingerprint,
+		arg.NowAt,
+	)
+	var i CatalogMetadataHead
+	err := row.Scan(
+		&i.SteamAppID,
+		&i.LatestRunRevision,
+		&i.LatestObservationOrdinal,
+		&i.LatestFingerprint,
+		&i.MaterialRunRevision,
+		&i.MaterialObservationOrdinal,
+		&i.MaterialFingerprint,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const upsertMetadataIngressWork = `-- name: UpsertMetadataIngressWork :one
+INSERT INTO catalog_metadata_ingress_work(steam_app_id,ingress_kind,ingress_identity,run_revision,observation_ordinal,fingerprint,
+    material_run_revision,material_observation_ordinal,material_fingerprint,priority,status,updated_at)
+VALUES($1,$2,$3,$4,$5,$6,
+    $7,$8,$9,$10,'pending',$11)
+ON CONFLICT(steam_app_id,ingress_kind,ingress_identity) DO UPDATE SET
+    run_revision=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.run_revision ELSE catalog_metadata_ingress_work.run_revision END,
+    observation_ordinal=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.observation_ordinal ELSE catalog_metadata_ingress_work.observation_ordinal END,
+    fingerprint=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.fingerprint ELSE catalog_metadata_ingress_work.fingerprint END,
+    material_run_revision=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.material_run_revision ELSE catalog_metadata_ingress_work.material_run_revision END,
+    material_observation_ordinal=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.material_observation_ordinal ELSE catalog_metadata_ingress_work.material_observation_ordinal END,
+    material_fingerprint=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.material_fingerprint ELSE catalog_metadata_ingress_work.material_fingerprint END,
+    priority=GREATEST(catalog_metadata_ingress_work.priority,EXCLUDED.priority),
+    status=CASE WHEN (EXCLUDED.material_run_revision,EXCLUDED.material_observation_ordinal)>
+        (catalog_metadata_ingress_work.material_run_revision,catalog_metadata_ingress_work.material_observation_ordinal) THEN 'pending'
+        ELSE catalog_metadata_ingress_work.status END,
+    next_eligible_at=CASE WHEN (EXCLUDED.material_run_revision,EXCLUDED.material_observation_ordinal)>
+        (catalog_metadata_ingress_work.material_run_revision,catalog_metadata_ingress_work.material_observation_ordinal) THEN NULL
+        ELSE catalog_metadata_ingress_work.next_eligible_at END,
+    updated_at=EXCLUDED.updated_at
+RETURNING id, steam_app_id, ingress_kind, ingress_identity, run_revision, observation_ordinal, fingerprint, material_run_revision, material_observation_ordinal, material_fingerprint, priority, status, next_eligible_at, created_at, updated_at
+`
+
+type UpsertMetadataIngressWorkParams struct {
+	SteamAppID                 int64              `json:"steam_app_id"`
+	IngressKind                string             `json:"ingress_kind"`
+	IngressIdentity            string             `json:"ingress_identity"`
+	RunRevision                int64              `json:"run_revision"`
+	ObservationOrdinal         int64              `json:"observation_ordinal"`
+	Fingerprint                string             `json:"fingerprint"`
+	MaterialRunRevision        int64              `json:"material_run_revision"`
+	MaterialObservationOrdinal int64              `json:"material_observation_ordinal"`
+	MaterialFingerprint        string             `json:"material_fingerprint"`
+	Priority                   int16              `json:"priority"`
+	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
+}
+
+func (q *Queries) UpsertMetadataIngressWork(ctx context.Context, arg UpsertMetadataIngressWorkParams) (CatalogMetadataIngressWork, error) {
+	row := q.db.QueryRow(ctx, upsertMetadataIngressWork,
+		arg.SteamAppID,
+		arg.IngressKind,
+		arg.IngressIdentity,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
+		arg.Fingerprint,
+		arg.MaterialRunRevision,
+		arg.MaterialObservationOrdinal,
+		arg.MaterialFingerprint,
+		arg.Priority,
+		arg.UpdatedAt,
+	)
+	var i CatalogMetadataIngressWork
+	err := row.Scan(
+		&i.ID,
+		&i.SteamAppID,
+		&i.IngressKind,
+		&i.IngressIdentity,
+		&i.RunRevision,
+		&i.ObservationOrdinal,
+		&i.Fingerprint,
+		&i.MaterialRunRevision,
+		&i.MaterialObservationOrdinal,
+		&i.MaterialFingerprint,
+		&i.Priority,
+		&i.Status,
+		&i.NextEligibleAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const upsertSearchWorklist = `-- name: UpsertSearchWorklist :one
 WITH inserted AS (
-    INSERT INTO catalog_search_worklist(run_id,steam_app_id,run_revision,observation_ordinal,priority)
-    VALUES($1,$2,$3,$4,$5)
+    INSERT INTO catalog_search_worklist(run_id,steam_app_id,run_revision,observation_ordinal,priority,
+        material_run_revision,material_observation_ordinal)
+    VALUES($1,$2,$3,$4,$5,$6::bigint,$7::bigint)
     ON CONFLICT(run_id,steam_app_id) DO NOTHING RETURNING true AS created
 ), updated AS (
     UPDATE catalog_search_worklist SET run_revision=$3,observation_ordinal=$4,
-        priority=GREATEST(priority,$5)
+        priority=GREATEST(priority,$5),material_run_revision=$6::bigint,
+        material_observation_ordinal=$7::bigint,
+        status=CASE WHEN ($6::bigint,$7::bigint)>(COALESCE(material_run_revision,run_revision),COALESCE(material_observation_ordinal,observation_ordinal)) THEN 'pending' ELSE status END,
+        next_retry_at=CASE WHEN ($6::bigint,$7::bigint)>(COALESCE(material_run_revision,run_revision),COALESCE(material_observation_ordinal,observation_ordinal)) THEN NULL ELSE next_retry_at END
     WHERE run_id=$1 AND steam_app_id=$2 AND NOT EXISTS(SELECT 1 FROM inserted)
         AND ($3::bigint,$4::bigint)>(run_revision,observation_ordinal)
     RETURNING false AS created
@@ -955,11 +2007,13 @@ UNION ALL SELECT false WHERE NOT EXISTS(SELECT 1 FROM inserted) AND NOT EXISTS(S
 `
 
 type UpsertSearchWorklistParams struct {
-	RunID              pgtype.UUID `json:"run_id"`
-	SteamAppID         int64       `json:"steam_app_id"`
-	RunRevision        int64       `json:"run_revision"`
-	ObservationOrdinal int64       `json:"observation_ordinal"`
-	Priority           int16       `json:"priority"`
+	RunID                      pgtype.UUID `json:"run_id"`
+	SteamAppID                 int64       `json:"steam_app_id"`
+	RunRevision                int64       `json:"run_revision"`
+	ObservationOrdinal         int64       `json:"observation_ordinal"`
+	Priority                   int16       `json:"priority"`
+	MaterialRunRevision        int64       `json:"material_run_revision"`
+	MaterialObservationOrdinal int64       `json:"material_observation_ordinal"`
 }
 
 func (q *Queries) UpsertSearchWorklist(ctx context.Context, arg UpsertSearchWorklistParams) (bool, error) {
@@ -969,6 +2023,8 @@ func (q *Queries) UpsertSearchWorklist(ctx context.Context, arg UpsertSearchWork
 		arg.RunRevision,
 		arg.ObservationOrdinal,
 		arg.Priority,
+		arg.MaterialRunRevision,
+		arg.MaterialObservationOrdinal,
 	)
 	var created bool
 	err := row.Scan(&created)

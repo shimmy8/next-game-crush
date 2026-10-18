@@ -145,12 +145,16 @@ ON CONFLICT DO NOTHING;
 
 -- name: UpsertSearchWorklist :one
 WITH inserted AS (
-    INSERT INTO catalog_search_worklist(run_id,steam_app_id,run_revision,observation_ordinal,priority)
-    VALUES($1,$2,$3,$4,$5)
+    INSERT INTO catalog_search_worklist(run_id,steam_app_id,run_revision,observation_ordinal,priority,
+        material_run_revision,material_observation_ordinal)
+    VALUES($1,$2,$3,$4,$5,sqlc.arg(material_run_revision)::bigint,sqlc.arg(material_observation_ordinal)::bigint)
     ON CONFLICT(run_id,steam_app_id) DO NOTHING RETURNING true AS created
 ), updated AS (
     UPDATE catalog_search_worklist SET run_revision=$3,observation_ordinal=$4,
-        priority=GREATEST(priority,$5)
+        priority=GREATEST(priority,$5),material_run_revision=sqlc.arg(material_run_revision)::bigint,
+        material_observation_ordinal=sqlc.arg(material_observation_ordinal)::bigint,
+        status=CASE WHEN (sqlc.arg(material_run_revision)::bigint,sqlc.arg(material_observation_ordinal)::bigint)>(COALESCE(material_run_revision,run_revision),COALESCE(material_observation_ordinal,observation_ordinal)) THEN 'pending' ELSE status END,
+        next_retry_at=CASE WHEN (sqlc.arg(material_run_revision)::bigint,sqlc.arg(material_observation_ordinal)::bigint)>(COALESCE(material_run_revision,run_revision),COALESCE(material_observation_ordinal,observation_ordinal)) THEN NULL ELSE next_retry_at END
     WHERE run_id=$1 AND steam_app_id=$2 AND NOT EXISTS(SELECT 1 FROM inserted)
         AND ($3::bigint,$4::bigint)>(run_revision,observation_ordinal)
     RETURNING false AS created
@@ -161,7 +165,8 @@ UNION ALL SELECT false WHERE NOT EXISTS(SELECT 1 FROM inserted) AND NOT EXISTS(S
 -- name: UpsertCurrentSearchObservation :execrows
 INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,release_text,precision,
     release_date,release_year,release_month,release_quarter,fingerprint,
-    review_band,review_label,positive_percent,review_total,review_observed_at,last_seen_at,priority)
+    review_band,review_label,positive_percent,review_total,review_observed_at,last_seen_at,priority,
+    material_run_revision,material_observation_ordinal,material_fingerprint)
 VALUES(sqlc.arg(steam_app_id),sqlc.arg(run_revision),sqlc.arg(observation_ordinal),sqlc.arg(release_text),
     sqlc.arg(precision),
     CASE WHEN sqlc.arg(precision)='day' THEN sqlc.narg(release_date)::date END,
@@ -171,7 +176,7 @@ VALUES(sqlc.arg(steam_app_id),sqlc.arg(run_revision),sqlc.arg(observation_ordina
     sqlc.arg(fingerprint),sqlc.arg(review_band),sqlc.arg(review_label),
     sqlc.narg(positive_percent),sqlc.arg(review_total),
     CASE WHEN sqlc.arg(review_band)='unknown' THEN NULL ELSE sqlc.arg(review_observed_at)::timestamptz END,
-    sqlc.arg(review_observed_at),sqlc.arg(priority))
+    sqlc.arg(review_observed_at),sqlc.arg(priority),sqlc.arg(run_revision),sqlc.arg(observation_ordinal),sqlc.arg(fingerprint))
 ON CONFLICT(steam_app_id) DO UPDATE SET run_revision=EXCLUDED.run_revision,observation_ordinal=EXCLUDED.observation_ordinal,
     release_text=EXCLUDED.release_text,precision=EXCLUDED.precision,fingerprint=EXCLUDED.fingerprint,
     release_date=EXCLUDED.release_date,release_year=EXCLUDED.release_year,
@@ -181,9 +186,56 @@ ON CONFLICT(steam_app_id) DO UPDATE SET run_revision=EXCLUDED.run_revision,obser
     positive_percent=CASE WHEN EXCLUDED.review_band='unknown' THEN catalog_search_current.positive_percent ELSE EXCLUDED.positive_percent END,
     review_total=CASE WHEN EXCLUDED.review_band='unknown' THEN catalog_search_current.review_total ELSE EXCLUDED.review_total END,
     review_observed_at=CASE WHEN EXCLUDED.review_band='unknown' THEN catalog_search_current.review_observed_at ELSE EXCLUDED.review_observed_at END,
-    last_seen_at=EXCLUDED.last_seen_at,priority=GREATEST(catalog_search_current.priority,EXCLUDED.priority)
+    last_seen_at=EXCLUDED.last_seen_at,priority=GREATEST(catalog_search_current.priority,EXCLUDED.priority),
+    material_run_revision=CASE WHEN EXCLUDED.fingerprint<>catalog_search_current.fingerprint
+        THEN EXCLUDED.run_revision ELSE COALESCE(catalog_search_current.material_run_revision,catalog_search_current.run_revision) END,
+    material_observation_ordinal=CASE WHEN EXCLUDED.fingerprint<>catalog_search_current.fingerprint
+        THEN EXCLUDED.observation_ordinal ELSE COALESCE(catalog_search_current.material_observation_ordinal,catalog_search_current.observation_ordinal) END,
+    material_fingerprint=CASE WHEN EXCLUDED.fingerprint<>catalog_search_current.fingerprint
+        THEN EXCLUDED.fingerprint ELSE COALESCE(catalog_search_current.material_fingerprint,catalog_search_current.fingerprint) END
 WHERE (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>
     (catalog_search_current.run_revision,catalog_search_current.observation_ordinal);
+
+-- name: GetCurrentMaterialCandidate :one
+SELECT material_run_revision,material_observation_ordinal,material_fingerprint
+FROM catalog_metadata_heads WHERE steam_app_id=$1;
+
+-- name: SyncCurrentMaterialCandidate :execrows
+UPDATE catalog_search_current SET material_run_revision=sqlc.arg(run_revision),
+    material_observation_ordinal=sqlc.arg(observation_ordinal),material_fingerprint=sqlc.arg(fingerprint)
+WHERE steam_app_id=sqlc.arg(steam_app_id);
+
+-- name: UpsertMetadataCandidateHead :one
+INSERT INTO catalog_metadata_heads(steam_app_id,latest_run_revision,latest_observation_ordinal,latest_fingerprint,
+    material_run_revision,material_observation_ordinal,material_fingerprint,updated_at)
+VALUES(sqlc.arg(steam_app_id),sqlc.arg(run_revision),sqlc.arg(observation_ordinal),sqlc.arg(fingerprint),
+    sqlc.arg(run_revision),sqlc.arg(observation_ordinal),sqlc.arg(fingerprint),sqlc.arg(now_at))
+ON CONFLICT(steam_app_id) DO UPDATE SET
+    latest_run_revision=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        THEN EXCLUDED.latest_run_revision ELSE catalog_metadata_heads.latest_run_revision END,
+    latest_observation_ordinal=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        THEN EXCLUDED.latest_observation_ordinal ELSE catalog_metadata_heads.latest_observation_ordinal END,
+    latest_fingerprint=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        THEN EXCLUDED.latest_fingerprint ELSE catalog_metadata_heads.latest_fingerprint END,
+    material_run_revision=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        AND EXCLUDED.latest_fingerprint<>catalog_metadata_heads.latest_fingerprint
+        THEN EXCLUDED.latest_run_revision ELSE catalog_metadata_heads.material_run_revision END,
+    material_observation_ordinal=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        AND EXCLUDED.latest_fingerprint<>catalog_metadata_heads.latest_fingerprint
+        THEN EXCLUDED.latest_observation_ordinal ELSE catalog_metadata_heads.material_observation_ordinal END,
+    material_fingerprint=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        AND EXCLUDED.latest_fingerprint<>catalog_metadata_heads.latest_fingerprint
+        THEN EXCLUDED.latest_fingerprint ELSE catalog_metadata_heads.material_fingerprint END,
+    updated_at=CASE WHEN (EXCLUDED.latest_run_revision,EXCLUDED.latest_observation_ordinal)>
+        (catalog_metadata_heads.latest_run_revision,catalog_metadata_heads.latest_observation_ordinal)
+        THEN EXCLUDED.updated_at ELSE catalog_metadata_heads.updated_at END
+RETURNING *;
 
 -- Atomic UPSERT locks the UTC-hour bucket across app instances, including retries
 -- of an already charged identity. A full bucket returns no row without charging.
@@ -200,23 +252,305 @@ WHERE catalog_budget_reservations.reservations ? sqlc.arg(identity_hash)::text
 RETURNING *;
 
 -- name: AcquireStoreReservation :one
+WITH locked_current AS MATERIALIZED (
+    SELECT h.material_run_revision,h.material_observation_ordinal,c.next_refresh_at
+    FROM catalog_metadata_heads h LEFT JOIN catalog_search_current c USING(steam_app_id)
+    WHERE h.steam_app_id=sqlc.arg(steam_app_id) FOR UPDATE OF h
+)
 INSERT INTO catalog_store_reservations(steam_app_id,id,run_revision,observation_ordinal,fingerprint,fencing_token,lease_until)
 SELECT sqlc.arg(steam_app_id),sqlc.arg(id),sqlc.arg(run_revision),sqlc.arg(observation_ordinal),
     sqlc.arg(fingerprint),sqlc.arg(fencing_token),sqlc.arg(lease_until)
-WHERE NOT EXISTS(SELECT 1 FROM catalog_search_current c WHERE c.steam_app_id=sqlc.arg(steam_app_id)
-    AND (c.run_revision,c.observation_ordinal)>(sqlc.arg(run_revision)::bigint,sqlc.arg(observation_ordinal)::bigint))
+WHERE NOT EXISTS(SELECT 1 FROM locked_current c
+    WHERE (c.material_run_revision,c.material_observation_ordinal)>(sqlc.arg(run_revision)::bigint,sqlc.arg(observation_ordinal)::bigint))
+  AND (NOT EXISTS(SELECT 1 FROM catalog_store_reservations r WHERE r.steam_app_id=sqlc.arg(steam_app_id))
+       OR EXISTS(SELECT 1 FROM catalog_store_reservations r WHERE r.steam_app_id=sqlc.arg(steam_app_id)
+           AND r.fingerprint<>sqlc.arg(fingerprint))
+       OR COALESCE((SELECT next_refresh_at<=sqlc.arg(now_at) FROM locked_current LIMIT 1),true))
 ON CONFLICT(steam_app_id) DO UPDATE SET id=EXCLUDED.id,run_revision=EXCLUDED.run_revision,
     observation_ordinal=EXCLUDED.observation_ordinal,fingerprint=EXCLUDED.fingerprint,
     fencing_token=EXCLUDED.fencing_token,lease_until=EXCLUDED.lease_until,status='reserved',updated_at=sqlc.arg(now_at)
-WHERE (catalog_store_reservations.status<>'reserved' OR catalog_store_reservations.lease_until<=sqlc.arg(now_at))
+WHERE (catalog_store_reservations.status<>'reserved' OR catalog_store_reservations.lease_until<=sqlc.arg(now_at)
+       OR (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>(catalog_store_reservations.run_revision,catalog_store_reservations.observation_ordinal)
+          AND EXCLUDED.fingerprint<>catalog_store_reservations.fingerprint)
     AND (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
         (catalog_store_reservations.run_revision,catalog_store_reservations.observation_ordinal)
 RETURNING *;
+
+-- name: GetStoreReservation :one
+SELECT * FROM catalog_store_reservations WHERE steam_app_id=$1;
+
+-- name: RecordMetadataProvenance :exec
+INSERT INTO catalog_metadata_provenance(steam_app_id,ingress_kind,ingress_identity,run_revision,observation_ordinal,first_seen_at,last_seen_at)
+VALUES($1,$2,$3,$4,$5,$6,$6)
+ON CONFLICT(steam_app_id,ingress_kind,ingress_identity) DO UPDATE SET
+    run_revision=GREATEST(catalog_metadata_provenance.run_revision,EXCLUDED.run_revision),
+    observation_ordinal=CASE WHEN EXCLUDED.run_revision>catalog_metadata_provenance.run_revision
+        THEN EXCLUDED.observation_ordinal
+        WHEN EXCLUDED.run_revision=catalog_metadata_provenance.run_revision
+        THEN GREATEST(catalog_metadata_provenance.observation_ordinal,EXCLUDED.observation_ordinal)
+        ELSE catalog_metadata_provenance.observation_ordinal END,
+    last_seen_at=EXCLUDED.last_seen_at;
+
+-- name: PeekNextMetadataWork :one
+SELECT w.run_id,w.steam_app_id,COALESCE(w.material_run_revision,w.run_revision)::bigint AS run_revision,
+    COALESCE(w.material_observation_ordinal,w.observation_ordinal)::bigint AS observation_ordinal,w.priority,r.kind,
+    c.material_fingerprint::text AS fingerprint
+FROM catalog_search_worklist w
+JOIN catalog_search_runs r ON r.id=w.run_id
+JOIN catalog_metadata_heads c ON c.steam_app_id=w.steam_app_id
+WHERE (w.status='pending' OR (w.status='deferred' AND w.next_retry_at<=sqlc.arg(now_at))
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations sr
+        WHERE sr.steam_app_id=w.steam_app_id AND sr.status='reserved'
+          AND sr.lease_until<=sqlc.arg(now_at))))
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))=(c.material_run_revision,c.material_observation_ordinal)
+ORDER BY CASE WHEN w.status IN ('deferred','reserved') THEN 0 WHEN r.kind='reconciliation' THEN 2 ELSE 1 END,
+    w.priority DESC,w.run_revision DESC,w.observation_ordinal DESC,w.created_at,w.steam_app_id
+LIMIT 1;
+
+-- name: ClaimMetadataWork :one
+SELECT w.run_id,w.steam_app_id,COALESCE(w.material_run_revision,w.run_revision)::bigint AS run_revision,
+    COALESCE(w.material_observation_ordinal,w.observation_ordinal)::bigint AS observation_ordinal,w.priority,r.kind,
+    c.material_fingerprint::text AS fingerprint
+FROM catalog_search_worklist w
+JOIN catalog_search_runs r ON r.id=w.run_id
+JOIN catalog_metadata_heads c ON c.steam_app_id=w.steam_app_id
+WHERE w.run_id=sqlc.arg(run_id) AND w.steam_app_id=sqlc.arg(steam_app_id)
+  AND (w.status='pending' OR (w.status='deferred' AND w.next_retry_at<=sqlc.arg(now_at))
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations sr
+        WHERE sr.steam_app_id=w.steam_app_id AND sr.status='reserved' AND sr.lease_until<=sqlc.arg(now_at))))
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))=(c.material_run_revision,c.material_observation_ordinal)
+FOR UPDATE OF w;
+
+-- name: LockMetadataApp :exec
+SELECT pg_advisory_xact_lock(sqlc.arg(steam_app_id));
+
+-- name: LockCurrentMetadataCandidate :one
+SELECT * FROM catalog_search_current WHERE steam_app_id=$1 FOR UPDATE;
+
+-- name: LockMetadataCandidateHead :one
+SELECT * FROM catalog_metadata_heads WHERE steam_app_id=$1 FOR UPDATE;
+
+-- name: MetadataReservationNeeded :one
+SELECT CASE
+    WHEN COALESCE((SELECT (c.material_run_revision,c.material_observation_ordinal)>
+        (sqlc.arg(run_revision)::bigint,sqlc.arg(observation_ordinal)::bigint)
+        FROM catalog_metadata_heads c WHERE c.steam_app_id=sqlc.arg(steam_app_id)),false) THEN false
+    WHEN NOT EXISTS(SELECT 1 FROM catalog_store_reservations r WHERE r.steam_app_id=sqlc.arg(steam_app_id)) THEN true
+    WHEN COALESCE((SELECT r.fingerprint<>sqlc.arg(candidate_fingerprint)
+        FROM catalog_store_reservations r WHERE r.steam_app_id=sqlc.arg(steam_app_id)),false) THEN true
+    WHEN COALESCE((SELECT r.status='reserved' AND r.lease_until<=sqlc.arg(now_at)
+        FROM catalog_store_reservations r WHERE r.steam_app_id=sqlc.arg(steam_app_id)),false) THEN true
+    WHEN COALESCE((SELECT r.status='released' FROM catalog_store_reservations r
+        WHERE r.steam_app_id=sqlc.arg(steam_app_id)),false) THEN true
+    WHEN COALESCE((SELECT r.run_revision=sqlc.arg(run_revision)::bigint
+            AND r.observation_ordinal=sqlc.arg(observation_ordinal)::bigint
+            AND r.fingerprint=sqlc.arg(candidate_fingerprint)
+        FROM catalog_store_reservations r WHERE r.steam_app_id=sqlc.arg(steam_app_id)),false)
+        AND NOT EXISTS(SELECT 1 FROM catalog_search_current c
+            WHERE c.steam_app_id=sqlc.arg(steam_app_id) AND c.next_refresh_at<=sqlc.arg(now_at)) THEN false
+    WHEN COALESCE((SELECT c.next_refresh_at IS NULL OR c.next_refresh_at<=sqlc.arg(now_at)
+        FROM catalog_search_current c WHERE c.steam_app_id=sqlc.arg(steam_app_id)),true)
+        AND COALESCE((SELECT r.status<>'reserved' FROM catalog_store_reservations r
+            WHERE r.steam_app_id=sqlc.arg(steam_app_id)),false) THEN true
+    ELSE false END AS needed;
+
+-- name: UpsertMetadataIngressWork :one
+INSERT INTO catalog_metadata_ingress_work(steam_app_id,ingress_kind,ingress_identity,run_revision,observation_ordinal,fingerprint,
+    material_run_revision,material_observation_ordinal,material_fingerprint,priority,status,updated_at)
+VALUES(sqlc.arg(steam_app_id),sqlc.arg(ingress_kind),sqlc.arg(ingress_identity),sqlc.arg(run_revision),sqlc.arg(observation_ordinal),sqlc.arg(fingerprint),
+    sqlc.arg(material_run_revision),sqlc.arg(material_observation_ordinal),sqlc.arg(material_fingerprint),sqlc.arg(priority),'pending',sqlc.arg(updated_at))
+ON CONFLICT(steam_app_id,ingress_kind,ingress_identity) DO UPDATE SET
+    run_revision=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.run_revision ELSE catalog_metadata_ingress_work.run_revision END,
+    observation_ordinal=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.observation_ordinal ELSE catalog_metadata_ingress_work.observation_ordinal END,
+    fingerprint=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.fingerprint ELSE catalog_metadata_ingress_work.fingerprint END,
+    material_run_revision=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.material_run_revision ELSE catalog_metadata_ingress_work.material_run_revision END,
+    material_observation_ordinal=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.material_observation_ordinal ELSE catalog_metadata_ingress_work.material_observation_ordinal END,
+    material_fingerprint=CASE WHEN (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>=
+        (catalog_metadata_ingress_work.run_revision,catalog_metadata_ingress_work.observation_ordinal)
+        THEN EXCLUDED.material_fingerprint ELSE catalog_metadata_ingress_work.material_fingerprint END,
+    priority=GREATEST(catalog_metadata_ingress_work.priority,EXCLUDED.priority),
+    status=CASE WHEN (EXCLUDED.material_run_revision,EXCLUDED.material_observation_ordinal)>
+        (catalog_metadata_ingress_work.material_run_revision,catalog_metadata_ingress_work.material_observation_ordinal) THEN 'pending'
+        ELSE catalog_metadata_ingress_work.status END,
+    next_eligible_at=CASE WHEN (EXCLUDED.material_run_revision,EXCLUDED.material_observation_ordinal)>
+        (catalog_metadata_ingress_work.material_run_revision,catalog_metadata_ingress_work.material_observation_ordinal) THEN NULL
+        ELSE catalog_metadata_ingress_work.next_eligible_at END,
+    updated_at=EXCLUDED.updated_at
+RETURNING *;
+
+-- name: ClaimMetadataIngressWork :one
+SELECT w.* FROM catalog_metadata_ingress_work w
+JOIN catalog_metadata_heads h USING(steam_app_id)
+WHERE w.id=sqlc.arg(id) AND (w.status='pending'
+    OR (w.status='deferred' AND w.next_eligible_at<=sqlc.arg(now_at))
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations r
+        WHERE r.steam_app_id=w.steam_app_id AND r.status='reserved'
+          AND r.lease_until<=sqlc.arg(now_at))))
+  AND (w.material_run_revision,w.material_observation_ordinal,w.material_fingerprint)=
+      (h.material_run_revision,h.material_observation_ordinal,h.material_fingerprint)
+FOR UPDATE;
+
+-- name: PeekNextMetadataIngressWork :one
+SELECT w.* FROM catalog_metadata_ingress_work w
+JOIN catalog_metadata_heads h USING(steam_app_id)
+WHERE ((w.status='pending' OR (w.status='deferred' AND w.next_eligible_at<=sqlc.arg(now_at))
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations r
+        WHERE r.steam_app_id=w.steam_app_id AND r.status='reserved'
+          AND r.lease_until<=sqlc.arg(now_at))))
+  AND (w.material_run_revision,w.material_observation_ordinal,w.material_fingerprint)=
+      (h.material_run_revision,h.material_observation_ordinal,h.material_fingerprint))
+ORDER BY CASE WHEN w.status IN ('deferred','reserved') THEN 0 ELSE 1 END,w.priority DESC,w.created_at
+LIMIT 1;
+
+-- name: SetMetadataIngressWorkState :execrows
+UPDATE catalog_metadata_ingress_work SET status=sqlc.arg(status),next_eligible_at=sqlc.narg(next_eligible_at),updated_at=sqlc.arg(now_at)
+WHERE id=sqlc.arg(id);
+
+-- name: SupersedeStaleMetadataWork :execrows
+UPDATE catalog_search_worklist w SET status='superseded',next_retry_at=NULL
+FROM catalog_search_current c
+WHERE c.steam_app_id=w.steam_app_id AND w.status IN ('pending','deferred')
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))<(COALESCE(c.material_run_revision,c.run_revision),COALESCE(c.material_observation_ordinal,c.observation_ordinal));
+
+-- name: SupersedeStaleReservedMetadataWork :execrows
+UPDATE catalog_search_worklist w SET status='superseded',next_retry_at=NULL
+FROM catalog_search_current c
+WHERE c.steam_app_id=w.steam_app_id AND w.status='reserved'
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))<(COALESCE(c.material_run_revision,c.run_revision),COALESCE(c.material_observation_ordinal,c.observation_ordinal));
+
+-- name: SupersedeStaleMetadataWorkForApp :execrows
+UPDATE catalog_search_worklist SET status='superseded',next_retry_at=NULL
+WHERE steam_app_id=sqlc.arg(steam_app_id) AND status IN ('pending','reserved','deferred')
+  AND (COALESCE(material_run_revision,run_revision),COALESCE(material_observation_ordinal,observation_ordinal))<(sqlc.arg(run_revision)::bigint,sqlc.arg(observation_ordinal)::bigint);
+
+-- name: SupersedeStaleMetadataIngressWork :execrows
+UPDATE catalog_metadata_ingress_work SET status='superseded',next_eligible_at=NULL,updated_at=sqlc.arg(now_at)
+WHERE steam_app_id=sqlc.arg(steam_app_id) AND status IN ('pending','reserved','deferred')
+  AND ((material_run_revision,material_observation_ordinal)<(sqlc.arg(run_revision)::bigint,sqlc.arg(observation_ordinal)::bigint)
+    OR ((material_run_revision,material_observation_ordinal)=(sqlc.arg(run_revision)::bigint,sqlc.arg(observation_ordinal)::bigint)
+      AND material_fingerprint<>sqlc.arg(fingerprint)));
+
+-- name: MarkMetadataWorkReserved :execrows
+UPDATE catalog_search_worklist SET status='reserved',next_retry_at=NULL
+WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred');
+
+-- name: MarkMetadataWorkSuperseded :execrows
+UPDATE catalog_search_worklist SET status='superseded',next_retry_at=NULL
+WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred');
+
+-- name: DeferMetadataWork :execrows
+UPDATE catalog_search_worklist SET status='deferred',next_retry_at=sqlc.arg(next_retry_at)
+WHERE run_id=sqlc.arg(run_id) AND steam_app_id=sqlc.arg(steam_app_id)
+    AND status IN ('pending','reserved','deferred');
+
+-- name: RequeueMetadataWork :execrows
+UPDATE catalog_search_worklist SET status='pending',next_retry_at=NULL
+WHERE steam_app_id=sqlc.arg(steam_app_id)
+  AND COALESCE(material_run_revision,run_revision)=sqlc.arg(run_revision)::bigint
+  AND COALESCE(material_observation_ordinal,observation_ordinal)=sqlc.arg(observation_ordinal)::bigint AND status='reserved';
+
+-- name: RequeueMetadataIngressWork :execrows
+UPDATE catalog_metadata_ingress_work SET status='pending',next_eligible_at=NULL,updated_at=now()
+WHERE steam_app_id=sqlc.arg(steam_app_id)
+  AND material_run_revision=sqlc.arg(run_revision) AND material_observation_ordinal=sqlc.arg(observation_ordinal)
+  AND material_fingerprint=sqlc.arg(fingerprint) AND status='reserved';
 
 -- name: ReleaseStoreReservation :execrows
 UPDATE catalog_store_reservations SET status='released',updated_at=sqlc.arg(now_at)
 WHERE steam_app_id=sqlc.arg(steam_app_id) AND id=sqlc.arg(id) AND fencing_token=sqlc.arg(fencing_token)
     AND status='reserved' AND lease_until>sqlc.arg(now_at);
+
+-- name: AttachStoreReservationBudget :execrows
+UPDATE catalog_store_reservations SET budget_hour=sqlc.arg(budget_hour),budget_identity_hash=sqlc.arg(identity_hash),updated_at=sqlc.arg(now_at)
+WHERE steam_app_id=sqlc.arg(steam_app_id) AND id=sqlc.arg(id) AND fencing_token=sqlc.arg(fencing_token)
+  AND status='reserved';
+
+-- name: EnsureCatalogHostThrottle :one
+INSERT INTO catalog_host_throttles(host,concurrency_limit)
+VALUES(sqlc.arg(host),sqlc.arg(default_limit))
+ON CONFLICT(host) DO UPDATE SET concurrency_limit=LEAST(catalog_host_throttles.concurrency_limit,EXCLUDED.concurrency_limit)
+RETURNING *;
+
+-- name: AcquireCatalogHostSlot :one
+WITH candidate AS (
+    SELECT s.host,s.slot FROM catalog_host_throttle_slots s
+    JOIN catalog_host_throttles h ON h.host=s.host
+    WHERE s.host=sqlc.arg(host) AND s.slot<=h.concurrency_limit
+      AND (s.fencing_token IS NULL OR s.lease_until<=sqlc.arg(now_at))
+      AND (SELECT count(*) FROM catalog_host_throttle_slots active
+           WHERE active.host=s.host AND active.fencing_token IS NOT NULL
+             AND active.lease_until>sqlc.arg(now_at))<h.concurrency_limit
+    ORDER BY s.slot FOR UPDATE OF s SKIP LOCKED LIMIT 1
+)
+UPDATE catalog_host_throttle_slots s SET fencing_token=sqlc.arg(fencing_token),
+    lease_until=sqlc.arg(lease_until),updated_at=sqlc.arg(now_at)
+FROM candidate c WHERE s.host=c.host AND s.slot=c.slot
+RETURNING s.*;
+
+-- name: ReleaseCatalogHostSlot :execrows
+UPDATE catalog_host_throttle_slots SET fencing_token=NULL,lease_until=NULL,updated_at=sqlc.arg(now_at)
+WHERE host=sqlc.arg(host) AND fencing_token=sqlc.arg(fencing_token);
+
+-- name: PruneCatalogBudgets :execrows
+DELETE FROM catalog_budget_reservations b WHERE b.hour_at<sqlc.arg(before_at)
+  AND NOT EXISTS(SELECT 1 FROM catalog_store_reservations r
+      WHERE r.budget_hour=b.hour_at AND (r.status='reserved'
+        OR EXISTS(SELECT 1 FROM catalog_search_worklist w WHERE w.steam_app_id=r.steam_app_id
+            AND w.status IN ('pending','reserved','deferred'))
+        OR EXISTS(SELECT 1 FROM catalog_metadata_ingress_work w WHERE w.steam_app_id=r.steam_app_id
+            AND w.status IN ('pending','reserved','deferred'))));
+
+-- name: PruneCatalogReservations :execrows
+DELETE FROM catalog_store_reservations r
+WHERE r.updated_at<sqlc.arg(before_at) AND r.status<>'reserved'
+  AND NOT EXISTS(SELECT 1 FROM catalog_search_current c WHERE c.steam_app_id=r.steam_app_id)
+  AND NOT EXISTS(SELECT 1 FROM catalog_search_worklist w WHERE w.steam_app_id=r.steam_app_id
+      AND w.status IN ('pending','reserved','deferred'))
+  AND NOT EXISTS(SELECT 1 FROM catalog_metadata_ingress_work w WHERE w.steam_app_id=r.steam_app_id
+      AND w.status IN ('pending','reserved','deferred'));
+
+-- name: PruneCatalogHostSlots :execrows
+UPDATE catalog_host_throttle_slots SET fencing_token=NULL,lease_until=NULL,updated_at=sqlc.arg(now_at)
+WHERE fencing_token IS NOT NULL AND lease_until<=sqlc.arg(now_at);
+
+-- name: GetCatalogHostThrottle :one
+SELECT * FROM catalog_host_throttles WHERE host=$1;
+
+-- name: LockCatalogHostThrottle :one
+SELECT * FROM catalog_host_throttles WHERE host=$1 FOR UPDATE;
+
+-- name: RecordCatalogThrottleFailure :one
+INSERT INTO catalog_host_throttles(host,concurrency_limit,consecutive_failures,success_count,next_eligible_at,updated_at)
+VALUES(sqlc.arg(host),GREATEST(1,sqlc.arg(default_limit)::integer-sqlc.arg(limit_decrement)::integer),1,0,sqlc.arg(next_eligible_at),sqlc.arg(now_at))
+ON CONFLICT(host) DO UPDATE SET
+    concurrency_limit=GREATEST(1,catalog_host_throttles.concurrency_limit-sqlc.arg(limit_decrement)::integer),
+    consecutive_failures=catalog_host_throttles.consecutive_failures+1,success_count=0,
+    next_eligible_at=GREATEST(catalog_host_throttles.next_eligible_at,EXCLUDED.next_eligible_at),updated_at=EXCLUDED.updated_at
+RETURNING *;
+
+-- name: RecordCatalogThrottleSuccess :one
+UPDATE catalog_host_throttles SET
+    concurrency_limit=CASE WHEN (next_eligible_at IS NULL OR next_eligible_at<=sqlc.arg(now_at))
+        AND success_count+1>=sqlc.arg(successes_to_recover)::integer
+        THEN LEAST(sqlc.arg(max_limit)::integer,concurrency_limit+1) ELSE concurrency_limit END,
+    success_count=CASE
+        WHEN next_eligible_at>sqlc.arg(now_at) THEN success_count
+        WHEN success_count+1>=sqlc.arg(successes_to_recover)::integer THEN 0 ELSE success_count+1 END,
+    consecutive_failures=CASE WHEN next_eligible_at>sqlc.arg(now_at) THEN consecutive_failures ELSE 0 END,
+    next_eligible_at=CASE WHEN next_eligible_at<=sqlc.arg(now_at) THEN NULL ELSE next_eligible_at END,
+    updated_at=sqlc.arg(now_at)
+WHERE host=sqlc.arg(host)
+RETURNING *;
 
 -- name: ListDueEligibilityChanges :many
 SELECT * FROM catalog_search_current

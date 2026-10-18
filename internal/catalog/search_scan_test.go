@@ -147,6 +147,39 @@ func TestSearchPageReplayAfterCrash(t *testing.T) {
 	}
 }
 
+func TestSearchThrottleDefersDurablyWithoutFailureAttempt(t *testing.T) {
+	cfg := DefaultDiscoveryConfig()
+	at := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
+	service, repo := newSearchScanForTest(t, &searchStub{err: &steam.ThrottleDeferred{At: at}}, cfg)
+	run := searchTestRun(t, repo, cfg, time.Now().UTC())
+	if _, err := repo.store.Pool.Exec(context.Background(), `DELETE FROM sync_jobs`); err != nil {
+		t.Fatal(err)
+	}
+	payload := SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}
+	queue := jobs.NewQueue(repo.store)
+	id, err := queue.Enqueue(context.Background(), searchPageSpec(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := queue.Claim(context.Background(), jobs.LaneCatalog, "catalog-worker", time.Minute)
+	if err != nil || lease == nil {
+		t.Fatalf("claim=%v err=%v", lease, err)
+	}
+	if err := service.handlePage(context.Background(), *lease); !errors.Is(err, jobs.ErrDeferred) {
+		t.Fatalf("handle=%v", err)
+	}
+	var status string
+	var attempts int
+	var available time.Time
+	var failed int
+	if err := repo.store.Pool.QueryRow(context.Background(), `SELECT status,attempts,available_at,(SELECT count(*) FROM job_attempts WHERE job_id=$1 AND status IN ('retryable','dead')) FROM sync_jobs WHERE id=$1`, id).Scan(&status, &attempts, &available, &failed); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || attempts != 0 || !available.Equal(at) || failed != 0 {
+		t.Fatalf("state=%s attempts=%d at=%v failed=%d", status, attempts, available, failed)
+	}
+}
+
 func TestOlderSearchRunCannotOverwritePublishedState(t *testing.T) {
 	cfg := DefaultDiscoveryConfig()
 	service, repo := newSearchScanForTest(t, &searchStub{}, cfg)
