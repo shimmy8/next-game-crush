@@ -671,6 +671,114 @@ func TestLatestAndGetExposeSteamPresentation(t *testing.T) {
 	assertCompatibilityPresentation(t, safeUnknown, false)
 }
 
+func TestLatestAndGetProjectCurrentSteamReviewSummary(t *testing.T) {
+	db := openRankingStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 34, 56, 0, time.UTC)
+	userID, profileID := uuid.New(), uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata) VALUES($1,$2,1,'{}')`, profileID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key,published) VALUES($1,$2,$3,1,$4,'reviews-test',true)`, uuid.New(), userID, profileID, AlgorithmVersion); err != nil {
+		t.Fatal(err)
+	}
+
+	type reviewFixture struct {
+		name       string
+		appID      int64
+		currentSQL string
+		want       *ReviewSummary
+	}
+	percent91 := 91
+	fixtures := []reviewFixture{
+		{name: "rated", appID: 97001, currentSQL: `false,'positive','Very Positive',91,1284,$2,''`, want: &ReviewSummary{Band: "positive", Label: "Very Positive", PositivePercent: &percent91, Total: 1284, ObservedAt: now}},
+		{name: "unrated", appID: 97002, currentSQL: `false,'unrated','No user reviews',NULL,0,$2,''`, want: &ReviewSummary{Band: "unrated", Label: "No user reviews", PositivePercent: nil, Total: 0, ObservedAt: now}},
+		{name: "missing", appID: 97003},
+		{name: "stale last known good", appID: 97004, currentSQL: `false,'positive','Positive',91,1284,$2,'malformed'`, want: &ReviewSummary{Band: "positive", Label: "Positive", PositivePercent: &percent91, Total: 1284, ObservedAt: now}},
+		{name: "malformed review", appID: 97005, currentSQL: `false,'unknown','<b>invalid</b>',91,1284,$2,'malformed'`},
+		{name: "upcoming", appID: 97006, currentSQL: `true,'positive','Very Positive',91,1284,$2,''`},
+		{name: "unsafe total", appID: 97007, currentSQL: `false,'positive','Positive',91,9007199254740992,$2,'malformed'`},
+	}
+	factors, _ := json.Marshal(Factors{Confidence: 1})
+	weights, _ := json.Marshal(DefaultWeights())
+	ids := make(map[string]uuid.UUID, len(fixtures))
+	for index, fixture := range fixtures {
+		gameID, recommendationID := uuid.New(), uuid.New()
+		ids[fixture.name] = recommendationID
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,$2,$3,'test',$4)`, gameID, fixture.appID, fixture.name, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,ranking_version,score) VALUES($1,$2,$3,$4,$5,1,$6)`, recommendationID, userID, gameID, profileID, AlgorithmVersion, 100-index); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO recommendation_factors(recommendation_id,factors,weights) VALUES($1,$2,$3)`, recommendationID, factors, weights); err != nil {
+			t.Fatal(err)
+		}
+		if fixture.currentSQL != "" {
+			query := `INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,coming_soon,review_band,review_label,positive_percent,review_total,review_observed_at,safe_error) VALUES($1,1,1,` + fixture.currentSQL + `)`
+			if _, err := db.Pool.Exec(ctx, query, fixture.appID, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	repo, err := NewSQLRepository(db, "embed", "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, err := repo.Latest(ctx, userID)
+	if err != nil || len(latest) != len(fixtures) {
+		t.Fatalf("Latest = %#v, %v", latest, err)
+	}
+	byName := make(map[string]Recommendation, len(latest))
+	for _, item := range latest {
+		byName[item.Name] = item
+	}
+	for _, fixture := range fixtures {
+		if !reflect.DeepEqual(byName[fixture.name].Reviews, fixture.want) {
+			t.Errorf("%s reviews = %#v, want %#v", fixture.name, byName[fixture.name].Reviews, fixture.want)
+		}
+		got, err := repo.Get(ctx, userID, ids[fixture.name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got.Reviews, fixture.want) {
+			t.Errorf("Get(%s) reviews = %#v, want %#v", fixture.name, got.Reviews, fixture.want)
+		}
+	}
+
+	encoded, err := json.Marshal(byName["rated"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &object); err != nil {
+		t.Fatal(err)
+	}
+	var reviews map[string]json.RawMessage
+	if err := json.Unmarshal(object["reviews"], &reviews); err != nil {
+		t.Fatal(err)
+	}
+	if len(reviews) != 5 || string(reviews["band"]) != `"positive"` || string(reviews["label"]) != `"Very Positive"` || string(reviews["positivePercent"]) != "91" || string(reviews["total"]) != "1284" || string(reviews["observedAt"]) != `"2026-10-18T12:34:56Z"` {
+		t.Fatalf("review JSON = %s", object["reviews"])
+	}
+	for _, forbidden := range []string{"rawHtml", "html", "tooltip"} {
+		if strings.Contains(strings.ToLower(string(object["reviews"])), strings.ToLower(forbidden)) {
+			t.Fatalf("review JSON leaked %s: %s", forbidden, object["reviews"])
+		}
+	}
+	missingJSON, err := json.Marshal(byName["missing"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(missingJSON), `"reviews"`) {
+		t.Fatalf("missing review serialized: %s", missingJSON)
+	}
+}
+
 func TestLatestAndGetExposeLatestDirectFeedbackAcrossRankingVersions(t *testing.T) {
 	db := openRankingStore(t)
 	ctx := context.Background()

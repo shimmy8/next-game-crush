@@ -184,6 +184,22 @@ const (
 	DeckUnknown     DeckCompatibility = "unknown"
 )
 
+type ReviewBand string
+
+const (
+	ReviewPositive     ReviewBand = "positive"
+	ReviewMixedOrBelow ReviewBand = "mixed_or_below"
+	ReviewUnrated      ReviewBand = "unrated"
+)
+
+type ReviewSummary struct {
+	Band            ReviewBand `json:"band"`
+	Label           string     `json:"label"`
+	PositivePercent *int       `json:"positivePercent"`
+	Total           int64      `json:"total"`
+	ObservedAt      time.Time  `json:"observedAt"`
+}
+
 type Recommendation struct {
 	ID                    uuid.UUID         `json:"id"`
 	GameID                uuid.UUID         `json:"gameId"`
@@ -201,6 +217,7 @@ type Recommendation struct {
 	Factors               Factors           `json:"factors"`
 	Weights               Weights           `json:"weights"`
 	Wishlisted            bool              `json:"wishlisted"`
+	Reviews               *ReviewSummary    `json:"reviews,omitempty"`
 	Release               ReleaseWindow     `json:"release"`
 	Explanation           string            `json:"explanation"`
 	Evidence              []Evidence        `json:"evidence"`

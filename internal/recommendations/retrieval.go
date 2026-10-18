@@ -797,11 +797,13 @@ func (r *SQLRepository) PublishedDeckRefreshTargets(ctx context.Context, userID 
 
 func (r *SQLRepository) Latest(ctx context.Context, userID uuid.UUID) ([]Recommendation, error) {
 	rows, err := r.store.Pool.Query(ctx, `SELECT r.id,r.game_id,g.steam_app_id,g.source_snapshot,g.name,p.version,r.ranking_version,r.algorithm_version,r.score,r.explanation,r.explanation_evidence,r.explanation_generated,r.explanation_source,r.explanation_failure_reason,r.created_at,rf.factors,rf.weights,
-		COALESCE(rd.precision,'unknown'),rd.release_date,rd.raw_text,gc.windows,gc.mac,gc.linux,COALESCE(gc.deck_status,'unknown'),latest_feedback.action,latest_feedback.reasons
+		COALESCE(rd.precision,'unknown'),rd.release_date,rd.raw_text,gc.windows,gc.mac,gc.linux,COALESCE(gc.deck_status,'unknown'),latest_feedback.action,latest_feedback.reasons,
+		review.review_band,review.review_label,review.positive_percent,review.review_total,review.review_observed_at
 	FROM recommendations r JOIN games g ON g.id=r.game_id JOIN preference_profiles p ON p.id=r.profile_id JOIN recommendation_factors rf ON rf.recommendation_id=r.id
 	LEFT JOIN game_compatibility gc ON gc.game_id=g.id
 	LEFT JOIN LATERAL(SELECT precision,release_date,raw_text FROM game_release_dates WHERE game_id=g.id ORDER BY observed_at DESC,id DESC LIMIT 1)rd ON true
 		LEFT JOIN LATERAL(SELECT f.action,f.reasons FROM feedback_events f JOIN recommendations source_rec ON source_rec.id=f.recommendation_id WHERE f.user_id=r.user_id AND source_rec.game_id=r.game_id AND f.action IN ('like','dislike','exclude') ORDER BY f.created_at DESC,f.id DESC LIMIT 1)latest_feedback ON true
+	LEFT JOIN catalog_search_current review ON review.steam_app_id=g.steam_app_id AND review.coming_soon=false
 	WHERE r.user_id=$1 AND r.ranking_version=(SELECT max(ranking_version) FROM recommendation_runs WHERE user_id=$1 AND published)
 	AND (latest_feedback.action IS NULL OR latest_feedback.action='like')
 	ORDER BY r.score DESC,lower(g.name) COLLATE "C",g.name COLLATE "C",g.id`, userID)
@@ -821,10 +823,12 @@ func (r *SQLRepository) Latest(ctx context.Context, userID uuid.UUID) ([]Recomme
 }
 func (r *SQLRepository) Get(ctx context.Context, userID, id uuid.UUID) (Recommendation, error) {
 	row := r.store.Pool.QueryRow(ctx, `SELECT r.id,r.game_id,g.steam_app_id,g.source_snapshot,g.name,p.version,r.ranking_version,r.algorithm_version,r.score,r.explanation,r.explanation_evidence,r.explanation_generated,r.explanation_source,r.explanation_failure_reason,r.created_at,rf.factors,rf.weights,
-		COALESCE(rd.precision,'unknown'),rd.release_date,rd.raw_text,gc.windows,gc.mac,gc.linux,COALESCE(gc.deck_status,'unknown'),latest_feedback.action,latest_feedback.reasons FROM recommendations r JOIN games g ON g.id=r.game_id JOIN preference_profiles p ON p.id=r.profile_id JOIN recommendation_factors rf ON rf.recommendation_id=r.id
+		COALESCE(rd.precision,'unknown'),rd.release_date,rd.raw_text,gc.windows,gc.mac,gc.linux,COALESCE(gc.deck_status,'unknown'),latest_feedback.action,latest_feedback.reasons,
+		review.review_band,review.review_label,review.positive_percent,review.review_total,review.review_observed_at FROM recommendations r JOIN games g ON g.id=r.game_id JOIN preference_profiles p ON p.id=r.profile_id JOIN recommendation_factors rf ON rf.recommendation_id=r.id
 	LEFT JOIN game_compatibility gc ON gc.game_id=g.id
 		LEFT JOIN LATERAL(SELECT precision,release_date,raw_text FROM game_release_dates WHERE game_id=g.id ORDER BY observed_at DESC,id DESC LIMIT 1)rd ON true
 		LEFT JOIN LATERAL(SELECT f.action,f.reasons FROM feedback_events f JOIN recommendations source_rec ON source_rec.id=f.recommendation_id WHERE f.user_id=r.user_id AND source_rec.game_id=r.game_id AND f.action IN ('like','dislike') ORDER BY f.created_at DESC,f.id DESC LIMIT 1)latest_feedback ON true
+		LEFT JOIN catalog_search_current review ON review.steam_app_id=g.steam_app_id AND review.coming_soon=false
 		WHERE r.id=$1 AND r.user_id=$2 AND EXISTS(SELECT 1 FROM recommendation_runs run WHERE run.user_id=r.user_id AND run.ranking_version=r.ranking_version AND run.published)`, id, userID)
 	return scanRecommendation(row)
 }
@@ -844,7 +848,11 @@ func scanRecommendation(row scanner) (Recommendation, error) {
 	var raw pgtype.Text
 	var windows, mac, linux pgtype.Bool
 	var latestFeedback pgtype.Text
-	if err := row.Scan(&r.ID, &r.GameID, &r.SteamAppID, &snapshot, &r.Name, &r.ProfileVersion, &r.RankingVersion, &r.AlgorithmVersion, &r.Score, &explanation, &evidence, &generated, &source, &failure, &r.CreatedAt, &factors, &weights, &r.Release.Precision, &releaseDate, &raw, &windows, &mac, &linux, &r.DeckCompatibility, &latestFeedback, &r.LatestFeedbackReasons); err != nil {
+	var reviewBand, reviewLabel pgtype.Text
+	var reviewPercent pgtype.Int4
+	var reviewTotal pgtype.Int8
+	var reviewObservedAt pgtype.Timestamptz
+	if err := row.Scan(&r.ID, &r.GameID, &r.SteamAppID, &snapshot, &r.Name, &r.ProfileVersion, &r.RankingVersion, &r.AlgorithmVersion, &r.Score, &explanation, &evidence, &generated, &source, &failure, &r.CreatedAt, &factors, &weights, &r.Release.Precision, &releaseDate, &raw, &windows, &mac, &linux, &r.DeckCompatibility, &latestFeedback, &r.LatestFeedbackReasons, &reviewBand, &reviewLabel, &reviewPercent, &reviewTotal, &reviewObservedAt); err != nil {
 		return Recommendation{}, err
 	}
 	if windows.Valid && mac.Valid && linux.Valid {
@@ -866,7 +874,40 @@ func scanRecommendation(row scanner) (Recommendation, error) {
 		action := latestFeedback.String
 		r.LatestFeedbackAction = &action
 	}
+	r.Reviews = validReviewSummary(reviewBand, reviewLabel, reviewPercent, reviewTotal, reviewObservedAt)
 	return r, nil
+}
+
+func validReviewSummary(band, label pgtype.Text, percent pgtype.Int4, total pgtype.Int8, observedAt pgtype.Timestamptz) *ReviewSummary {
+	const maxJavaScriptSafeInteger = int64(9_007_199_254_740_991)
+	if !band.Valid || !label.Valid || !total.Valid || total.Int64 < 0 || total.Int64 > maxJavaScriptSafeInteger || !observedAt.Valid || observedAt.Time.IsZero() {
+		return nil
+	}
+	cleanLabel := strings.TrimSpace(label.String)
+	if cleanLabel == "" || len([]rune(cleanLabel)) > 64 || strings.ContainsAny(cleanLabel, "<>") {
+		return nil
+	}
+	for _, character := range cleanLabel {
+		if character < 32 || character == 127 {
+			return nil
+		}
+	}
+	review := &ReviewSummary{Band: ReviewBand(band.String), Label: cleanLabel, Total: total.Int64, ObservedAt: observedAt.Time.UTC()}
+	switch review.Band {
+	case ReviewUnrated:
+		if percent.Valid || review.Total != 0 {
+			return nil
+		}
+	case ReviewPositive, ReviewMixedOrBelow:
+		if !percent.Valid || percent.Int32 < 0 || percent.Int32 > 100 || review.Total <= 0 {
+			return nil
+		}
+		value := int(percent.Int32)
+		review.PositivePercent = &value
+	default:
+		return nil
+	}
+	return review
 }
 
 func nullableExplanationFailure(reason ExplanationFailureReason) any {

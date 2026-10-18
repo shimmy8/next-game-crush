@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -21,7 +23,8 @@ func TestRankingReadEndpointsRequireAuthenticationAndUseSessionOwner(t *testing.
 	recommendationID := uuid.New()
 	profiles := &fakeProfileReader{value: profile.Profile{ID: uuid.New(), Version: 3}}
 	completionText := "Есть сходство с пройденной вами игрой SOMA."
-	recommendationsReader := &fakeRecommendationReader{items: []recommendations.Recommendation{{ID: recommendationID, Name: "Upcoming", Platforms: &recommendations.Platforms{Windows: true, Linux: true}, DeckCompatibility: recommendations.DeckVerified, Factors: recommendations.Factors{CompletionAffinity: .5}, Weights: recommendations.DefaultWeights(), Release: recommendations.ReleaseWindow{Precision: "month", Raw: "March 2027"}, Explanation: completionText, ExplanationSource: recommendations.ExplanationSourceDeterministic, Evidence: []recommendations.Evidence{{ID: "completion-anchor-1", Kind: recommendations.EvidenceCompletionAnchor, Text: completionText}}}}}
+	positivePercent := 91
+	recommendationsReader := &fakeRecommendationReader{items: []recommendations.Recommendation{{ID: recommendationID, Name: "Upcoming", Platforms: &recommendations.Platforms{Windows: true, Linux: true}, DeckCompatibility: recommendations.DeckVerified, Factors: recommendations.Factors{CompletionAffinity: .5}, Weights: recommendations.DefaultWeights(), Reviews: &recommendations.ReviewSummary{Band: recommendations.ReviewPositive, Label: "Very Positive", PositivePercent: &positivePercent, Total: 1284, ObservedAt: time.Date(2026, 10, 18, 12, 34, 56, 0, time.UTC)}, Release: recommendations.ReleaseWindow{Precision: "month", Raw: "March 2027"}, Explanation: completionText, ExplanationSource: recommendations.ExplanationSourceDeterministic, Evidence: []recommendations.Evidence{{ID: "completion-anchor-1", Kind: recommendations.EvidenceCompletionAnchor, Text: completionText}}}}}
 	router := NewRouter(Dependencies{Auth: authService, Profile: profiles, Recommendations: recommendationsReader})
 
 	for _, path := range []string{"/api/profile", "/api/calendar", "/api/recommendations/" + recommendationID.String()} {
@@ -71,6 +74,18 @@ func TestRankingReadEndpointsRequireAuthenticationAndUseSessionOwner(t *testing.
 			}
 			if err := json.Unmarshal(body["weights"], &weights); err != nil || weights["completionAffinity"] != 5 {
 				t.Fatalf("%s completion weight=%#v err=%v", path, weights, err)
+			}
+			var reviews map[string]json.RawMessage
+			if err := json.Unmarshal(body["reviews"], &reviews); err != nil {
+				t.Fatalf("%s reviews=%s err=%v", path, body["reviews"], err)
+			}
+			if len(reviews) != 5 || string(reviews["band"]) != `"positive"` || string(reviews["label"]) != `"Very Positive"` || string(reviews["positivePercent"]) != "91" || string(reviews["total"]) != "1284" || string(reviews["observedAt"]) != `"2026-10-18T12:34:56Z"` {
+				t.Fatalf("%s review contract=%s", path, body["reviews"])
+			}
+			for _, forbidden := range []string{"rawHtml", "html", "tooltip"} {
+				if strings.Contains(strings.ToLower(string(body["reviews"])), strings.ToLower(forbidden)) {
+					t.Fatalf("%s review leaked %s: %s", path, forbidden, body["reviews"])
+				}
 			}
 		}
 	}

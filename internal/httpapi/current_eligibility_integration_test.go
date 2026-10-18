@@ -53,7 +53,13 @@ func TestCurrentEligibilityProtectsEveryDeliveryPathEndToEnd(t *testing.T) {
 		{uuid.New(), uuid.New(), 95003, "C Outside", now.AddDate(0, 0, 32), true, "unknown", 98, false},
 	}
 	for i := 0; i < 11; i++ {
-		fixtures = append(fixtures, fixture{uuid.New(), uuid.New(), int64(95010 + i), fmt.Sprintf("Eligible %02d", i), now.AddDate(0, 0, i+1), true, "unknown", float64(90 - i), false})
+		item := fixture{uuid.New(), uuid.New(), int64(95010 + i), fmt.Sprintf("Eligible %02d", i), now.AddDate(0, 0, i+1), true, "unknown", float64(90 - i), false}
+		if i == 0 {
+			item.date = now
+			item.comingSoon = false
+			item.review = "positive"
+		}
+		fixtures = append(fixtures, item)
 	}
 	for _, item := range fixtures {
 		snapshot := fmt.Sprintf(`{"AppID":%d,"Type":"game","Name":"%s","ReleaseDate":{"ComingSoon":%t,"Raw":"%s"}}`, item.appID, item.name, item.comingSoon, item.date.Format(time.DateOnly))
@@ -76,6 +82,11 @@ func TestCurrentEligibilityProtectsEveryDeliveryPathEndToEnd(t *testing.T) {
 		}
 		if item.review == "unrated" {
 			label = "No user reviews"
+		}
+		if item.review == "positive" {
+			percent = 91
+			total = 1284
+			label = "Very Positive"
 		}
 		if _, err := db.Pool.Exec(ctx, `INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,coming_soon,precision,release_date,review_band,review_label,positive_percent,review_total,review_observed_at,last_successful_appdetails_at,active) VALUES($1,1,1,$2,'day',$3,$4,$5,$6,$7,$8,$8,true)`, item.appID, item.comingSoon, item.date, item.review, label, percent, total, now); err != nil {
 			t.Fatal(err)
@@ -141,6 +152,25 @@ func TestCurrentEligibilityProtectsEveryDeliveryPathEndToEnd(t *testing.T) {
 				}
 			}
 		}
+		byName := make(map[string]recommendations.Recommendation, len(latest))
+		for _, item := range latest {
+			byName[item.Name] = item
+		}
+		if daySeven {
+			unrated := byName[fixtures[0].name].Reviews
+			if unrated == nil || unrated.Band != recommendations.ReviewUnrated || unrated.PositivePercent != nil || unrated.Total != 0 || !unrated.ObservedAt.Equal(now) {
+				t.Fatalf("unrated review projection=%#v", unrated)
+			}
+		}
+		rated := byName[fixtures[3].name].Reviews
+		if rated == nil || rated.Band != recommendations.ReviewPositive || rated.PositivePercent == nil || *rated.PositivePercent != 91 || rated.Total != 1284 || !rated.ObservedAt.Equal(now) {
+			t.Fatalf("rated review projection=%#v", rated)
+		}
+		for _, item := range latest {
+			if item.Name != fixtures[0].name && item.Name != fixtures[3].name && item.Reviews != nil {
+				t.Fatalf("upcoming/missing review projection=%s %#v", item.Name, item.Reviews)
+			}
+		}
 		overview, err := ranking.Overview(ctx, userID)
 		if err != nil {
 			t.Fatal(err)
@@ -157,6 +187,9 @@ func TestCurrentEligibilityProtectsEveryDeliveryPathEndToEnd(t *testing.T) {
 			if strings.Contains(string(overviewJSON), bad.String()) {
 				t.Fatalf("ineligible overview/calendar item leaked: %s", bad)
 			}
+		}
+		if strings.Contains(string(overviewJSON), "tooltip") || strings.Contains(string(overviewJSON), "<") {
+			t.Fatalf("overview leaked raw review markup: %s", overviewJSON)
 		}
 		input, err := digests.DigestInput(ctx, userID)
 		if err != nil {
