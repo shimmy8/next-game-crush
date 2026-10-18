@@ -173,6 +173,17 @@ func (q *Queries) CommitSearchPage(ctx context.Context, arg CommitSearchPagePara
 	return i, err
 }
 
+const countSearchRunWorklist = `-- name: CountSearchRunWorklist :one
+SELECT count(*)::integer FROM catalog_search_worklist WHERE run_id=$1
+`
+
+func (q *Queries) CountSearchRunWorklist(ctx context.Context, runID pgtype.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, countSearchRunWorklist, runID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const createOrGetSearchRun = `-- name: CreateOrGetSearchRun :one
 INSERT INTO catalog_search_runs(schedule_name,occurrence_at,kind,config_snapshot)
 VALUES($1,$2,$3,$4)
@@ -216,6 +227,61 @@ func (q *Queries) CreateOrGetSearchRun(ctx context.Context, arg CreateOrGetSearc
 	return i, err
 }
 
+const failSearchFeedAtCursor = `-- name: FailSearchFeedAtCursor :execrows
+UPDATE catalog_search_feeds SET status='failed',completed_at=$1,safe_error=$2
+WHERE run_id=$3 AND feed=$4 AND status IN ('queued','running')
+    AND cursor_offset=$5 AND page_generation=$6
+`
+
+type FailSearchFeedAtCursorParams struct {
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	SafeError      string             `json:"safe_error"`
+	RunID          pgtype.UUID        `json:"run_id"`
+	Feed           string             `json:"feed"`
+	ExpectedOffset int32              `json:"expected_offset"`
+	PageGeneration int32              `json:"page_generation"`
+}
+
+func (q *Queries) FailSearchFeedAtCursor(ctx context.Context, arg FailSearchFeedAtCursorParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failSearchFeedAtCursor,
+		arg.CompletedAt,
+		arg.SafeError,
+		arg.RunID,
+		arg.Feed,
+		arg.ExpectedOffset,
+		arg.PageGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const finishSearchRunIfTerminal = `-- name: FinishSearchRunIfTerminal :execrows
+UPDATE catalog_search_runs r SET
+    status=CASE
+        WHEN EXISTS(SELECT 1 FROM catalog_search_feeds f WHERE f.run_id=r.id AND f.status='failed') THEN 'failed'
+        WHEN EXISTS(SELECT 1 FROM catalog_search_feeds f WHERE f.run_id=r.id AND f.status='partial') THEN 'partial'
+        ELSE 'complete' END,
+    completed_at=$1,
+    last_successful_at=CASE WHEN NOT EXISTS(SELECT 1 FROM catalog_search_feeds f WHERE f.run_id=r.id AND f.status IN ('partial','failed')) THEN $1 ELSE last_successful_at END
+WHERE r.id=$2 AND r.status IN ('queued','running')
+    AND NOT EXISTS(SELECT 1 FROM catalog_search_feeds f WHERE f.run_id=r.id AND f.status NOT IN ('complete','partial','failed'))
+`
+
+type FinishSearchRunIfTerminalParams struct {
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+	RunID       pgtype.UUID        `json:"run_id"`
+}
+
+func (q *Queries) FinishSearchRunIfTerminal(ctx context.Context, arg FinishSearchRunIfTerminalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishSearchRunIfTerminal, arg.CompletedAt, arg.RunID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getCatalogWorkflowState = `-- name: GetCatalogWorkflowState :one
 SELECT singleton, legacy_enqueue_enabled, legacy_cutover_at FROM catalog_workflow_state WHERE singleton
 `
@@ -224,6 +290,68 @@ func (q *Queries) GetCatalogWorkflowState(ctx context.Context) (CatalogWorkflowS
 	row := q.db.QueryRow(ctx, getCatalogWorkflowState)
 	var i CatalogWorkflowState
 	err := row.Scan(&i.Singleton, &i.LegacyEnqueueEnabled, &i.LegacyCutoverAt)
+	return i, err
+}
+
+const getCommittedSearchPage = `-- name: GetCommittedSearchPage :one
+SELECT run_id, feed, start_offset, page_generation, observation_ordinal, next_offset, result_count, has_more, committed_at FROM catalog_search_pages
+WHERE run_id=$1 AND feed=$2 AND start_offset=$3 AND page_generation=$4
+`
+
+type GetCommittedSearchPageParams struct {
+	RunID          pgtype.UUID `json:"run_id"`
+	Feed           string      `json:"feed"`
+	StartOffset    int32       `json:"start_offset"`
+	PageGeneration int32       `json:"page_generation"`
+}
+
+func (q *Queries) GetCommittedSearchPage(ctx context.Context, arg GetCommittedSearchPageParams) (CatalogSearchPage, error) {
+	row := q.db.QueryRow(ctx, getCommittedSearchPage,
+		arg.RunID,
+		arg.Feed,
+		arg.StartOffset,
+		arg.PageGeneration,
+	)
+	var i CatalogSearchPage
+	err := row.Scan(
+		&i.RunID,
+		&i.Feed,
+		&i.StartOffset,
+		&i.PageGeneration,
+		&i.ObservationOrdinal,
+		&i.NextOffset,
+		&i.ResultCount,
+		&i.HasMore,
+		&i.CommittedAt,
+	)
+	return i, err
+}
+
+const getSearchRun = `-- name: GetSearchRun :one
+SELECT id, run_revision, schedule_name, occurrence_at, kind, config_snapshot, status, retry_generation, next_retry_at, observation_ordinal, new_app_count, created_at, started_at, completed_at, last_successful_at, safe_error FROM catalog_search_runs WHERE id=$1
+`
+
+func (q *Queries) GetSearchRun(ctx context.Context, id pgtype.UUID) (CatalogSearchRun, error) {
+	row := q.db.QueryRow(ctx, getSearchRun, id)
+	var i CatalogSearchRun
+	err := row.Scan(
+		&i.ID,
+		&i.RunRevision,
+		&i.ScheduleName,
+		&i.OccurrenceAt,
+		&i.Kind,
+		&i.ConfigSnapshot,
+		&i.Status,
+		&i.RetryGeneration,
+		&i.NextRetryAt,
+		&i.ObservationOrdinal,
+		&i.NewAppCount,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.LastSuccessfulAt,
+		&i.SafeError,
+	)
 	return i, err
 }
 
@@ -420,6 +548,39 @@ func (q *Queries) LockCatalogWorkflowState(ctx context.Context) (CatalogWorkflow
 	return i, err
 }
 
+const lockSearchFeed = `-- name: LockSearchFeed :one
+SELECT run_id, feed, status, cursor_offset, page_generation, first_page_at, last_page_at, completed_at, pages, observed_count, natural_end, monotonic, boundary_stop, last_ordering_date, safety_cap_reason, safe_error FROM catalog_search_feeds WHERE run_id=$1 AND feed=$2 FOR UPDATE
+`
+
+type LockSearchFeedParams struct {
+	RunID pgtype.UUID `json:"run_id"`
+	Feed  string      `json:"feed"`
+}
+
+func (q *Queries) LockSearchFeed(ctx context.Context, arg LockSearchFeedParams) (CatalogSearchFeed, error) {
+	row := q.db.QueryRow(ctx, lockSearchFeed, arg.RunID, arg.Feed)
+	var i CatalogSearchFeed
+	err := row.Scan(
+		&i.RunID,
+		&i.Feed,
+		&i.Status,
+		&i.CursorOffset,
+		&i.PageGeneration,
+		&i.FirstPageAt,
+		&i.LastPageAt,
+		&i.CompletedAt,
+		&i.Pages,
+		&i.ObservedCount,
+		&i.NaturalEnd,
+		&i.Monotonic,
+		&i.BoundaryStop,
+		&i.LastOrderingDate,
+		&i.SafetyCapReason,
+		&i.SafeError,
+	)
+	return i, err
+}
+
 const lockSearchFeedPublication = `-- name: LockSearchFeedPublication :one
 SELECT feed, published_run_revision, published_at FROM catalog_search_feed_publications WHERE feed=$1 FOR UPDATE
 `
@@ -449,6 +610,46 @@ type MarkSearchRunFailedParams struct {
 func (q *Queries) MarkSearchRunFailed(ctx context.Context, arg MarkSearchRunFailedParams) error {
 	_, err := q.db.Exec(ctx, markSearchRunFailed, arg.ID, arg.NextRetryAt)
 	return err
+}
+
+const markSearchRunRunning = `-- name: MarkSearchRunRunning :execrows
+UPDATE catalog_search_runs SET status='running',started_at=COALESCE(started_at,$1)
+WHERE id=$2 AND run_revision=$3
+    AND retry_generation=$4 AND status IN ('queued','running')
+`
+
+type MarkSearchRunRunningParams struct {
+	StartTime       pgtype.Timestamptz `json:"start_time"`
+	RunID           pgtype.UUID        `json:"run_id"`
+	RunRevision     int64              `json:"run_revision"`
+	RetryGeneration int32              `json:"retry_generation"`
+}
+
+func (q *Queries) MarkSearchRunRunning(ctx context.Context, arg MarkSearchRunRunningParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markSearchRunRunning,
+		arg.StartTime,
+		arg.RunID,
+		arg.RunRevision,
+		arg.RetryGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const prepareSearchRunFeeds = `-- name: PrepareSearchRunFeeds :execrows
+INSERT INTO catalog_search_feeds(run_id,feed)
+SELECT $1,feed FROM unnest(ARRAY['popular_upcoming','popular_new','recent','coming_soon']) AS feed
+ON CONFLICT(run_id,feed) DO NOTHING
+`
+
+func (q *Queries) PrepareSearchRunFeeds(ctx context.Context, runID pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, prepareSearchRunFeeds, runID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const publishFeedMembership = `-- name: PublishFeedMembership :one
@@ -494,6 +695,56 @@ func (q *Queries) PublishFeedMembership(ctx context.Context, arg PublishFeedMemb
 	var published bool
 	err := row.Scan(&published)
 	return published, err
+}
+
+const recordSearchFeedProgress = `-- name: RecordSearchFeedProgress :execrows
+UPDATE catalog_search_feeds SET status=$1,cursor_offset=$2,
+    first_page_at=COALESCE(first_page_at,$3),last_page_at=$3,
+    completed_at=CASE WHEN $1 IN ('complete','partial') THEN $3 ELSE NULL END,
+    pages=pages+1,observed_count=observed_count+$4,
+    natural_end=$5,monotonic=monotonic AND $6,
+    boundary_stop=$7,last_ordering_date=$8,
+    safety_cap_reason=$9,safe_error=''
+WHERE run_id=$10 AND feed=$11
+    AND cursor_offset=$12 AND page_generation=$13
+`
+
+type RecordSearchFeedProgressParams struct {
+	Status           string             `json:"status"`
+	CursorOffset     int32              `json:"cursor_offset"`
+	ObservedAt       pgtype.Timestamptz `json:"observed_at"`
+	ObservedCount    int32              `json:"observed_count"`
+	NaturalEnd       bool               `json:"natural_end"`
+	Monotonic        bool               `json:"monotonic"`
+	BoundaryStop     bool               `json:"boundary_stop"`
+	LastOrderingDate pgtype.Date        `json:"last_ordering_date"`
+	SafetyCapReason  string             `json:"safety_cap_reason"`
+	RunID            pgtype.UUID        `json:"run_id"`
+	Feed             string             `json:"feed"`
+	ExpectedOffset   int32              `json:"expected_offset"`
+	PageGeneration   int32              `json:"page_generation"`
+}
+
+func (q *Queries) RecordSearchFeedProgress(ctx context.Context, arg RecordSearchFeedProgressParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordSearchFeedProgress,
+		arg.Status,
+		arg.CursorOffset,
+		arg.ObservedAt,
+		arg.ObservedCount,
+		arg.NaturalEnd,
+		arg.Monotonic,
+		arg.BoundaryStop,
+		arg.LastOrderingDate,
+		arg.SafetyCapReason,
+		arg.RunID,
+		arg.Feed,
+		arg.ExpectedOffset,
+		arg.PageGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const releaseStoreReservation = `-- name: ReleaseStoreReservation :execrows
@@ -585,6 +836,36 @@ func (q *Queries) SearchRunJobExists(ctx context.Context, idempotencyKey string)
 	return column_1, err
 }
 
+const searchWorklistContains = `-- name: SearchWorklistContains :one
+SELECT EXISTS(SELECT 1 FROM catalog_search_worklist WHERE run_id=$1 AND steam_app_id=$2)::boolean
+`
+
+type SearchWorklistContainsParams struct {
+	RunID      pgtype.UUID `json:"run_id"`
+	SteamAppID int64       `json:"steam_app_id"`
+}
+
+func (q *Queries) SearchWorklistContains(ctx context.Context, arg SearchWorklistContainsParams) (bool, error) {
+	row := q.db.QueryRow(ctx, searchWorklistContains, arg.RunID, arg.SteamAppID)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const updateSearchRunNewAppCount = `-- name: UpdateSearchRunNewAppCount :exec
+UPDATE catalog_search_runs SET new_app_count=$2 WHERE id=$1
+`
+
+type UpdateSearchRunNewAppCountParams struct {
+	ID          pgtype.UUID `json:"id"`
+	NewAppCount int32       `json:"new_app_count"`
+}
+
+func (q *Queries) UpdateSearchRunNewAppCount(ctx context.Context, arg UpdateSearchRunNewAppCountParams) error {
+	_, err := q.db.Exec(ctx, updateSearchRunNewAppCount, arg.ID, arg.NewAppCount)
+	return err
+}
+
 const upsertCurrentSearchObservation = `-- name: UpsertCurrentSearchObservation :execrows
 INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,release_text,precision,
     release_date,release_year,release_month,release_quarter,fingerprint,
@@ -657,13 +938,20 @@ func (q *Queries) UpsertCurrentSearchObservation(ctx context.Context, arg Upsert
 	return result.RowsAffected(), nil
 }
 
-const upsertSearchWorklist = `-- name: UpsertSearchWorklist :execrows
-INSERT INTO catalog_search_worklist(run_id,steam_app_id,run_revision,observation_ordinal,priority)
-VALUES($1,$2,$3,$4,$5)
-ON CONFLICT(run_id,steam_app_id) DO UPDATE SET run_revision=EXCLUDED.run_revision,
-    observation_ordinal=EXCLUDED.observation_ordinal,priority=GREATEST(catalog_search_worklist.priority,EXCLUDED.priority)
-WHERE (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>
-    (catalog_search_worklist.run_revision,catalog_search_worklist.observation_ordinal)
+const upsertSearchWorklist = `-- name: UpsertSearchWorklist :one
+WITH inserted AS (
+    INSERT INTO catalog_search_worklist(run_id,steam_app_id,run_revision,observation_ordinal,priority)
+    VALUES($1,$2,$3,$4,$5)
+    ON CONFLICT(run_id,steam_app_id) DO NOTHING RETURNING true AS created
+), updated AS (
+    UPDATE catalog_search_worklist SET run_revision=$3,observation_ordinal=$4,
+        priority=GREATEST(priority,$5)
+    WHERE run_id=$1 AND steam_app_id=$2 AND NOT EXISTS(SELECT 1 FROM inserted)
+        AND ($3::bigint,$4::bigint)>(run_revision,observation_ordinal)
+    RETURNING false AS created
+)
+SELECT created FROM inserted UNION ALL SELECT created FROM updated
+UNION ALL SELECT false WHERE NOT EXISTS(SELECT 1 FROM inserted) AND NOT EXISTS(SELECT 1 FROM updated)
 `
 
 type UpsertSearchWorklistParams struct {
@@ -674,16 +962,15 @@ type UpsertSearchWorklistParams struct {
 	Priority           int16       `json:"priority"`
 }
 
-func (q *Queries) UpsertSearchWorklist(ctx context.Context, arg UpsertSearchWorklistParams) (int64, error) {
-	result, err := q.db.Exec(ctx, upsertSearchWorklist,
+func (q *Queries) UpsertSearchWorklist(ctx context.Context, arg UpsertSearchWorklistParams) (bool, error) {
+	row := q.db.QueryRow(ctx, upsertSearchWorklist,
 		arg.RunID,
 		arg.SteamAppID,
 		arg.RunRevision,
 		arg.ObservationOrdinal,
 		arg.Priority,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var created bool
+	err := row.Scan(&created)
+	return created, err
 }

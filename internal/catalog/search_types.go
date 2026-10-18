@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"next-game-crush/internal/steam"
 )
 
 type RunKind string
@@ -30,6 +31,14 @@ type SearchRunPayload struct {
 	RunID       uuid.UUID `json:"run_id"`
 	RunRevision int64     `json:"run_revision"`
 	Generation  int       `json:"generation"`
+}
+
+type SearchPagePayload struct {
+	Version        int              `json:"version"`
+	RunID          uuid.UUID        `json:"run_id"`
+	Feed           steam.SearchFeed `json:"feed"`
+	Start          int              `json:"start"`
+	PageGeneration int              `json:"page_generation"`
 }
 
 type CandidateRevision struct {

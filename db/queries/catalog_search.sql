@@ -36,6 +36,62 @@ RETURNING *;
 UPDATE catalog_search_runs SET observation_ordinal=observation_ordinal+1
 WHERE id=$1 RETURNING observation_ordinal;
 
+-- name: MarkSearchRunRunning :execrows
+UPDATE catalog_search_runs SET status='running',started_at=COALESCE(started_at,sqlc.arg(start_time))
+WHERE id=sqlc.arg(run_id) AND run_revision=sqlc.arg(run_revision)
+    AND retry_generation=sqlc.arg(retry_generation) AND status IN ('queued','running');
+
+-- name: PrepareSearchRunFeeds :execrows
+INSERT INTO catalog_search_feeds(run_id,feed)
+SELECT sqlc.arg(run_id),feed FROM unnest(ARRAY['popular_upcoming','popular_new','recent','coming_soon']) AS feed
+ON CONFLICT(run_id,feed) DO NOTHING;
+
+-- name: GetSearchRun :one
+SELECT * FROM catalog_search_runs WHERE id=$1;
+
+-- name: GetCommittedSearchPage :one
+SELECT * FROM catalog_search_pages
+WHERE run_id=$1 AND feed=$2 AND start_offset=$3 AND page_generation=$4;
+
+-- name: LockSearchFeed :one
+SELECT * FROM catalog_search_feeds WHERE run_id=$1 AND feed=$2 FOR UPDATE;
+
+-- name: FailSearchFeedAtCursor :execrows
+UPDATE catalog_search_feeds SET status='failed',completed_at=sqlc.arg(completed_at),safe_error=sqlc.arg(safe_error)
+WHERE run_id=sqlc.arg(run_id) AND feed=sqlc.arg(feed) AND status IN ('queued','running')
+    AND cursor_offset=sqlc.arg(expected_offset) AND page_generation=sqlc.arg(page_generation);
+
+-- name: RecordSearchFeedProgress :execrows
+UPDATE catalog_search_feeds SET status=sqlc.arg(status),cursor_offset=sqlc.arg(cursor_offset),
+    first_page_at=COALESCE(first_page_at,sqlc.arg(observed_at)),last_page_at=sqlc.arg(observed_at),
+    completed_at=CASE WHEN sqlc.arg(status) IN ('complete','partial') THEN sqlc.arg(observed_at) ELSE NULL END,
+    pages=pages+1,observed_count=observed_count+sqlc.arg(observed_count),
+    natural_end=sqlc.arg(natural_end),monotonic=monotonic AND sqlc.arg(monotonic),
+    boundary_stop=sqlc.arg(boundary_stop),last_ordering_date=sqlc.narg(last_ordering_date),
+    safety_cap_reason=sqlc.arg(safety_cap_reason),safe_error=''
+WHERE run_id=sqlc.arg(run_id) AND feed=sqlc.arg(feed)
+    AND cursor_offset=sqlc.arg(expected_offset) AND page_generation=sqlc.arg(page_generation);
+
+-- name: CountSearchRunWorklist :one
+SELECT count(*)::integer FROM catalog_search_worklist WHERE run_id=$1;
+
+-- name: SearchWorklistContains :one
+SELECT EXISTS(SELECT 1 FROM catalog_search_worklist WHERE run_id=$1 AND steam_app_id=$2)::boolean;
+
+-- name: UpdateSearchRunNewAppCount :exec
+UPDATE catalog_search_runs SET new_app_count=$2 WHERE id=$1;
+
+-- name: FinishSearchRunIfTerminal :execrows
+UPDATE catalog_search_runs r SET
+    status=CASE
+        WHEN EXISTS(SELECT 1 FROM catalog_search_feeds f WHERE f.run_id=r.id AND f.status='failed') THEN 'failed'
+        WHEN EXISTS(SELECT 1 FROM catalog_search_feeds f WHERE f.run_id=r.id AND f.status='partial') THEN 'partial'
+        ELSE 'complete' END,
+    completed_at=sqlc.arg(completed_at),
+    last_successful_at=CASE WHEN NOT EXISTS(SELECT 1 FROM catalog_search_feeds f WHERE f.run_id=r.id AND f.status IN ('partial','failed')) THEN sqlc.arg(completed_at) ELSE last_successful_at END
+WHERE r.id=sqlc.arg(run_id) AND r.status IN ('queued','running')
+    AND NOT EXISTS(SELECT 1 FROM catalog_search_feeds f WHERE f.run_id=r.id AND f.status NOT IN ('complete','partial','failed'));
+
 -- name: CommitSearchPage :one
 INSERT INTO catalog_search_pages(run_id,feed,start_offset,page_generation,observation_ordinal,next_offset,result_count,has_more)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8)
@@ -87,13 +143,20 @@ INSERT INTO catalog_search_observations(run_id,feed,start_offset,page_generation
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 ON CONFLICT DO NOTHING;
 
--- name: UpsertSearchWorklist :execrows
-INSERT INTO catalog_search_worklist(run_id,steam_app_id,run_revision,observation_ordinal,priority)
-VALUES($1,$2,$3,$4,$5)
-ON CONFLICT(run_id,steam_app_id) DO UPDATE SET run_revision=EXCLUDED.run_revision,
-    observation_ordinal=EXCLUDED.observation_ordinal,priority=GREATEST(catalog_search_worklist.priority,EXCLUDED.priority)
-WHERE (EXCLUDED.run_revision,EXCLUDED.observation_ordinal)>
-    (catalog_search_worklist.run_revision,catalog_search_worklist.observation_ordinal);
+-- name: UpsertSearchWorklist :one
+WITH inserted AS (
+    INSERT INTO catalog_search_worklist(run_id,steam_app_id,run_revision,observation_ordinal,priority)
+    VALUES($1,$2,$3,$4,$5)
+    ON CONFLICT(run_id,steam_app_id) DO NOTHING RETURNING true AS created
+), updated AS (
+    UPDATE catalog_search_worklist SET run_revision=$3,observation_ordinal=$4,
+        priority=GREATEST(priority,$5)
+    WHERE run_id=$1 AND steam_app_id=$2 AND NOT EXISTS(SELECT 1 FROM inserted)
+        AND ($3::bigint,$4::bigint)>(run_revision,observation_ordinal)
+    RETURNING false AS created
+)
+SELECT created FROM inserted UNION ALL SELECT created FROM updated
+UNION ALL SELECT false WHERE NOT EXISTS(SELECT 1 FROM inserted) AND NOT EXISTS(SELECT 1 FROM updated);
 
 -- name: UpsertCurrentSearchObservation :execrows
 INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,release_text,precision,
