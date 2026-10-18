@@ -51,13 +51,56 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir web install --frozen-lockfile
 
-      - name: Verify repository
+      - name: Start isolated test services
         shell: bash
         run: |
+          set -Eeuo pipefail
+          docker compose up --quiet-pull --wait --wait-timeout 60 test-db
+          docker compose up -d mailpit
+          make prepare-e2e-db
+
+      - name: Verify generated SQL bindings
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sqlc_snapshot="$(mktemp -d)"
+          trap 'rm -rf "$sqlc_snapshot"' EXIT
+          cp -R internal/store/sqlc "$sqlc_snapshot/"
+          make sqlc
+          diff -ru "$sqlc_snapshot/sqlc" internal/store/sqlc
+
+      - name: Run backend race tests
+        run: GOWORK=off TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127.0.0.1:55432/next_game_crush_test?sslmode=disable' go test -race ./...
+
+      - name: Run frontend unit tests
+        run: pnpm --dir web run test
+
+      - name: Verify frontend types, lint, and build
+        run: |
+          pnpm --dir web run typecheck
+          pnpm --dir web run lint
+          pnpm --dir web run build
+
+      - name: Verify Compose and production image
+        run: |
+          docker compose config --quiet
+          docker compose build app
+
+      - name: Select Playwright browser
+        shell: bash
+        run: |
+          set -Eeuo pipefail
           if [[ -x /usr/bin/google-chrome ]]; then
-            export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome
+            printf '%s\n' 'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome' >>"$GITHUB_ENV"
+          else
+            make playwright-browser
           fi
-          GOWORK=off make verify
+
+      - name: Run browser acceptance tests
+        run: pnpm --dir web exec playwright test tests/e2e/smoke.spec.ts tests/e2e/presentation.spec.ts tests/e2e/catalog-discovery.spec.ts tests/e2e/completion-signals.spec.ts
+
+      - name: Run OpenAI-disabled completion acceptance test
+        run: E2E_OPENAI_DISABLED=1 pnpm --dir web exec playwright test tests/e2e/completion-signals.spec.ts
 
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

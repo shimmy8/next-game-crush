@@ -133,7 +133,8 @@ visible before merge. Publication and deployment run only for a push to
 Jobs execute in this order:
 
 1. `verify`: check out the exact commit and run the repository's required
-   release verification.
+   release verification as separately reported backend, frontend, Docker, and
+   browser steps.
 2. `publish`: build the existing Dockerfile and push a commit-SHA tag to GHCR.
 3. `deploy`: copy the versioned production artifacts, connect over SSH, and
    deploy the published SHA.
