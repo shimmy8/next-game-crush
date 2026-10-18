@@ -447,6 +447,181 @@ func TestClassificationHookFailureIsRetriedAfterPublication(t *testing.T) {
 	}
 }
 
+func TestClassificationActivationFansOutUserOwnedProjectionJobs(t *testing.T) {
+	db := openCompletionStore(t)
+	ctx := context.Background()
+	firstUser, gameID := seedCompletionGame(t, db, nil)
+	secondUser := uuid.New()
+	unrelatedUser := uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1),($2)`, secondUser, unrelatedUser); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO user_games(user_id,game_id,source,last_successful_fetch_at) VALUES($1,$2,'steam',now())`, secondUser, gameID); err != nil {
+		t.Fatal(err)
+	}
+	repository, _ := NewSQLRepository(db)
+	summary := steam.AchievementSummary{Achievements: []steam.Achievement{{APIName: "ending", Name: "Ending", Description: "Reach an ending", Achieved: true}}}
+	firstChange, err := repository.SaveSteamSnapshot(ctx, firstUser, gameID, summary, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.SaveSteamSnapshot(ctx, secondUser, gameID, summary, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.PublishClassificationGeneration(ctx, gameID, "semantic-model", ai.AchievementSemanticsPromptVersion, ai.AchievementSemanticsSchemaVersion, LexicalRuleVersion, firstChange.DefinitionSetHash, []StagedClassification{{APIName: "ending", DefinitionContentHash: definitionHashFor(t, db, gameID, "ending"), Class: ai.AchievementSemanticBaseGameEnding, Source: ClassificationSourceLexical}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	queue := jobs.NewQueue(db)
+	service, _ := NewService(repository, semanticClassifierFunc(func(context.Context, ai.AchievementSemanticEvidence) (ai.AchievementSemanticClassification, error) {
+		return ai.AchievementSemanticClassification{}, nil
+	}), "semantic-model", queue)
+	classification, err := service.PlanClassificationJob(ctx, gameID, firstChange.DefinitionSetHash, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, classification); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := service.EnqueueProjectionJobsForGame(ctx, gameID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := db.Pool.Query(ctx, `SELECT kind,user_id,idempotency_key,payload::text FROM sync_jobs WHERE kind IN ('achievement.classify','completion.project') ORDER BY kind,user_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	projectionUsers := map[uuid.UUID]bool{}
+	classificationUnowned := false
+	for rows.Next() {
+		var kind, key, payload string
+		var owner *uuid.UUID
+		if err := rows.Scan(&kind, &owner, &key, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if kind == ClassificationJobKind {
+			classificationUnowned = owner == nil
+			continue
+		}
+		if owner == nil || *owner == uuid.Nil || !strings.Contains(key, ProjectionJobKind+":v1:") || !strings.Contains(payload, gameID.String()) {
+			t.Fatalf("invalid projection job owner=%v key=%q payload=%s", owner, key, payload)
+		}
+		projectionUsers[*owner] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !classificationUnowned || len(projectionUsers) != 2 || !projectionUsers[firstUser] || !projectionUsers[secondUser] || projectionUsers[unrelatedUser] {
+		t.Fatalf("classification_unowned=%v projection_users=%v", classificationUnowned, projectionUsers)
+	}
+}
+
+func TestProjectionJobRebuildsProfileThenRecommendationsOnce(t *testing.T) {
+	db := openCompletionStore(t)
+	ctx := context.Background()
+	userID, gameID := seedCompletionGame(t, db, nil)
+	repository, _ := NewSQLRepository(db)
+	change, err := repository.SaveSteamSnapshot(ctx, userID, gameID, steam.AchievementSummary{Achievements: []steam.Achievement{{APIName: "ending", Name: "Ending", Description: "Reach an ending", Achieved: true}}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.PublishClassificationGeneration(ctx, gameID, "semantic-model", ai.AchievementSemanticsPromptVersion, ai.AchievementSemanticsSchemaVersion, LexicalRuleVersion, change.DefinitionSetHash, []StagedClassification{{APIName: "ending", DefinitionContentHash: definitionHashFor(t, db, gameID, "ending"), Class: ai.AchievementSemanticBaseGameEnding, Source: ClassificationSourceLexical}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	queue := jobs.NewQueue(db)
+	service, _ := NewService(repository, semanticClassifierFunc(func(context.Context, ai.AchievementSemanticEvidence) (ai.AchievementSemanticClassification, error) {
+		return ai.AchievementSemanticClassification{}, nil
+	}), "semantic-model", queue)
+	spec, err := service.planProjectionJob(userID, gameID, change.DefinitionSetHash, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	projectionLease := claimKind(t, queue, ProjectionJobKind)
+	stale := *projectionLease
+	stale.FencingToken = uuid.New()
+	if err := service.handleProjection(ctx, stale); !errors.Is(err, jobs.ErrLeaseLost) {
+		t.Fatalf("stale projection handling err=%v", err)
+	}
+	var rolledBack int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM user_game_completion_projections WHERE user_id=$1 AND game_id=$2`, userID, gameID).Scan(&rolledBack); err != nil || rolledBack != 0 {
+		t.Fatalf("projection rollback count=%d err=%v", rolledBack, err)
+	}
+	if err := service.handleProjection(ctx, *projectionLease); !errors.Is(err, jobs.ErrDeferred) {
+		t.Fatalf("first projection handling err=%v", err)
+	}
+	assertJobCounts(t, db, 1, 0)
+	profileLease := claimKind(t, queue, "profile.rebuild")
+	if err := queue.Complete(ctx, *profileLease); err != nil {
+		t.Fatal(err)
+	}
+	projectionLease = claimKind(t, queue, ProjectionJobKind)
+	if err := service.handleProjection(ctx, *projectionLease); !errors.Is(err, jobs.ErrDeferred) {
+		t.Fatalf("second projection handling err=%v", err)
+	}
+	assertJobCounts(t, db, 1, 1)
+	recommendationLease := claimKind(t, queue, "recommendations.rebuild")
+	if err := queue.Complete(ctx, *recommendationLease); err != nil {
+		t.Fatal(err)
+	}
+	projectionLease = claimKind(t, queue, ProjectionJobKind)
+	if err := service.handleProjection(ctx, *projectionLease); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Complete(ctx, *projectionLease); err != nil {
+		t.Fatal(err)
+	}
+	assertJobCounts(t, db, 1, 1)
+
+	unchanged, err := service.planProjectionJob(userID, gameID, change.DefinitionSetHash+"-recheck", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, unchanged); err != nil {
+		t.Fatal(err)
+	}
+	unchangedLease := claimKind(t, queue, ProjectionJobKind)
+	if err := service.handleProjection(ctx, *unchangedLease); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Complete(ctx, *unchangedLease); err != nil {
+		t.Fatal(err)
+	}
+	assertJobCounts(t, db, 1, 1)
+}
+
+func TestProjectionRebuildKeysIncludeTransitionIdentity(t *testing.T) {
+	userID, gameID := uuid.New(), uuid.New()
+	first := projectionRebuildKeyPrefix(userID, gameID, "generation", uuid.New(), "projection")
+	second := projectionRebuildKeyPrefix(userID, gameID, "generation", uuid.New(), "projection")
+	if first == second {
+		t.Fatalf("distinct projection transitions reused child key %q", first)
+	}
+}
+
+func claimKind(t *testing.T, queue *jobs.Queue, kind string) *jobs.Lease {
+	t.Helper()
+	lease, err := queue.Claim(context.Background(), "completion-projection-test", time.Minute)
+	if err != nil || lease == nil || lease.Kind != kind {
+		t.Fatalf("claim kind=%q lease=%+v err=%v", kind, lease, err)
+	}
+	return lease
+}
+
+func assertJobCounts(t *testing.T, db *store.Store, profiles, recommendations int) {
+	t.Helper()
+	var gotProfiles, gotRecommendations int
+	if err := db.Pool.QueryRow(context.Background(), `SELECT count(*) FILTER (WHERE kind='profile.rebuild'),count(*) FILTER (WHERE kind='recommendations.rebuild') FROM sync_jobs`).Scan(&gotProfiles, &gotRecommendations); err != nil {
+		t.Fatal(err)
+	}
+	if gotProfiles != profiles || gotRecommendations != recommendations {
+		t.Fatalf("profile jobs=%d recommendations=%d want=%d/%d", gotProfiles, gotRecommendations, profiles, recommendations)
+	}
+}
+
 func seedCompletionGame(t *testing.T, db *store.Store, _ []steam.Achievement) (uuid.UUID, uuid.UUID) {
 	t.Helper()
 	userID, gameID := uuid.New(), uuid.New()

@@ -102,6 +102,22 @@ func TestAchievementClassificationJobObservabilityIsAllowlistedAndSanitized(t *t
 	}
 }
 
+func TestCompletionProjectionJobObservabilityIsAllowlistedAndPrivate(t *testing.T) {
+	var output bytes.Buffer
+	logger := New(slog.New(slog.NewJSONHandler(&output, nil)))
+	logger.JobAttempt(context.Background(), JobAttemptEvent{Stage: JobRetryScheduled, Kind: "completion.project", LogicalStage: "completion_projection", Attempt: 1, MaxAttempts: 3, Reason: ReasonPersistenceFailed})
+	event := decodeEvents(t, output.String())[0]
+	if event["kind"] != "completion.project" || event["logical_stage"] != "completion_projection" || event["reason"] != "persistence_failed" {
+		t.Fatalf("event=%#v", event)
+	}
+	encoded, _ := json.Marshal(event)
+	for _, canary := range []string{"steam_id", "user_id", "game_id", "app_id", "api_name", "achievement_description", "payload", "completion_weight", "provider_body"} {
+		if strings.Contains(string(encoded), canary) {
+			t.Fatalf("sensitive completion projection field leaked: %s", encoded)
+		}
+	}
+}
+
 func TestSyncSourceLogsOnlyBoundedUpstreamStatusOnFinishedEvents(t *testing.T) {
 	for _, test := range []struct {
 		name       string

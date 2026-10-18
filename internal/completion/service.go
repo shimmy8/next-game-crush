@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/steam"
 )
 
 type Service struct {
@@ -27,6 +29,12 @@ type Service struct {
 
 type classificationJobResult struct {
 	PublishedHookPending bool `json:"published_hook_pending"`
+}
+
+type projectionJobResult struct {
+	Phase             string `json:"phase"`
+	ProjectionChanged bool   `json:"projection_changed"`
+	ProjectionHash    string `json:"projection_hash,omitempty"`
 }
 
 func NewService(repository *SQLRepository, classifier SemanticClassifier, model string, queue *jobs.Queue) (*Service, error) {
@@ -58,7 +66,161 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 	if worker == nil {
 		return errors.New("worker is required")
 	}
-	return worker.Register(ClassificationJobKind, s.handleClassification)
+	if err := worker.Register(ClassificationJobKind, s.handleClassification); err != nil {
+		return err
+	}
+	return worker.Register(ProjectionJobKind, s.handleProjection)
+}
+
+func (s *Service) RecordAchievementSnapshot(ctx context.Context, userID, gameID uuid.UUID, summary steam.AchievementSummary, observedAt time.Time) error {
+	change, err := s.repository.SaveSteamSnapshot(ctx, userID, gameID, summary, observedAt)
+	if err != nil {
+		return err
+	}
+	if _, _, err := s.repository.RebuildProjection(ctx, userID, gameID, s.model, observedAt); err != nil {
+		return err
+	}
+	if !change.DefinitionsChanged || change.DefinitionSetHash == "" {
+		return nil
+	}
+	spec, err := s.PlanClassificationJob(ctx, gameID, change.DefinitionSetHash, 80)
+	if err != nil {
+		return err
+	}
+	_, err = s.queue.Enqueue(ctx, spec)
+	return err
+}
+
+func (s *Service) EnqueueProjectionJobsForGame(ctx context.Context, gameID uuid.UUID) error {
+	generationHash, err := s.repository.ActiveClassificationGenerationHash(ctx, gameID, s.model)
+	if err != nil {
+		return err
+	}
+	if generationHash == "" {
+		return nil
+	}
+	users, err := s.repository.ListCompletionUsersForGame(ctx, gameID)
+	if err != nil {
+		return err
+	}
+	for _, userID := range users {
+		spec, err := s.planProjectionJob(userID, gameID, generationHash, 80)
+		if err != nil {
+			return err
+		}
+		if _, err := s.queue.Enqueue(ctx, spec); err != nil {
+			return fmt.Errorf("enqueue completion projection: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Service) planProjectionJob(userID, gameID uuid.UUID, generationHash string, priority int) (jobs.Spec, error) {
+	generationHash = strings.TrimSpace(generationHash)
+	if userID == uuid.Nil || gameID == uuid.Nil || generationHash == "" || priority < 1 || priority > 100 {
+		return jobs.Spec{}, errors.New("projection job identity and priority are required")
+	}
+	payload, err := json.Marshal(ProjectionJobPayload{Version: 1, UserID: userID, GameID: gameID, GenerationHash: generationHash})
+	if err != nil {
+		return jobs.Spec{}, fmt.Errorf("encode completion projection job: %w", err)
+	}
+	keyHash := sha256.Sum256([]byte(strings.Join([]string{userID.String(), gameID.String(), generationHash, ProjectionAlgorithmVersion}, "\x00")))
+	return jobs.Spec{Kind: ProjectionJobKind, Stage: "completion_projection", IdempotencyKey: ProjectionJobKind + ":v1:" + hex.EncodeToString(keyHash[:]), Payload: payload, MaxAttempts: 3, Priority: priority, UserID: userID}, nil
+}
+
+func (s *Service) handleProjection(ctx context.Context, lease jobs.Lease) error {
+	payload, err := decodeProjectionJobPayload(lease.Payload)
+	if err != nil {
+		return err
+	}
+	var result projectionJobResult
+	if len(lease.Result) > 0 && string(lease.Result) != "null" {
+		if err := json.Unmarshal(lease.Result, &result); err != nil {
+			return errors.New("unsupported completion projection result schema")
+		}
+	}
+	if result.Phase == "" {
+		projection, changed, err := s.repository.rebuildProjection(ctx, payload.UserID, payload.GameID, s.model, time.Now().UTC(), func(ctx context.Context, tx pgx.Tx, projection Projection, changed bool) error {
+			persisted := projectionJobResult{Phase: "complete", ProjectionChanged: false}
+			if changed {
+				persisted = projectionJobResult{Phase: "profile", ProjectionChanged: true, ProjectionHash: hashProjection(projection)}
+			}
+			encoded, err := json.Marshal(persisted)
+			if err != nil {
+				return fmt.Errorf("encode completion projection result: %w", err)
+			}
+			command, err := tx.Exec(ctx, `UPDATE sync_jobs SET result=$1,updated_at=now()
+				WHERE id=$2 AND status='running' AND worker_id=$3 AND fencing_token=$4 AND lease_until>now()`, encoded, lease.ID, lease.WorkerID, lease.FencingToken)
+			if err != nil {
+				return fmt.Errorf("record completion projection result: %w", err)
+			}
+			if command.RowsAffected() != 1 {
+				return jobs.ErrLeaseLost
+			}
+			result = persisted
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if changed && result.ProjectionHash == "" {
+			result = projectionJobResult{Phase: "profile", ProjectionChanged: true, ProjectionHash: hashProjection(projection)}
+		}
+	}
+	profilePayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": payload.UserID})
+	keyPrefix := projectionRebuildKeyPrefix(payload.UserID, payload.GameID, payload.GenerationHash, lease.ID, result.ProjectionHash)
+	if result.Phase == "profile" {
+		ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "profile.rebuild", Stage: "profile", Required: true, IdempotencyKey: keyPrefix + ":profile:v1", Payload: profilePayload, MaxAttempts: 3, Priority: lease.Priority, UserID: payload.UserID}})
+		if err != nil {
+			return err
+		}
+		if !ready {
+			return jobs.ErrDeferred
+		}
+		result.Phase = "recommendations"
+		if err := s.queue.RecordResult(ctx, lease, result); err != nil {
+			return err
+		}
+	}
+	if result.Phase == "recommendations" {
+		ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: keyPrefix + ":recommendations:v1", Payload: profilePayload, MaxAttempts: 3, Priority: lease.Priority, UserID: payload.UserID}})
+		if err != nil {
+			return err
+		}
+		if !ready {
+			return jobs.ErrDeferred
+		}
+		result.Phase = "complete"
+		return s.queue.RecordResult(ctx, lease, result)
+	}
+	if result.Phase != "complete" {
+		return errors.New("unsupported completion projection result phase")
+	}
+	return nil
+}
+
+func decodeProjectionJobPayload(raw json.RawMessage) (ProjectionJobPayload, error) {
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	var payload ProjectionJobPayload
+	if err := decoder.Decode(&payload); err != nil || payload.Version != 1 || payload.UserID == uuid.Nil || payload.GameID == uuid.Nil || strings.TrimSpace(payload.GenerationHash) == "" {
+		return ProjectionJobPayload{}, errors.New("unsupported completion projection payload schema")
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return ProjectionJobPayload{}, errors.New("completion projection payload contains trailing data")
+	}
+	return payload, nil
+}
+
+func hashProjection(projection Projection) string {
+	encoded, _ := json.Marshal(projection)
+	hash := sha256.Sum256(encoded)
+	return hex.EncodeToString(hash[:])
+}
+
+func projectionRebuildKeyPrefix(userID, gameID uuid.UUID, generationHash string, transitionID uuid.UUID, projectionHash string) string {
+	hash := sha256.Sum256([]byte(strings.Join([]string{userID.String(), gameID.String(), generationHash, transitionID.String(), ProjectionAlgorithmVersion, projectionHash}, "\x00")))
+	return ProjectionJobKind + ":rebuild:v1:" + hex.EncodeToString(hash[:])
 }
 
 func (s *Service) runClassification(ctx context.Context, payload JobPayload) error {

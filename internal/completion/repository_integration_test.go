@@ -10,9 +10,143 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"next-game-crush/internal/ai"
 	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
 )
+
+func TestProjectCompletionRetainsHistoricalHundredPercentAfterCatalogGrowth(t *testing.T) {
+	db := openCompletionStore(t)
+	ctx := context.Background()
+	userID, gameID := seedCompletionGame(t, db, nil)
+	repository, _ := NewSQLRepository(db)
+	completedAt := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	first := makeAchievementSet(10, 10, completedAt)
+	if _, err := repository.SaveSteamSnapshot(ctx, userID, gameID, first, completedAt.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	projection, changed, err := repository.RebuildProjection(ctx, userID, gameID, "semantic-model", completedAt.Add(time.Hour))
+	if err != nil || !changed || projection.Basis != "hundred_percent" || projection.Weight != 1.50 || !projection.CompletionAt.Equal(completedAt) {
+		t.Fatalf("first projection=%+v changed=%v err=%v", projection, changed, err)
+	}
+	second := makeAchievementSet(12, 10, completedAt)
+	if _, err := repository.SaveSteamSnapshot(ctx, userID, gameID, second, completedAt.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		projection, changed, err = repository.RebuildProjection(ctx, userID, gameID, "semantic-model", completedAt.Add(24*time.Hour))
+		if err != nil || changed || projection.Basis != "hundred_percent" || projection.Weight != 1.50 || !projection.CompletionAt.Equal(completedAt) {
+			t.Fatalf("replayed projection=%+v changed=%v err=%v", projection, changed, err)
+		}
+	}
+	var evidence int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM user_game_completion_evidence WHERE user_id=$1 AND game_id=$2 AND kind='hundred_percent'`, userID, gameID).Scan(&evidence); err != nil {
+		t.Fatal(err)
+	}
+	if evidence != 1 {
+		t.Fatalf("hundred percent evidence=%d want=1", evidence)
+	}
+}
+
+func TestRebuildProjectionCountsDistinctUnlockedBaseGameEndingsOnly(t *testing.T) {
+	db := openCompletionStore(t)
+	ctx := context.Background()
+	userID, gameID := seedCompletionGame(t, db, nil)
+	repository, _ := NewSQLRepository(db)
+	t0 := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	achievements := []steam.Achievement{
+		{APIName: "ending_a", Name: "A", Description: "A", Achieved: true, UnlockedAt: t0.Add(time.Hour)},
+		{APIName: "completion", Name: "Done", Description: "Done", Achieved: true, UnlockedAt: t0},
+		{APIName: "locked_ending", Name: "Locked", Description: "Locked"},
+		{APIName: "dlc", Name: "DLC", Description: "DLC", Achieved: true},
+		{APIName: "meta", Name: "Meta", Description: "Meta", Achieved: true},
+		{APIName: "partial", Name: "Partial", Description: "Partial", Achieved: true},
+		{APIName: "optional", Name: "Optional", Description: "Optional", Achieved: true},
+		{APIName: "other", Name: "Other", Description: "Other", Achieved: true},
+		{APIName: "unknown", Name: "Unknown", Description: "Unknown", Achieved: true},
+	}
+	change, err := repository.SaveSteamSnapshot(ctx, userID, gameID, steam.AchievementSummary{Achievements: achievements}, t0.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	classes := map[string]ai.AchievementSemanticClass{
+		"ending_a": ai.AchievementSemanticBaseGameEnding, "completion": ai.AchievementSemanticBaseGameCompletion,
+		"locked_ending": ai.AchievementSemanticBaseGameEnding, "dlc": ai.AchievementSemanticDLCEndingOrCompletion,
+		"meta": ai.AchievementSemanticMetaEndingCollection, "partial": ai.AchievementSemanticPartialProgress,
+		"optional": ai.AchievementSemanticOptionalChallenge, "other": ai.AchievementSemanticOther,
+		"unknown": ai.AchievementSemanticUnknown,
+	}
+	staged := make([]StagedClassification, 0, len(classes))
+	for apiName, class := range classes {
+		staged = append(staged, StagedClassification{APIName: apiName, DefinitionContentHash: definitionHashFor(t, db, gameID, apiName), Class: class, Source: ClassificationSourceOpenAI})
+	}
+	if _, err := repository.PublishClassificationGeneration(ctx, gameID, "semantic-model", ai.AchievementSemanticsPromptVersion, ai.AchievementSemanticsSchemaVersion, LexicalRuleVersion, change.DefinitionSetHash, staged, t0.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	projection, changed, err := repository.RebuildProjection(ctx, userID, gameID, "semantic-model", t0.Add(4*time.Hour))
+	if err != nil || !changed || projection.EndingCount != 2 || projection.Weight != 1.85 || projection.Basis != "ending" || !projection.CompletionAt.Equal(t0) {
+		t.Fatalf("projection=%+v changed=%v err=%v", projection, changed, err)
+	}
+	if _, changed, err := repository.RebuildProjection(ctx, userID, gameID, "semantic-model", t0.Add(5*time.Hour)); err != nil || changed {
+		t.Fatalf("replay changed=%v err=%v", changed, err)
+	}
+	var endingEvidence int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM user_game_completion_evidence WHERE user_id=$1 AND game_id=$2 AND kind='ending_marker'`, userID, gameID).Scan(&endingEvidence); err != nil {
+		t.Fatal(err)
+	}
+	if endingEvidence != 2 {
+		t.Fatalf("ending evidence=%d want=2", endingEvidence)
+	}
+}
+
+func TestRebuildProjectionPublishesNewHundredPercentWhileClassificationPending(t *testing.T) {
+	db := openCompletionStore(t)
+	ctx := context.Background()
+	userID, gameID := seedCompletionGame(t, db, nil)
+	repository, _ := NewSQLRepository(db)
+	t0 := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	initial := steam.AchievementSummary{Achievements: []steam.Achievement{
+		{APIName: "ending", Name: "Ending", Description: "Reach an ending", Achieved: true, UnlockedAt: t0},
+		{APIName: "optional", Name: "Optional", Description: "Find a token"},
+	}}
+	change, err := repository.SaveSteamSnapshot(ctx, userID, gameID, initial, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged := []StagedClassification{
+		{APIName: "ending", DefinitionContentHash: definitionHashFor(t, db, gameID, "ending"), Class: ai.AchievementSemanticBaseGameEnding, Source: ClassificationSourceLexical},
+		{APIName: "optional", DefinitionContentHash: definitionHashFor(t, db, gameID, "optional"), Class: ai.AchievementSemanticOptionalChallenge, Source: ClassificationSourceOpenAI},
+	}
+	if _, err := repository.PublishClassificationGeneration(ctx, gameID, "semantic-model", ai.AchievementSemanticsPromptVersion, ai.AchievementSemanticsSchemaVersion, LexicalRuleVersion, change.DefinitionSetHash, staged, t0); err != nil {
+		t.Fatal(err)
+	}
+	if projection, changed, err := repository.RebuildProjection(ctx, userID, gameID, "semantic-model", t0); err != nil || !changed || projection.Basis != "ending" {
+		t.Fatalf("initial projection=%+v changed=%v err=%v", projection, changed, err)
+	}
+	completed := initial
+	completed.Achievements = append([]steam.Achievement(nil), initial.Achievements...)
+	completed.Achievements[1].Description = "Changed optional text"
+	completed.Achievements[1].Achieved = true
+	completed.Achievements[1].UnlockedAt = t0.Add(time.Hour)
+	if _, err := repository.SaveSteamSnapshot(ctx, userID, gameID, completed, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	projection, changed, err := repository.RebuildProjection(ctx, userID, gameID, "semantic-model", t0.Add(2*time.Hour))
+	if err != nil || !changed || projection.Basis != "both" || !projection.HundredPercentBasis || projection.EndingCount != 1 || projection.Weight != 1.50 || !projection.CompletionAt.Equal(t0) {
+		t.Fatalf("pending projection=%+v changed=%v err=%v", projection, changed, err)
+	}
+}
+
+func makeAchievementSet(total, achieved int, unlockedAt time.Time) steam.AchievementSummary {
+	items := make([]steam.Achievement, total)
+	for index := range items {
+		items[index] = steam.Achievement{APIName: fmt.Sprintf("achievement_%02d", index), Name: fmt.Sprintf("Achievement %02d", index), Description: "Progress", Achieved: index < achieved}
+		if items[index].Achieved {
+			items[index].UnlockedAt = unlockedAt
+		}
+	}
+	return steam.AchievementSummary{Achievements: items}
+}
 
 func TestSaveSteamSnapshotAdvancesGenerationAndPreservesEverUnlocked(t *testing.T) {
 	db := openCompletionStore(t)

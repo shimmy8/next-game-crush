@@ -15,6 +15,8 @@ type SnapshotChange struct {
 
 const ClassificationJobKind = "achievement.classify"
 
+const ProjectionJobKind = "completion.project"
+
 const ClassificationJobPayloadVersion = 1
 
 type ClassificationSource string
@@ -34,6 +36,13 @@ type JobPayload struct {
 	Version           int       `json:"version"`
 	GameID            uuid.UUID `json:"game_id"`
 	DefinitionSetHash string    `json:"definition_set_hash"`
+}
+
+type ProjectionJobPayload struct {
+	Version        int       `json:"version"`
+	UserID         uuid.UUID `json:"user_id"`
+	GameID         uuid.UUID `json:"game_id"`
+	GenerationHash string    `json:"generation_hash"`
 }
 
 type StoredClassification struct {

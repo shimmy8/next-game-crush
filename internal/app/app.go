@@ -15,6 +15,7 @@ import (
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/auth"
 	"next-game-crush/internal/catalog"
+	"next-game-crush/internal/completion"
 	"next-game-crush/internal/config"
 	"next-game-crush/internal/feedback"
 	"next-game-crush/internal/httpapi"
@@ -100,6 +101,22 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("configure OpenAI client: %w", err)
 	}
+	completionRepository, err := completion.NewSQLRepository(db)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure completion repository: %w", err)
+	}
+	completionService, err := completion.NewService(completionRepository, openAIClient, cfg.OpenAIModel, queue)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure completion service: %w", err)
+	}
+	completionService.SetClassificationPublishedHook(completionService.EnqueueProjectionJobsForGame)
+	if err := completionService.RegisterHandlers(worker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register completion handlers: %w", err)
+	}
+	syncService.SetAchievementSnapshotRecorder(completionService)
 	aiService, err := ai.NewService(ai.NewSQLRepository(db), openAIClient, cfg.OpenAIModel, cfg.OpenAIEmbeddingModel)
 	if err != nil {
 		db.Close()
