@@ -51,8 +51,11 @@ func TestScorePreservesExplicitVersionOneWeights(t *testing.T) {
 }
 
 func TestEligibilityAndDeterministicTieBreak(t *testing.T) {
-	if Eligible(Candidate{Owned: true}) || Eligible(Candidate{Released: true}) || Eligible(Candidate{ExplicitlyHidden: true}) {
-		t.Fatal("owned, released, and explicitly hidden candidates must be excluded")
+	if Eligible(Candidate{Owned: true}) || Eligible(Candidate{ExplicitlyHidden: true}) {
+		t.Fatal("owned and explicitly hidden candidates must be excluded")
+	}
+	if !Eligible(Candidate{GameID: uuid.New(), Released: true}) {
+		t.Fatal("released candidates approved by current eligibility must remain rankable")
 	}
 	one := Recommendation{GameID: uuid.MustParse("00000000-0000-0000-0000-000000000001"), Name: "Zulu", Score: 50}
 	two := Recommendation{GameID: uuid.MustParse("00000000-0000-0000-0000-000000000002"), Name: "Alpha", Score: 50}

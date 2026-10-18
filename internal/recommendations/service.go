@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/jobs"
@@ -54,6 +56,8 @@ type Service struct {
 	explanationCache   ExplanationCache
 	explanationModel   string
 	deckRefreshPlanner DeckRefreshPlanner
+	eligibility        catalog.CurrentEligibilityReader
+	clock              func() time.Time
 }
 
 func (s *Service) SetQueue(queue *jobs.Queue)                       { s.queue = queue }
@@ -79,11 +83,11 @@ func (s *Service) SetExplanationCache(cache ExplanationCache, model string) {
 	s.explanationModel = strings.TrimSpace(model)
 }
 
-func NewService(repository Repository, profiles *profile.Service, explainer ExplanationClient) (*Service, error) {
-	if repository == nil || profiles == nil {
-		return nil, errors.New("recommendation repository and profile service are required")
+func NewService(repository Repository, profiles *profile.Service, explainer ExplanationClient, eligibility catalog.CurrentEligibilityReader, clock func() time.Time) (*Service, error) {
+	if repository == nil || profiles == nil || eligibility == nil || clock == nil {
+		return nil, errors.New("recommendation repository, profile service, eligibility reader, and clock are required")
 	}
-	return &Service{repository: repository, profiles: profiles, explainer: explainer, limit: 100}, nil
+	return &Service{repository: repository, profiles: profiles, explainer: explainer, eligibility: eligibility, clock: clock, limit: 100}, nil
 }
 func (s *Service) Rebuild(ctx context.Context, userID uuid.UUID) ([]Recommendation, error) {
 	items, _, _, err := s.rebuild(ctx, userID, uuid.NewString())
@@ -95,11 +99,30 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 	if err != nil {
 		return nil, 0, emptyStats, fmt.Errorf("load current profile: %w", err)
 	}
-	input, err := s.repository.RankingInputs(ctx, userID, p, s.limit)
+	// Eligibility must run before the presentation limit so expired rows cannot
+	// consume capacity that belongs to current candidates.
+	input, err := s.repository.RankingInputs(ctx, userID, p, 1000000)
 	if err != nil {
 		return nil, 0, emptyStats, fmt.Errorf("retrieve candidates: %w", err)
 	}
-	candidates := input.Candidates
+	allowed, err := s.eligibility.FilterEligibleGameIDs(ctx, candidateIDs(input.Candidates), s.clock().UTC())
+	if err != nil {
+		return nil, 0, emptyStats, fmt.Errorf("filter current catalog eligibility: %w", err)
+	}
+	candidates := make([]Candidate, 0, len(input.Candidates))
+	nonWishlist := 0
+	for _, candidate := range input.Candidates {
+		if !allowed[candidate.GameID] {
+			continue
+		}
+		if candidate.Factors.Wishlist != 1 && nonWishlist >= s.limit {
+			continue
+		}
+		candidates = append(candidates, candidate)
+		if candidate.Factors.Wishlist != 1 {
+			nonWishlist++
+		}
+	}
 	weights := DefaultWeights()
 	output := make([]Recommendation, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -236,17 +259,47 @@ func (s *Service) Latest(ctx context.Context, userID uuid.UUID) ([]Recommendatio
 	if err != nil {
 		return nil, err
 	}
-	for i := range items {
-		items[i] = safePresentation(items[i])
+	allowed, err := s.eligibility.FilterEligibleGameIDs(ctx, recommendationGameIDs(items), s.clock().UTC())
+	if err != nil {
+		return nil, err
 	}
-	return items, nil
+	filtered := make([]Recommendation, 0, len(items))
+	for i := range items {
+		if allowed[items[i].GameID] {
+			filtered = append(filtered, safePresentation(items[i]))
+		}
+	}
+	return filtered, nil
 }
 func (s *Service) Get(ctx context.Context, userID, id uuid.UUID) (Recommendation, error) {
 	item, err := s.repository.Get(ctx, userID, id)
 	if err != nil {
 		return Recommendation{}, err
 	}
+	eligible, err := s.eligibility.Eligible(ctx, item.GameID, s.clock().UTC())
+	if err != nil {
+		return Recommendation{}, err
+	}
+	if !eligible {
+		return Recommendation{}, pgx.ErrNoRows
+	}
 	return safePresentation(item), nil
+}
+
+func candidateIDs(items []Candidate) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.GameID)
+	}
+	return ids
+}
+
+func recommendationGameIDs(items []Recommendation) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.GameID)
+	}
+	return ids
 }
 func Explain(ctx context.Context, client ExplanationClient, name string, selected []GroundingEvidence) ExplanationResult {
 	selected = SelectGroundingEvidence(selected)

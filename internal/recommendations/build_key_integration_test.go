@@ -247,7 +247,7 @@ func historicalRankingFixture(t *testing.T, failExplanation bool) (*Service, his
 	if failExplanation {
 		rankingRepo = failingExplanationRepository{repo}
 	}
-	service, err := NewService(rankingRepo, profiles, nil)
+	service, err := NewService(rankingRepo, profiles, nil, allowAllCurrentEligibility{}, recommendationTestClock)
 	if err != nil {
 		t.Fatal(err)
 	}

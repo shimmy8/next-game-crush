@@ -44,7 +44,7 @@ func TestDisableWorkflowReranksAndDiffPinsItsVersion(t *testing.T) {
 	profilesRepo, _ := profile.NewSQLRepository(db, "embed")
 	profiles, _ := profile.NewService(profilesRepo)
 	rankingRepo, _ := recommendations.NewSQLRepository(db, "embed", "text")
-	ranking, _ := recommendations.NewService(rankingRepo, profiles, nil)
+	ranking, _ := recommendations.NewService(rankingRepo, profiles, nil, allowAllFeedbackEligibility{}, feedbackTestClock)
 	queue := jobs.NewQueue(db)
 	ranking.SetQueue(queue)
 	items, err := ranking.Rebuild(ctx, user)

@@ -11,18 +11,23 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/store"
 )
 
 var ErrDeliveryOwned = errors.New("delivery is already owned by another attempt")
 
-type SQLRepository struct{ store *store.Store }
+type SQLRepository struct {
+	store       *store.Store
+	eligibility catalog.CurrentEligibilityReader
+	clock       func() time.Time
+}
 
-func NewSQLRepository(db *store.Store) (*SQLRepository, error) {
-	if db == nil || db.Pool == nil {
-		return nil, errors.New("notification store is required")
+func NewSQLRepository(db *store.Store, eligibility catalog.CurrentEligibilityReader, clock func() time.Time) (*SQLRepository, error) {
+	if db == nil || db.Pool == nil || eligibility == nil || clock == nil {
+		return nil, errors.New("notification store, eligibility reader, and clock are required")
 	}
-	return &SQLRepository{store: db}, nil
+	return &SQLRepository{store: db, eligibility: eligibility, clock: clock}, nil
 }
 
 func (r *SQLRepository) DigestInput(ctx context.Context, userID uuid.UUID) (DigestInput, error) {
@@ -64,6 +69,7 @@ func (r *SQLRepository) DigestInput(ctx context.Context, userID uuid.UUID) (Dige
 	if err != nil {
 		return DigestInput{}, err
 	}
+	var recommendationCandidates []DigestRecommendation
 	for rows.Next() {
 		var item DigestRecommendation
 		var precision *string
@@ -74,24 +80,39 @@ func (r *SQLRepository) DigestInput(ctx context.Context, userID uuid.UUID) (Dige
 			return DigestInput{}, err
 		}
 		item.Release = formatRelease(precision, date, raw)
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%.6f\x00%s\x00%s", item.GameID, item.Name, item.Score, item.Explanation, item.Release)))
-		item.ContentHash = hex.EncodeToString(h[:])
-		if !sent[item.GameID][item.ContentHash] && len(input.Recommendations) < 5 {
-			input.Recommendations = append(input.Recommendations, item)
-		}
+		recommendationCandidates = append(recommendationCandidates, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return DigestInput{}, err
 	}
 	rows.Close()
+	recommendationIDs := make([]uuid.UUID, 0, len(recommendationCandidates))
+	for _, item := range recommendationCandidates {
+		recommendationIDs = append(recommendationIDs, item.GameID)
+	}
+	allowed, err := r.eligibility.FilterEligibleGameIDs(ctx, recommendationIDs, r.clock().UTC())
+	if err != nil {
+		return DigestInput{}, err
+	}
+	for _, item := range recommendationCandidates {
+		if !allowed[item.GameID] {
+			continue
+		}
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%.6f\x00%s\x00%s", item.GameID, item.Name, item.Score, item.Explanation, item.Release)))
+		item.ContentHash = hex.EncodeToString(h[:])
+		if !sent[item.GameID][item.ContentHash] && len(input.Recommendations) < 5 {
+			input.Recommendations = append(input.Recommendations, item)
+		}
+	}
 	rows, err = r.store.Pool.Query(ctx, `SELECT g.id,g.name,d.precision,d.release_date,d.raw_text FROM wishlist_entries w JOIN games g ON g.id=w.game_id
 		LEFT JOIN LATERAL (SELECT precision,release_date,raw_text FROM game_release_dates WHERE game_id=g.id ORDER BY observed_at DESC,id DESC LIMIT 1) d ON true
-		WHERE w.user_id=$1 AND (d.release_date IS NULL OR d.release_date>=CURRENT_DATE) ORDER BY d.release_date NULLS LAST,lower(g.name),g.id LIMIT 10`, userID)
+		WHERE w.user_id=$1 ORDER BY d.release_date NULLS LAST,lower(g.name),g.id`, userID)
 	if err != nil {
 		return DigestInput{}, err
 	}
 	defer rows.Close()
+	var wishlistCandidates []DigestWishlist
 	for rows.Next() {
 		var item DigestWishlist
 		var precision *string
@@ -101,9 +122,25 @@ func (r *SQLRepository) DigestInput(ctx context.Context, userID uuid.UUID) (Dige
 			return DigestInput{}, err
 		}
 		item.Release = formatRelease(precision, date, raw)
-		input.Wishlist = append(input.Wishlist, item)
+		wishlistCandidates = append(wishlistCandidates, item)
 	}
-	return input, rows.Err()
+	if err := rows.Err(); err != nil {
+		return DigestInput{}, err
+	}
+	wishlistIDs := make([]uuid.UUID, 0, len(wishlistCandidates))
+	for _, item := range wishlistCandidates {
+		wishlistIDs = append(wishlistIDs, item.GameID)
+	}
+	allowed, err = r.eligibility.FilterEligibleGameIDs(ctx, wishlistIDs, r.clock().UTC())
+	if err != nil {
+		return DigestInput{}, err
+	}
+	for _, item := range wishlistCandidates {
+		if allowed[item.GameID] && len(input.Wishlist) < 10 {
+			input.Wishlist = append(input.Wishlist, item)
+		}
+	}
+	return input, nil
 }
 
 func formatRelease(precision *string, date *time.Time, raw *string) string {

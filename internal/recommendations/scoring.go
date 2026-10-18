@@ -29,7 +29,7 @@ func Score(f Factors, w Weights) Result {
 	return Result{Score: math.Round(raw*1000) / 1000, SemanticAffinity: affinity}
 }
 func Eligible(candidate Candidate) bool {
-	return candidate.GameID != uuidNil && !candidate.Owned && !candidate.Released && !candidate.ExplicitlyHidden && !candidate.ExcludedByLatestDirectAction
+	return candidate.GameID != uuidNil && !candidate.Owned && !candidate.ExplicitlyHidden && !candidate.ExcludedByLatestDirectAction
 }
 func Sort(input []Recommendation) []Recommendation {
 	result := append([]Recommendation(nil), input...)

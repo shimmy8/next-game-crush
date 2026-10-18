@@ -160,7 +160,7 @@ func TestOverviewCatalogStatusMapping(t *testing.T) {
 		}
 	}
 	repo := &overviewRankingReader{}
-	service := &Service{repository: repo}
+	service := &Service{repository: repo, eligibility: allowAllCurrentEligibility{}, clock: recommendationTestClock}
 	owner := uuid.New()
 	got, err := service.Overview(context.Background(), owner)
 	if err != nil || got.CatalogStatus.Status != "disabled" {

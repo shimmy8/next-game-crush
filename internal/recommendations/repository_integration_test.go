@@ -85,13 +85,13 @@ func TestRebuildRetrievesSemanticAndWishlistCandidatesAndPersistsFactors(t *test
 		t.Fatalf("retry profiles=%#v %#v err=%v", retryOne, retryTwo, err)
 	}
 	repo, _ := NewSQLRepository(db, "embed", "text")
-	service, _ := NewService(repo, profiles, fakeExplanationClient{err: ai.ErrRefusal})
+	service, _ := NewService(repo, profiles, fakeExplanationClient{err: ai.ErrRefusal}, allowAllCurrentEligibility{}, recommendationTestClock)
 	items, err := service.Rebuild(ctx, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 2 {
-		t.Fatalf("recommendations=%d (%#v), want semantic and wishlist", len(items), items)
+	if len(items) != 3 {
+		t.Fatalf("recommendations=%d (%#v), want semantic, released, and wishlist", len(items), items)
 	}
 	for _, item := range items {
 		if item.AlgorithmVersion != AlgorithmVersion || item.Explanation == "" || item.GeneratedExplanation {
@@ -102,23 +102,117 @@ func TestRebuildRetrievesSemanticAndWishlistCandidatesAndPersistsFactors(t *test
 		t.Fatal("structured feature affinity was not computed")
 	}
 	var factors int
-	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM recommendation_factors`).Scan(&factors); err != nil || factors != 2 {
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM recommendation_factors`).Scan(&factors); err != nil || factors != 3 {
 		t.Fatalf("factor rows=%d err=%v", factors, err)
 	}
 	calendar := BuildCalendar(items)
-	if len(calendar.ExactDates) != 1 || len(calendar.Month) != 1 {
+	if len(calendar.ExactDates) != 2 || len(calendar.Month) != 1 {
 		t.Fatalf("calendar=%#v", calendar)
 	}
 	second, err := service.Rebuild(ctx, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(second) != 2 || second[0].RankingVersion != 2 {
+	if len(second) != 3 || second[0].RankingVersion != 2 {
 		t.Fatalf("second ranking=%#v", second)
 	}
 	latest, err := service.Latest(ctx, userID)
-	if err != nil || len(latest) != 2 || latest[0].RankingVersion != 2 || len(latest[0].Evidence) == 0 || latest[0].Evidence[0].Text == "" {
+	if err != nil || len(latest) != 3 || latest[0].RankingVersion != 2 || len(latest[0].Evidence) == 0 || latest[0].Evidence[0].Text == "" {
 		t.Fatalf("latest=%#v err=%v", latest, err)
+	}
+}
+
+func TestReviewsAndPopularityNeverChangeDeterministicScoreOrBuildIdentity(t *testing.T) {
+	db := openRankingStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	userID, profileID := uuid.New(), uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,created_at) VALUES($1,$2,1,$3)`, profileID, userID, now); err != nil {
+		t.Fatal(err)
+	}
+	ids := []uuid.UUID{uuid.New(), uuid.New()}
+	for index, id := range ids {
+		appID := int64(94001 + index)
+		name := []string{"Alpha Semantic", "Beta Semantic"}[index]
+		snapshot := fmt.Sprintf(`{"AppID":%d,"Type":"game","Name":"%s","ReleaseDate":{"ComingSoon":false,"Raw":"18 Oct 2026"}}`, appID, name)
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at,source_snapshot) VALUES($1,$2,$3,'steam_store',$4,$5)`, id, appID, name, now, snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO catalog_entries(game_id,origin) VALUES($1,'seed')`, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO game_release_dates(id,game_id,precision,release_date,raw_text,observed_at,source,last_successful_fetch_at) VALUES($1,$2,'day',$3,'18 Oct 2026',$4,'steam_store',$4)`, uuid.New(), id, now, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,coming_soon,precision,release_date,review_band,review_label,positive_percent,review_total,review_observed_at,last_successful_appdetails_at,active) VALUES($1,1,1,false,'day',$2,$3,$4,$5,$6,$7,$8,true)`, appID, now, []string{"positive", "mixed_or_below"}[index], []string{"Very Positive", "Mixed"}[index], []int{91, 55}[index], []int64{1284, 50000}[index], now.Add(time.Duration(index)*time.Hour), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO catalog_search_memberships(feed,steam_app_id,published_run_revision,active) VALUES('popular_new',94001,1,true),('popular_upcoming',94001,1,true)`); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := NewSQLRepository(db, "embed", "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.now = func() time.Time { return now }
+	p := profile.Profile{ID: profileID, UserID: userID, Version: 1, CreatedAt: now}
+	read := func() ([]Candidate, []Recommendation) {
+		input, err := repo.RankingInputs(ctx, userID, p, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]Recommendation, 0, len(input.Candidates))
+		for _, c := range input.Candidates {
+			scored := Score(c.Factors, DefaultWeights())
+			out = append(out, Recommendation{GameID: c.GameID, Name: c.Name, ProfileVersion: 1, AlgorithmVersion: AlgorithmVersion, Score: scored.Score, Factors: c.Factors, Weights: DefaultWeights()})
+		}
+		return input.Candidates, Sort(out)
+	}
+	beforeCandidates, before := read()
+	if len(beforeCandidates) != 2 || beforeCandidates[0].Factors != beforeCandidates[1].Factors || before[0].Score != before[1].Score {
+		t.Fatalf("metadata affected initial factors/score: %#v %#v", beforeCandidates, before)
+	}
+	key := RankingBuildKey("semantic-request", AlgorithmVersion, ActiveAdjustmentsDigest(nil))
+	saved, version, _, err := repo.SaveRanking(ctx, userID, p, before, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range saved {
+		if err := repo.SaveExplanation(ctx, userID, version, key, item.ID, item.Name, ExplanationRecord{
+			Text: neutralExplanation, Source: ExplanationSourceNone, Supplied: []GroundingEvidence{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.PublishRanking(ctx, userID, version, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE catalog_search_current SET review_band=CASE steam_app_id WHEN 94001 THEN 'unrated' ELSE 'positive' END,review_label=CASE steam_app_id WHEN 94001 THEN 'No user reviews' ELSE 'Positive' END,positive_percent=CASE steam_app_id WHEN 94001 THEN NULL ELSE 88 END,review_total=CASE steam_app_id WHEN 94001 THEN 0 ELSE 999999 END,review_observed_at=$1 WHERE steam_app_id IN (94001,94002)`, now.Add(48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `DELETE FROM catalog_search_memberships WHERE steam_app_id=94001`); err != nil {
+		t.Fatal(err)
+	}
+	afterCandidates, after := read()
+	if len(afterCandidates) != len(beforeCandidates) || len(after) != len(before) {
+		t.Fatalf("review/popularity changed ranking inputs: before=%#v/%#v after=%#v/%#v", beforeCandidates, before, afterCandidates, after)
+	}
+	for index := range before {
+		if afterCandidates[index].Factors != beforeCandidates[index].Factors || after[index].GameID != before[index].GameID || after[index].Factors != before[index].Factors || after[index].Weights != before[index].Weights || after[index].Score != before[index].Score {
+			t.Fatalf("review/popularity changed factors, weights, score, or order at %d: before=%#v/%#v after=%#v/%#v", index, beforeCandidates[index], before[index], afterCandidates[index], after[index])
+		}
+	}
+	_, replayVersion, published, err := repo.SaveRanking(ctx, userID, p, after, key)
+	if err != nil || !published || replayVersion != version {
+		t.Fatalf("build replay version=%d/%d published=%v err=%v", replayVersion, version, published, err)
+	}
+	var storedKey string
+	if err := db.Pool.QueryRow(ctx, `SELECT build_key FROM recommendation_runs WHERE user_id=$1 AND ranking_version=$2`, userID, version).Scan(&storedKey); err != nil || storedKey != key {
+		t.Fatalf("build key=%q want=%q err=%v", storedKey, key, err)
 	}
 }
 
@@ -553,7 +647,7 @@ func TestLatestAndGetExposeSteamPresentation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := NewService(repo, profiles, nil)
+	service, err := NewService(repo, profiles, nil, allowAllCurrentEligibility{}, recommendationTestClock)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -176,11 +176,17 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("configure recommendation repository: %w", err)
 	}
-	if err := recommendationRepository.SetHorizonDays(cfg.CatalogDiscovery.HorizonDays); err != nil {
+	if err := recommendationRepository.SetWindowDays(cfg.CatalogDiscovery.LookbackDays, cfg.CatalogDiscovery.HorizonDays); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("configure recommendation horizon: %w", err)
+		return nil, fmt.Errorf("configure recommendation window: %w", err)
 	}
-	recommendationService, err := recommendations.NewService(recommendationRepository, profileService, openAIClient)
+	eligibilityRepository := catalog.NewEligibilityRepository(db)
+	if err := eligibilityRepository.SetWindowDays(cfg.CatalogDiscovery.LookbackDays, cfg.CatalogDiscovery.HorizonDays); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure current eligibility: %w", err)
+	}
+	sharedClock := func() time.Time { return time.Now().UTC() }
+	recommendationService, err := recommendations.NewService(recommendationRepository, profileService, openAIClient, eligibilityRepository, sharedClock)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure recommendation service: %w", err)
@@ -220,7 +226,7 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("register preference handlers: %w", err)
 	}
-	notificationRepository, err := notifications.NewSQLRepository(db)
+	notificationRepository, err := notifications.NewSQLRepository(db, eligibilityRepository, sharedClock)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure notification repository: %w", err)

@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/ai"
@@ -14,6 +15,21 @@ import (
 	"next-game-crush/internal/recommendations"
 	"next-game-crush/internal/store"
 )
+
+type allowAllFeedbackEligibility struct{}
+
+func (allowAllFeedbackEligibility) Eligible(context.Context, uuid.UUID, time.Time) (bool, error) {
+	return true, nil
+}
+func (allowAllFeedbackEligibility) FilterEligibleGameIDs(_ context.Context, ids []uuid.UUID, _ time.Time) (map[uuid.UUID]bool, error) {
+	result := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func feedbackTestClock() time.Time { return time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC) }
 
 func TestFeedbackReranksCollectionsAndExcludesOnlyCurrentDislike(t *testing.T) {
 	fixture := newPresentationAcceptanceFixture(t)
@@ -231,7 +247,7 @@ func newPresentationAcceptanceFixture(t *testing.T) presentationAcceptanceFixtur
 	if err != nil {
 		t.Fatal(err)
 	}
-	ranking, err := recommendations.NewService(rankingRepo, profiles, nil)
+	ranking, err := recommendations.NewService(rankingRepo, profiles, nil, allowAllFeedbackEligibility{}, feedbackTestClock)
 	if err != nil {
 		t.Fatal(err)
 	}

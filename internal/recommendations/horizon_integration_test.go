@@ -58,21 +58,60 @@ func TestCandidatesConfiguredHorizon(t *testing.T) {
 			}
 		}
 	}
-	// The constructor retains 90 days; wishlist bypasses both horizon and limit.
-	assertCandidates(1, day90, wishlist)
+	// Source membership never bypasses the current release window.
+	assertCandidates(1, day90)
 	if err := repository.SetHorizonDays(120); err != nil {
 		t.Fatal(err)
 	}
-	assertCandidates(10, day90, day91, wishlist)
+	assertCandidates(10, day90, day91)
 	for _, invalid := range []int{-1, 0, 367} {
 		if err := repository.SetHorizonDays(invalid); err == nil {
 			t.Fatalf("accepted invalid horizon %d", invalid)
 		}
 	}
-	assertCandidates(10, day90, day91, wishlist)
+	assertCandidates(10, day90, day91)
 	for _, boundary := range []int{1, 366} {
 		if err := repository.SetHorizonDays(boundary); err != nil {
 			t.Fatalf("rejected valid horizon %d: %v", boundary, err)
 		}
+	}
+}
+
+func TestCandidatesIncludeQualifiedReleasedLookback(t *testing.T) {
+	db := openRankingStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	userID := uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	boundary := insertRankingGame(t, db, 9110, "Released Boundary")
+	tooOld := insertRankingGame(t, db, 9111, "Released Too Old")
+	for _, entry := range []struct {
+		id   uuid.UUID
+		days int
+	}{{boundary, -30}, {tooOld, -31}} {
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO catalog_entries(game_id,origin) VALUES($1,'seed')`, entry.id); err != nil {
+			t.Fatal(err)
+		}
+		date := now.AddDate(0, 0, entry.days)
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO game_release_dates(id,game_id,precision,release_date,raw_text,observed_at,source,last_successful_fetch_at) VALUES($1,$2,'day',$3,$4,$5,'test',$5)`, uuid.New(), entry.id, date, date.Format(time.DateOnly), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repository, err := NewSQLRepository(db, "embed", "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository.now = func() time.Time { return now }
+	if err := repository.SetWindowDays(30, 30); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repository.Candidates(ctx, userID, profile.Profile{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].GameID != boundary || !got[0].Released {
+		t.Fatalf("released candidates=%#v", got)
 	}
 }

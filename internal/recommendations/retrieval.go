@@ -28,6 +28,7 @@ type SQLRepository struct {
 	store                     *store.Store
 	embeddingModel, textModel string
 	now                       func() time.Time
+	lookbackDays              int
 	horizonDays               int
 }
 
@@ -39,16 +40,25 @@ func NewSQLRepository(database *store.Store, embeddingModel, textModel string) (
 	if database == nil || strings.TrimSpace(embeddingModel) == "" {
 		return nil, errors.New("recommendation store and embedding model are required")
 	}
-	return &SQLRepository{store: database, embeddingModel: embeddingModel, textModel: textModel, now: time.Now, horizonDays: 90}, nil
+	return &SQLRepository{store: database, embeddingModel: embeddingModel, textModel: textModel, now: time.Now, lookbackDays: 30, horizonDays: 90}, nil
 }
 
-// SetHorizonDays configures shared candidate retrieval before the repository is used.
-// Wishlist candidates remain mandatory regardless of this horizon.
+// SetHorizonDays configures the future side of the shared release window.
+// Wishlist candidates remain subject to that window; they only bypass the
+// non-wishlist result cap after admission.
 func (r *SQLRepository) SetHorizonDays(days int) error {
 	if days < 1 || days > 366 {
 		return errors.New("recommendation horizon must be between 1 and 366 days")
 	}
 	r.horizonDays = days
+	return nil
+}
+
+func (r *SQLRepository) SetWindowDays(lookbackDays, horizonDays int) error {
+	if lookbackDays < 1 || lookbackDays > 366 || horizonDays < 1 || horizonDays > 366 {
+		return errors.New("recommendation windows must be between 1 and 366 days")
+	}
+	r.lookbackDays, r.horizonDays = lookbackDays, horizonDays
 	return nil
 }
 
@@ -79,12 +89,8 @@ LEFT JOIN latest_direct ld ON ld.game_id=g.id
 LEFT JOIN current_release cr ON cr.game_id=g.id
 WHERE NOT COALESCE(
 	jsonb_typeof(g.source_snapshot->'AppID')='number' AND g.source_snapshot->>'AppID'=g.steam_app_id::text
-	AND jsonb_typeof(g.source_snapshot->'Name')='string' AND btrim(g.source_snapshot->>'Name')<>''
 	AND jsonb_typeof(g.source_snapshot->'Type')='string' AND btrim(g.source_snapshot->>'Type')<>''
-	AND jsonb_typeof(g.source_snapshot->'ReleaseDate'->'ComingSoon')='boolean'
-	AND jsonb_typeof(g.source_snapshot->'ReleaseDate'->'Raw')='string'
-	AND (g.source_snapshot->'ReleaseDate'->>'ComingSoon'='true' OR btrim(g.source_snapshot->'ReleaseDate'->>'Raw')<>'')
-	AND (g.source_snapshot->'ReleaseDate'->>'ComingSoon'='false' OR lower(btrim(g.source_snapshot->>'Type'))<>'game'),false)
+	AND lower(btrim(g.source_snapshot->>'Type'))<>'game',false)
 	AND %s ORDER BY %s LIMIT $3`
 
 func (r *SQLRepository) Candidates(ctx context.Context, userID uuid.UUID, p profile.Profile, limit int) ([]Candidate, error) {
@@ -153,7 +159,7 @@ func (r *SQLRepository) candidates(ctx context.Context, tx pgx.Tx, userID uuid.U
 	byID := map[uuid.UUID]Candidate{}
 	asOf := r.now().UTC()
 	semantic := hasVector(p.Positive)
-	base := "ug.game_id IS NULL AND NOT (COALESCE(cr.precision,'unknown')='day' AND cr.release_date<CURRENT_DATE)"
+	base := "ug.game_id IS NULL"
 	condition, order := base, `lower(g.name) COLLATE "C",g.name COLLATE "C",g.id`
 	args := []any{userID, r.embeddingModel, 1000000}
 	if semantic {
@@ -182,7 +188,7 @@ func (r *SQLRepository) candidates(ctx context.Context, tx pgx.Tx, userID uuid.U
 	result := make([]Candidate, 0, len(byID))
 	nonWishlist := 0
 	for _, candidate := range ordered {
-		if Eligible(candidate) && (candidate.Factors.Wishlist == 1 || withinHorizon(candidate.Release, asOf, r.horizonDays)) {
+		if Eligible(candidate) && withinReleaseWindow(candidate.Release, asOf, r.lookbackDays, r.horizonDays) {
 			if candidate.Factors.Wishlist == 1 || nonWishlist < limit {
 				result = append(result, candidate)
 				if candidate.Factors.Wishlist != 1 {
@@ -202,6 +208,26 @@ func (r *SQLRepository) candidates(ctx context.Context, tx pgx.Tx, userID uuid.U
 		return result[i].GameID.String() < result[j].GameID.String()
 	})
 	return result, nil
+}
+
+func withinReleaseWindow(window ReleaseWindow, now time.Time, lookbackDays, horizonDays int) bool {
+	if window.Precision == "day" && window.ExactDate != "" {
+		date, err := time.Parse(time.DateOnly, window.ExactDate)
+		if err != nil {
+			return false
+		}
+		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		return !date.Before(today.AddDate(0, 0, -lookbackDays)) && !date.After(today.AddDate(0, 0, horizonDays))
+	}
+	parsed := catalog.ParseReleaseDate(window.Raw, now)
+	start, end, known := parsed.Interval()
+	if !known {
+		// Coarse year/Coming Soon/TBA admission is decided by the shared
+		// provenance-aware eligibility reader.
+		return true
+	}
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	return !end.Before(today.AddDate(0, 0, -lookbackDays)) && !start.After(today.AddDate(0, 0, horizonDays))
 }
 
 func (r *SQLRepository) ExplanationCorpus(ctx context.Context, userID uuid.UUID, gameIDs []uuid.UUID) (EvidenceCorpus, error) {
@@ -584,25 +610,6 @@ func releaseWindowEnded(window ReleaseWindow, now time.Time) bool {
 		return false
 	}
 }
-func withinHorizon(window ReleaseWindow, now time.Time, days int) bool {
-	if window.Precision == "day" && window.ExactDate != "" {
-		date, err := time.Parse(time.DateOnly, window.ExactDate)
-		return err == nil && !date.After(now.AddDate(0, 0, days))
-	}
-	parsed := catalog.ParseReleaseDate(window.Raw, now)
-	end := now.AddDate(0, 0, days)
-	switch parsed.Precision {
-	case catalog.PrecisionMonth:
-		return parsed.Year < end.Year() || parsed.Year == end.Year() && parsed.Month <= end.Month()
-	case catalog.PrecisionQuarter:
-		return parsed.Year < end.Year() || parsed.Year == end.Year() && parsed.Quarter <= ((int(end.Month())-1)/3+1)
-	case catalog.PrecisionYear:
-		return parsed.Year <= end.Year()
-	default:
-		return true
-	}
-}
-
 func (r *SQLRepository) SaveRanking(ctx context.Context, userID uuid.UUID, p profile.Profile, input []Recommendation, buildKey string) ([]Recommendation, int64, bool, error) {
 	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {

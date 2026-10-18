@@ -53,7 +53,7 @@ func TestCandidatesIncludeWishlistWithoutCatalogProjection(t *testing.T) {
 		for _, c := range got {
 			counts[c.GameID]++
 		}
-		if counts[wish] != 1 || counts[foreign] != 0 || counts[shared] != 1 || counts[released] != 0 || counts[nonGame] != 0 || counts[malformed] != 1 {
+		if counts[wish] != 1 || counts[foreign] != 0 || counts[shared] != 1 || counts[released] != 1 || counts[nonGame] != 0 || counts[malformed] != 1 {
 			t.Fatalf("candidate union lost, leaked, duplicated or admitted invalid membership: %v", counts)
 		}
 	}

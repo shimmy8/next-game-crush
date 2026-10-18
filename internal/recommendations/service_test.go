@@ -8,10 +8,100 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/ai"
 )
+
+type allowAllCurrentEligibility struct{}
+
+func (allowAllCurrentEligibility) Eligible(context.Context, uuid.UUID, time.Time) (bool, error) {
+	return true, nil
+}
+
+func (allowAllCurrentEligibility) FilterEligibleGameIDs(_ context.Context, ids []uuid.UUID, _ time.Time) (map[uuid.UUID]bool, error) {
+	result := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
+
+func recommendationTestClock() time.Time {
+	return time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+}
+
+type selectiveCurrentEligibility struct {
+	allowed map[uuid.UUID]bool
+	err     error
+}
+
+func (r selectiveCurrentEligibility) Eligible(_ context.Context, id uuid.UUID, _ time.Time) (bool, error) {
+	return r.allowed[id], r.err
+}
+
+func (r selectiveCurrentEligibility) FilterEligibleGameIDs(_ context.Context, ids []uuid.UUID, _ time.Time) (map[uuid.UUID]bool, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	result := map[uuid.UUID]bool{}
+	for _, id := range ids {
+		if r.allowed[id] {
+			result[id] = true
+		}
+	}
+	return result, nil
+}
+
+type currentEligibilityReadRepository struct {
+	Repository
+	items []Recommendation
+}
+
+func (r currentEligibilityReadRepository) Latest(context.Context, uuid.UUID) ([]Recommendation, error) {
+	return append([]Recommendation(nil), r.items...), nil
+}
+
+func (r currentEligibilityReadRepository) Get(_ context.Context, _ uuid.UUID, id uuid.UUID) (Recommendation, error) {
+	for _, item := range r.items {
+		if item.ID == id {
+			return item, nil
+		}
+	}
+	return Recommendation{}, pgx.ErrNoRows
+}
+
+func TestCurrentEligibilityProtectsEveryDeliveryPath(t *testing.T) {
+	eligibleGame, expiredGame := uuid.New(), uuid.New()
+	eligibleRecommendation, expiredRecommendation := uuid.New(), uuid.New()
+	repo := currentEligibilityReadRepository{items: []Recommendation{
+		{ID: eligibleRecommendation, GameID: eligibleGame, Name: "Eligible", Release: ReleaseWindow{Precision: "day", ExactDate: "2026-10-18"}},
+		{ID: expiredRecommendation, GameID: expiredGame, Name: "Expired", Release: ReleaseWindow{Precision: "day", ExactDate: "2026-10-10"}},
+	}}
+	service := &Service{repository: repo, eligibility: selectiveCurrentEligibility{allowed: map[uuid.UUID]bool{eligibleGame: true}}, clock: recommendationTestClock}
+
+	latest, err := service.Latest(context.Background(), uuid.New())
+	if err != nil || len(latest) != 1 || latest[0].GameID != eligibleGame {
+		t.Fatalf("latest=%#v err=%v", latest, err)
+	}
+	overview, err := service.Overview(context.Background(), uuid.New())
+	if err != nil || overview.Discoveries.Total != 1 || len(overview.Calendar.ExactDates) != 1 {
+		t.Fatalf("overview=%#v err=%v", overview, err)
+	}
+	if _, err := service.Get(context.Background(), uuid.New(), expiredRecommendation); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("expired detail err=%v", err)
+	}
+	if len(repo.items) != 2 {
+		t.Fatal("read-time gate mutated historical ranking rows")
+	}
+
+	service.eligibility = selectiveCurrentEligibility{err: errors.New("eligibility unavailable")}
+	if _, err := service.Latest(context.Background(), uuid.New()); err == nil {
+		t.Fatal("eligibility failure did not fail closed")
+	}
+}
 
 func TestClassifyExplanationFailure(t *testing.T) {
 	tests := []struct {

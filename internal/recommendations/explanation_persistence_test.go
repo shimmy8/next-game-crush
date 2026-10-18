@@ -73,7 +73,7 @@ func TestRebuildExplanationMixedOutcomesPublishAtomically(t *testing.T) {
 	}
 	repo.now = func() time.Time { return now }
 	client := mixedExplanationClient{}
-	service, err := NewService(repo, profiles, client)
+	service, err := NewService(repo, profiles, client, allowAllCurrentEligibility{}, recommendationTestClock)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,6 +2,7 @@ package notifications
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -13,6 +14,89 @@ import (
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/store"
 )
+
+type allowAllNotificationEligibility struct{}
+
+func (allowAllNotificationEligibility) Eligible(context.Context, uuid.UUID, time.Time) (bool, error) {
+	return true, nil
+}
+
+type selectiveNotificationEligibility struct {
+	allowed map[uuid.UUID]bool
+	err     error
+}
+
+func (r selectiveNotificationEligibility) Eligible(_ context.Context, id uuid.UUID, _ time.Time) (bool, error) {
+	return r.allowed[id], r.err
+}
+func (r selectiveNotificationEligibility) FilterEligibleGameIDs(_ context.Context, ids []uuid.UUID, _ time.Time) (map[uuid.UUID]bool, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	result := map[uuid.UUID]bool{}
+	for _, id := range ids {
+		if r.allowed[id] {
+			result[id] = true
+		}
+	}
+	return result, nil
+}
+
+func TestCurrentEligibilityProtectsDigestInputBeforeLimits(t *testing.T) {
+	db := openNotificationStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	userID, profileID := uuid.New(), uuid.New()
+	eligible, expired := uuid.New(), uuid.New()
+	setup := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO users(id) VALUES($1)`, []any{userID}},
+		{`INSERT INTO steam_accounts(user_id,steam_id,display_name) VALUES($1,'76561198000000001','Player')`, []any{userID}},
+		{`INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, []any{profileID, userID}},
+		{`INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key,published) VALUES($1,$2,$3,1,'ranking-v1','eligibility-digest',true)`, []any{uuid.New(), userID, profileID}},
+	}
+	for _, statement := range setup {
+		if _, err := db.Pool.Exec(ctx, statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index, gameID := range []uuid.UUID{expired, eligible} {
+		appID := int64(93001 + index)
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,$2,$3,'test',$4)`, gameID, appID, fmt.Sprintf("Game %d", index), now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO wishlist_entries(user_id,game_id,source,last_successful_fetch_at) VALUES($1,$2,'test',$3)`, userID, gameID, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score,ranking_version) VALUES($1,$2,$3,$4,'ranking-v1',$5,1)`, uuid.New(), userID, gameID, profileID, 100-index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repo, err := NewSQLRepository(db, selectiveNotificationEligibility{allowed: map[uuid.UUID]bool{eligible: true}}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := repo.DigestInput(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(input.Recommendations) != 1 || input.Recommendations[0].GameID != eligible || len(input.Wishlist) != 1 || input.Wishlist[0].GameID != eligible {
+		t.Fatalf("digest leaked ineligible rows: %#v", input)
+	}
+	repo.eligibility = selectiveNotificationEligibility{err: errors.New("eligibility unavailable")}
+	if _, err := repo.DigestInput(ctx, userID); err == nil {
+		t.Fatal("eligibility failure did not fail digest closed")
+	}
+}
+func (allowAllNotificationEligibility) FilterEligibleGameIDs(_ context.Context, ids []uuid.UUID, _ time.Time) (map[uuid.UUID]bool, error) {
+	result := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		result[id] = true
+	}
+	return result, nil
+}
 
 type schedulerStub struct {
 	calls int
@@ -62,7 +146,7 @@ func TestDigestDeliveryIdempotencySuppressionOwnershipAndActionReplay(t *testing
 			t.Fatal(err)
 		}
 	}
-	repository, _ := NewSQLRepository(db)
+	repository, _ := NewSQLRepository(db, allowAllNotificationEligibility{}, func() time.Time { return now })
 	signer, _ := NewSigner([]byte(strings.Repeat("x", 32)), actionPurpose)
 	scheduler := &schedulerStub{}
 	service, err := NewService(repository, scheduler, SenderFunc(func(context.Context, Message) (bool, error) { return true, nil }), signer, "http://localhost:8080")

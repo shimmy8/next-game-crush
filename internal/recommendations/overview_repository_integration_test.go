@@ -60,7 +60,7 @@ func TestOverviewReadsOnePublishedRunDuringRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	repo, _ := NewSQLRepository(db, "embed", "text")
-	service := &Service{repository: repo}
+	service := &Service{repository: repo, eligibility: allowAllCurrentEligibility{}, clock: recommendationTestClock}
 	service.SetOverviewSources(repo, nil)
 	first := insertRankingGame(t, db, 7101, "Published discovery")
 	second := insertRankingGame(t, db, 7102, "Next wishlist")

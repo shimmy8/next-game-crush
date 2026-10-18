@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/auth"
 	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/profile"
@@ -87,6 +88,20 @@ func TestRankingReadEndpointsRequireAuthenticationAndUseSessionOwner(t *testing.
 	}
 }
 
+func TestIneligibleRecommendationDetailReturnsNotFound(t *testing.T) {
+	authService, sessions := handlerService(t, "http://localhost:8080")
+	session := sessions.addSession()
+	recommendationID := uuid.New()
+	router := NewRouter(Dependencies{Auth: authService, Recommendations: &fakeRecommendationReader{getErr: pgx.ErrNoRows}})
+	req := httptest.NewRequest(http.MethodGet, "/api/recommendations/"+recommendationID.String(), nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestProfileResponseExposesSummaryAvailability(t *testing.T) {
 	for _, test := range []struct {
 		name, summary, status string
@@ -135,6 +150,7 @@ func (f *fakeProfileReader) Latest(_ context.Context, userID uuid.UUID) (profile
 type fakeRecommendationReader struct {
 	items  []recommendations.Recommendation
 	userID uuid.UUID
+	getErr error
 }
 
 func (f *fakeRecommendationReader) Latest(_ context.Context, userID uuid.UUID) ([]recommendations.Recommendation, error) {
@@ -147,6 +163,9 @@ func (f *fakeRecommendationReader) Overview(_ context.Context, userID uuid.UUID)
 }
 func (f *fakeRecommendationReader) Get(_ context.Context, userID, id uuid.UUID) (recommendations.Recommendation, error) {
 	f.userID = userID
+	if f.getErr != nil {
+		return recommendations.Recommendation{}, f.getErr
+	}
 	item := f.items[0]
 	item.ID = id
 	return item, nil
