@@ -1,6 +1,9 @@
 -- name: GetGameByAppID :one
 SELECT * FROM games WHERE steam_app_id = $1;
 
+-- name: GetCatalogGameByAppIDForUpdate :one
+SELECT * FROM games WHERE steam_app_id = $1 FOR UPDATE;
+
 -- name: ListCatalogGames :many
 SELECT g.* FROM games g JOIN catalog_entries ce ON ce.game_id = g.id ORDER BY g.steam_app_id;
 

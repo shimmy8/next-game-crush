@@ -11,6 +11,29 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getCatalogGameByAppIDForUpdate = `-- name: GetCatalogGameByAppIDForUpdate :one
+SELECT id, steam_app_id, name, source, last_successful_fetch_at, source_snapshot, created_at, updated_at, availability, last_attempt_at, content_hash FROM games WHERE steam_app_id = $1 FOR UPDATE
+`
+
+func (q *Queries) GetCatalogGameByAppIDForUpdate(ctx context.Context, steamAppID int64) (Game, error) {
+	row := q.db.QueryRow(ctx, getCatalogGameByAppIDForUpdate, steamAppID)
+	var i Game
+	err := row.Scan(
+		&i.ID,
+		&i.SteamAppID,
+		&i.Name,
+		&i.Source,
+		&i.LastSuccessfulFetchAt,
+		&i.SourceSnapshot,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Availability,
+		&i.LastAttemptAt,
+		&i.ContentHash,
+	)
+	return i, err
+}
+
 const getCurrentReleaseDate = `-- name: GetCurrentReleaseDate :one
 SELECT id, game_id, precision, release_date, raw_text, observed_at, source, last_successful_fetch_at FROM game_release_dates WHERE game_id = $1 ORDER BY observed_at DESC, id DESC LIMIT 1
 `

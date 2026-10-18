@@ -345,6 +345,73 @@ func (q *Queries) CommitSearchPage(ctx context.Context, arg CommitSearchPagePara
 	return i, err
 }
 
+const completeSearchQualificationCandidate = `-- name: CompleteSearchQualificationCandidate :execrows
+UPDATE catalog_search_worklist SET status='complete',next_retry_at=NULL
+WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred')
+`
+
+type CompleteSearchQualificationCandidateParams struct {
+	RunID      pgtype.UUID `json:"run_id"`
+	SteamAppID int64       `json:"steam_app_id"`
+}
+
+func (q *Queries) CompleteSearchQualificationCandidate(ctx context.Context, arg CompleteSearchQualificationCandidateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeSearchQualificationCandidate, arg.RunID, arg.SteamAppID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const completeSearchQualificationReservation = `-- name: CompleteSearchQualificationReservation :execrows
+UPDATE catalog_store_reservations SET status='complete',retry_generation=0,next_retry_at=NULL,
+  lease_until=$1,updated_at=$1
+WHERE steam_app_id=$2 AND id=$3
+  AND fencing_token=$4 AND status='reserved'
+`
+
+type CompleteSearchQualificationReservationParams struct {
+	NowAt        pgtype.Timestamptz `json:"now_at"`
+	SteamAppID   int64              `json:"steam_app_id"`
+	ID           pgtype.UUID        `json:"id"`
+	FencingToken pgtype.UUID        `json:"fencing_token"`
+}
+
+func (q *Queries) CompleteSearchQualificationReservation(ctx context.Context, arg CompleteSearchQualificationReservationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeSearchQualificationReservation,
+		arg.NowAt,
+		arg.SteamAppID,
+		arg.ID,
+		arg.FencingToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const completeSearchQualificationWork = `-- name: CompleteSearchQualificationWork :execrows
+UPDATE catalog_search_worklist SET status='complete',next_retry_at=NULL
+WHERE steam_app_id=$1
+  AND COALESCE(material_run_revision,run_revision)=$2::bigint
+  AND COALESCE(material_observation_ordinal,observation_ordinal)=$3::bigint
+  AND status='reserved'
+`
+
+type CompleteSearchQualificationWorkParams struct {
+	SteamAppID         int64 `json:"steam_app_id"`
+	RunRevision        int64 `json:"run_revision"`
+	ObservationOrdinal int64 `json:"observation_ordinal"`
+}
+
+func (q *Queries) CompleteSearchQualificationWork(ctx context.Context, arg CompleteSearchQualificationWorkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeSearchQualificationWork, arg.SteamAppID, arg.RunRevision, arg.ObservationOrdinal)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const countSearchRunWorklist = `-- name: CountSearchRunWorklist :one
 SELECT count(*)::integer FROM catalog_search_worklist WHERE run_id=$1
 `
@@ -468,6 +535,67 @@ func (q *Queries) FailSearchFeedAtCursor(ctx context.Context, arg FailSearchFeed
 		arg.Feed,
 		arg.ExpectedOffset,
 		arg.PageGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const failSearchQualificationReservation = `-- name: FailSearchQualificationReservation :execrows
+UPDATE catalog_store_reservations SET status='reserved',retry_generation=$1,
+  next_retry_at=$2,lease_until=$3,updated_at=$4
+WHERE steam_app_id=$5 AND id=$6
+  AND fencing_token=$7 AND status='reserved'
+`
+
+type FailSearchQualificationReservationParams struct {
+	RetryGeneration int32              `json:"retry_generation"`
+	NextRetryAt     pgtype.Timestamptz `json:"next_retry_at"`
+	LeaseUntil      pgtype.Timestamptz `json:"lease_until"`
+	NowAt           pgtype.Timestamptz `json:"now_at"`
+	SteamAppID      int64              `json:"steam_app_id"`
+	ID              pgtype.UUID        `json:"id"`
+	FencingToken    pgtype.UUID        `json:"fencing_token"`
+}
+
+func (q *Queries) FailSearchQualificationReservation(ctx context.Context, arg FailSearchQualificationReservationParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failSearchQualificationReservation,
+		arg.RetryGeneration,
+		arg.NextRetryAt,
+		arg.LeaseUntil,
+		arg.NowAt,
+		arg.SteamAppID,
+		arg.ID,
+		arg.FencingToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const failSearchQualificationWork = `-- name: FailSearchQualificationWork :execrows
+UPDATE catalog_search_worklist SET status='reserved',next_retry_at=$1
+WHERE steam_app_id=$2
+  AND COALESCE(material_run_revision,run_revision)=$3::bigint
+  AND COALESCE(material_observation_ordinal,observation_ordinal)=$4::bigint
+  AND status='reserved'
+`
+
+type FailSearchQualificationWorkParams struct {
+	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
+	SteamAppID         int64              `json:"steam_app_id"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+}
+
+func (q *Queries) FailSearchQualificationWork(ctx context.Context, arg FailSearchQualificationWorkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failSearchQualificationWork,
+		arg.NextRetryAt,
+		arg.SteamAppID,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
 	)
 	if err != nil {
 		return 0, err
@@ -971,6 +1099,34 @@ func (q *Queries) LockSearchFeedPublication(ctx context.Context, feed string) (C
 	return i, err
 }
 
+const lockSearchQualificationReservation = `-- name: LockSearchQualificationReservation :one
+SELECT steam_app_id, id, run_revision, observation_ordinal, fingerprint, fencing_token, status, lease_until, retry_generation, next_retry_at, created_at, updated_at, budget_hour, budget_identity_hash FROM catalog_store_reservations WHERE steam_app_id=$1 FOR UPDATE
+`
+
+// Search qualification owns this row together with the per-AppID advisory
+// lock. The id/token and candidate revision form the publication fence.
+func (q *Queries) LockSearchQualificationReservation(ctx context.Context, steamAppID int64) (CatalogStoreReservation, error) {
+	row := q.db.QueryRow(ctx, lockSearchQualificationReservation, steamAppID)
+	var i CatalogStoreReservation
+	err := row.Scan(
+		&i.SteamAppID,
+		&i.ID,
+		&i.RunRevision,
+		&i.ObservationOrdinal,
+		&i.Fingerprint,
+		&i.FencingToken,
+		&i.Status,
+		&i.LeaseUntil,
+		&i.RetryGeneration,
+		&i.NextRetryAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.BudgetHour,
+		&i.BudgetIdentityHash,
+	)
+	return i, err
+}
+
 const markMetadataWorkReserved = `-- name: MarkMetadataWorkReserved :execrows
 UPDATE catalog_search_worklist SET status='reserved',next_retry_at=NULL
 WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred')
@@ -1092,6 +1248,77 @@ func (q *Queries) MetadataReservationNeeded(ctx context.Context, arg MetadataRes
 	var needed bool
 	err := row.Scan(&needed)
 	return needed, err
+}
+
+const peekNextIndependentMetadataWork = `-- name: PeekNextIndependentMetadataWork :one
+SELECT w.run_id,w.steam_app_id,COALESCE(w.material_run_revision,w.run_revision)::bigint AS run_revision,
+    COALESCE(w.material_observation_ordinal,w.observation_ordinal)::bigint AS observation_ordinal,w.priority,r.kind,
+    c.material_fingerprint::text AS fingerprint
+FROM catalog_search_worklist w
+JOIN catalog_search_runs r ON r.id=w.run_id
+JOIN catalog_metadata_heads h ON h.steam_app_id=w.steam_app_id
+JOIN catalog_search_current c ON c.steam_app_id=w.steam_app_id
+WHERE (w.status='pending' OR (w.status='deferred' AND w.next_retry_at<=$1)
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations sr
+        WHERE sr.steam_app_id=w.steam_app_id AND sr.status='reserved' AND sr.lease_until<=$1)))
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))=
+      (h.material_run_revision,h.material_observation_ordinal)
+  AND c.precision IN ('day','month','quarter')
+  AND CASE c.precision
+      WHEN 'day' THEN c.release_date
+      WHEN 'month' THEN make_date(c.release_year,c.release_month,1)
+      ELSE make_date(c.release_year,(c.release_quarter-1)*3+1,1)
+      END <= $2::date
+  AND CASE c.precision
+      WHEN 'day' THEN c.release_date
+      WHEN 'month' THEN (make_date(c.release_year,c.release_month,1)+interval '1 month - 1 day')::date
+      ELSE (make_date(c.release_year,(c.release_quarter-1)*3+1,1)+interval '3 months - 1 day')::date
+      END >= $3::date
+  AND (CASE c.precision
+      WHEN 'day' THEN c.release_date
+      WHEN 'month' THEN (make_date(c.release_year,c.release_month,1)+interval '1 month - 1 day')::date
+      ELSE (make_date(c.release_year,(c.release_quarter-1)*3+1,1)+interval '3 months - 1 day')::date
+      END >= $4::date OR c.review_band='positive')
+ORDER BY CASE WHEN w.status IN ('deferred','reserved') THEN 0 WHEN r.kind='reconciliation' THEN 2 ELSE 1 END,
+    w.priority DESC,w.run_revision DESC,w.observation_ordinal DESC,w.created_at,w.steam_app_id
+LIMIT 1
+`
+
+type PeekNextIndependentMetadataWorkParams struct {
+	NowAt       pgtype.Timestamptz `json:"now_at"`
+	WindowEnd   pgtype.Date        `json:"window_end"`
+	WindowStart pgtype.Date        `json:"window_start"`
+	Today       pgtype.Date        `json:"today"`
+}
+
+type PeekNextIndependentMetadataWorkRow struct {
+	RunID              pgtype.UUID `json:"run_id"`
+	SteamAppID         int64       `json:"steam_app_id"`
+	RunRevision        int64       `json:"run_revision"`
+	ObservationOrdinal int64       `json:"observation_ordinal"`
+	Priority           int16       `json:"priority"`
+	Kind               string      `json:"kind"`
+	Fingerprint        string      `json:"fingerprint"`
+}
+
+func (q *Queries) PeekNextIndependentMetadataWork(ctx context.Context, arg PeekNextIndependentMetadataWorkParams) (PeekNextIndependentMetadataWorkRow, error) {
+	row := q.db.QueryRow(ctx, peekNextIndependentMetadataWork,
+		arg.NowAt,
+		arg.WindowEnd,
+		arg.WindowStart,
+		arg.Today,
+	)
+	var i PeekNextIndependentMetadataWorkRow
+	err := row.Scan(
+		&i.RunID,
+		&i.SteamAppID,
+		&i.RunRevision,
+		&i.ObservationOrdinal,
+		&i.Priority,
+		&i.Kind,
+		&i.Fingerprint,
+	)
+	return i, err
 }
 
 const peekNextMetadataIngressWork = `-- name: PeekNextMetadataIngressWork :one

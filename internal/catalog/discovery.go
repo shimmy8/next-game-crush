@@ -36,14 +36,15 @@ type DiscoveryEnrichmentPlanner interface {
 	PlanGameFeatureJob(context.Context, uuid.UUID, string, int) (jobs.Spec, error)
 }
 type DiscoveryService struct {
-	repo     *DiscoveryRepository
-	source   DiscoverySource
-	metadata steam.Client
-	queue    *jobs.Queue
-	cfg      DiscoveryConfig
-	planner  DiscoveryEnrichmentPlanner
-	now      func() time.Time
-	logger   *observability.Logger
+	repo          *DiscoveryRepository
+	source        DiscoverySource
+	metadata      steam.Client
+	queue         *jobs.Queue
+	cfg           DiscoveryConfig
+	planner       DiscoveryEnrichmentPlanner
+	searchPlanner SearchDiscoveryEnrichmentPlanner
+	now           func() time.Time
+	logger        *observability.Logger
 }
 
 func NewDiscoveryService(repo *DiscoveryRepository, source DiscoverySource, metadata steam.Client, queue *jobs.Queue, cfg DiscoveryConfig, logger *observability.Logger) (*DiscoveryService, error) {

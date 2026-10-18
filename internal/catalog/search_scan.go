@@ -25,10 +25,19 @@ type SearchScanService struct {
 	repo                  *SearchRepository
 	source                steam.SearchCatalog
 	queue                 *jobs.Queue
+	qualificationProducer SearchQualificationProducer
 	cfg                   DiscoveryConfig
 	now                   func() time.Time
 	afterPageCommitHook   func() error
 	beforePagePersistHook func() error
+}
+
+// SearchQualificationProducer is installed explicitly by the catalog worker
+// composition. Keeping it optional lets callers that only persist pages (and
+// Task 8's direct claim flow) retain ownership of when metadata is claimed.
+type SearchQualificationProducer interface {
+	EnqueueReadySearchQualifications(context.Context, *jobs.Queue, DiscoveryConfig, time.Time) (int, error)
+	EnqueueReadyIndependentSearchQualifications(context.Context, *jobs.Queue, DiscoveryConfig, time.Time) (int, error)
 }
 
 type catalogSearchFailure struct {
@@ -74,6 +83,10 @@ func NewSearchScanService(repo *SearchRepository, source steam.SearchCatalog, qu
 		now = time.Now
 	}
 	return &SearchScanService{repo: repo, source: source, queue: queue, cfg: cfg, now: now}, nil
+}
+
+func (s *SearchScanService) SetSearchQualificationProducer(producer SearchQualificationProducer) {
+	s.qualificationProducer = producer
 }
 
 func validSearchFeed(feed steam.SearchFeed) bool {
@@ -181,6 +194,16 @@ func (s *SearchScanService) handlePage(ctx context.Context, lease jobs.Lease) er
 	}
 	if err := s.repo.finalizePageFailure(ctx, lease, payload, reason, s.now().UTC()); err != nil {
 		return err
+	}
+	if s.qualificationProducer == nil {
+		return jobs.ErrDeferred
+	}
+	if ready, readyErr := s.qualificationBoundaryReady(ctx, payload.RunID, payload.Feed); readyErr != nil {
+		return readyErr
+	} else if ready {
+		if _, err := s.qualificationProducer.EnqueueReadySearchQualifications(ctx, s.queue, s.cfg, s.now().UTC()); err != nil {
+			return err
+		}
 	}
 	// The terminal lifecycle was completed transactionally above; suppress the
 	// worker's separate Fail call, which no longer owns the cleared lease.
@@ -456,9 +479,19 @@ func (s *SearchScanService) afterPageCommit(ctx context.Context, runID uuid.UUID
 	if err := s.repo.store.Pool.QueryRow(ctx, `SELECT status,cursor_offset,natural_end,monotonic,boundary_stop,safety_cap_reason FROM catalog_search_feeds WHERE run_id=$1 AND feed=$2`, runID, feed).Scan(&status, &cursor, &naturalEnd, &monotonic, &boundaryStop, &capReason); err != nil {
 		return err
 	}
+	// These candidates do not depend on Popular New/TBA authority, so they can
+	// begin after every durable page. Popularity-dependent work remains pending
+	// until the safe feed-completion boundary below.
+	if s.qualificationProducer != nil {
+		if _, err = s.qualificationProducer.EnqueueReadyIndependentSearchQualifications(ctx, s.queue, s.cfg, s.now().UTC()); err != nil {
+			return err
+		}
+	}
 	if status == "running" {
-		_, err = s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: runID, Feed: feed, Start: cursor, PageGeneration: 0}))
-		return err
+		if _, err = s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: runID, Feed: feed, Start: cursor, PageGeneration: 0})); err != nil {
+			return err
+		}
+		return nil
 	}
 	if status == "complete" {
 		if _, err := s.repo.PublishFeed(ctx, run, feed, FeedCompletion{Status: status, NaturalEnd: naturalEnd, Monotonic: monotonic, BoundaryStop: boundaryStop, SafetyCapReason: capReason}); err != nil {
@@ -480,6 +513,36 @@ func (s *SearchScanService) afterPageCommit(ctx context.Context, runID uuid.UUID
 			}
 		}
 	}
+	// Popular Upcoming alone is not a safe qualification boundary: TBA and
+	// unrated rules depend on the authoritative Popular New publication too.
+	// Once both popular feeds are terminal, later ordinary completions can
+	// safely expose their tails and re-evaluate the accumulated worklist.
+	if ready, readyErr := s.qualificationBoundaryReady(ctx, runID, feed); readyErr != nil {
+		return readyErr
+	} else if ready {
+		if _, err = s.qualificationProducer.EnqueueReadySearchQualifications(ctx, s.queue, s.cfg, s.now().UTC()); err != nil {
+			return err
+		}
+	}
 	_, err = s.repo.store.Queries.FinishSearchRunIfTerminal(ctx, dbgen.FinishSearchRunIfTerminalParams{CompletedAt: pgtype.Timestamptz{Time: s.now().UTC(), Valid: true}, RunID: catalogUUID(runID)})
 	return err
+}
+
+func (s *SearchScanService) qualificationBoundaryReady(ctx context.Context, runID uuid.UUID, feed steam.SearchFeed) (bool, error) {
+	if s.qualificationProducer == nil {
+		return false, nil
+	}
+	if feed == steam.FeedPopularUpcoming {
+		return false, nil
+	}
+	if feed != steam.FeedPopularNew {
+		// Every ordinary completion re-evaluates the tail against the already
+		// published popular authority. Production priorities publish the popular
+		// pair first; direct/reconciliation runs can reuse the prior publication.
+		return true, nil
+	}
+	var terminal bool
+	err := s.repo.store.Pool.QueryRow(ctx, `SELECT count(*)=2 AND bool_and(status IN ('complete','partial','failed'))
+		FROM catalog_search_feeds WHERE run_id=$1 AND feed IN ('popular_upcoming','popular_new')`, runID).Scan(&terminal)
+	return terminal, err
 }

@@ -386,6 +386,43 @@ func TestPermanentFailureDeadLettersOnFirstAttempt(t *testing.T) {
 	}
 }
 
+func TestDeadLetterSuccessorEnqueuesOnlyOnTerminalTransition(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	root, err := queue.Enqueue(ctx, Spec{Lane: LaneCatalog, Kind: "root", IdempotencyKey: "dead-successor:root", MaxAttempts: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := Spec{Lane: LaneCatalog, Kind: "root", IdempotencyKey: "dead-successor:next", MaxAttempts: 2, AvailableAt: time.Now().Add(time.Hour)}
+	first, err := queue.Claim(ctx, LaneCatalog, "dead-successor", time.Minute)
+	if err != nil || first == nil || first.ID != root {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	if outcome, err := queue.Fail(ctx, *first, WithDeadLetterSuccessor(errors.New("temporary"), successor), time.Now().Add(-time.Second)); err != nil || outcome != FailureRetryScheduled {
+		t.Fatalf("first outcome=%q err=%v", outcome, err)
+	}
+	var successors int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE idempotency_key='dead-successor:next'`).Scan(&successors); err != nil || successors != 0 {
+		t.Fatalf("successors before dead=%d err=%v", successors, err)
+	}
+	second, err := queue.Claim(ctx, LaneCatalog, "dead-successor", time.Minute)
+	if err != nil || second == nil || second.ID != root {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	if outcome, err := queue.Fail(ctx, *second, WithDeadLetterSuccessor(errors.New("terminal"), successor), time.Now()); err != nil || outcome != FailureDead {
+		t.Fatalf("second outcome=%q err=%v", outcome, err)
+	}
+	var rootStatus, successorStatus string
+	if err := db.Pool.QueryRow(ctx, `SELECT
+		(SELECT status FROM sync_jobs WHERE id=$1),(SELECT status FROM sync_jobs WHERE idempotency_key='dead-successor:next')`, root).
+		Scan(&rootStatus, &successorStatus); err != nil {
+		t.Fatal(err)
+	}
+	if rootStatus != "dead" || successorStatus != "queued" {
+		t.Fatalf("root=%q successor=%q", rootStatus, successorStatus)
+	}
+}
+
 func TestClaimClearsCurrentErrorAndPreservesAttemptHistory(t *testing.T) {
 	queue, db := openTestQueue(t)
 	ctx := context.Background()

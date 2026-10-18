@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/jobs"
@@ -94,6 +95,41 @@ func (s *Service) executionForJob(payload JobPayload, lease jobs.Lease) (GameExe
 		plan.Key = rootKey
 	}
 	return plan, true, nil
+}
+
+func (s *Service) catalogExecutionFailure(payload JobPayload, plan GameExecution, lease jobs.Lease, cause error) error {
+	if cause == nil || errors.Is(cause, jobs.ErrDeferred) || lease.Lane != jobs.LaneCatalog ||
+		plan.Generation < 1 || payload.Execution == nil || plan.Generation == int64(^uint64(0)>>1) {
+		return cause
+	}
+	next := plan
+	next.Generation++
+	logical, err := featureLogicalKey(payload.GameID, plan.ContentHash, plan.TextModel, plan.EmbeddingModel)
+	if err != nil {
+		return cause
+	}
+	identity := fmt.Sprintf("%x", sha256.Sum256([]byte(FeaturesJobKind+":"+logical)))
+	next.Key = fmt.Sprintf("catalog:enrichment:v1:%s:%d:%s", payload.GameID, next.Generation, identity)
+	nextPayload := payload
+	nextPayload.Execution = &next
+	raw, err := json.Marshal(nextPayload)
+	if err != nil {
+		return cause
+	}
+	spec := jobs.Spec{Lane: jobs.LaneCatalog, Kind: FeaturesJobKind, Stage: "ai_features",
+		IdempotencyKey: next.Key, Payload: raw, MaxAttempts: 4, Priority: lease.Priority,
+		AvailableAt: s.now().UTC().Add(catalogAIRetryDelay(plan.Generation))}
+	return jobs.WithDeadLetterSuccessor(cause, spec)
+}
+
+func catalogAIRetryDelay(generation int64) time.Duration {
+	if generation < 1 {
+		generation = 1
+	}
+	if generation > 5 {
+		return 24 * time.Hour
+	}
+	return time.Hour * time.Duration(int64(1)<<(generation-1))
 }
 
 func (s *Service) loadGameExecution(ctx context.Context, id uuid.UUID, plan GameExecution, lease *jobs.Lease) (StoredGameEvidence, bool, error) {

@@ -52,12 +52,18 @@ type Repository interface {
 	SaveProfileSummary(context.Context, uuid.UUID, string, string, ProfileSummary) error
 }
 
+type CatalogFeatureAdmission interface {
+	ReserveCatalogFeature(context.Context, jobs.Lease, string, time.Time) (bool, time.Time, error)
+}
+
 type Service struct {
 	repository            Repository
 	client                Client
 	model, embeddingModel string
 	queue                 *jobs.Queue
+	catalogAdmission      CatalogFeatureAdmission
 	catalogChangedHook    func(context.Context, uuid.UUID) error
+	now                   func() time.Time
 }
 
 func NewService(repository Repository, client Client, model, embeddingModel string) (*Service, error) {
@@ -67,10 +73,13 @@ func NewService(repository Repository, client Client, model, embeddingModel stri
 	if strings.TrimSpace(model) == "" || strings.TrimSpace(embeddingModel) == "" {
 		return nil, errors.New("AI model IDs are required")
 	}
-	return &Service{repository: repository, client: client, model: model, embeddingModel: embeddingModel}, nil
+	return &Service{repository: repository, client: client, model: model, embeddingModel: embeddingModel, now: time.Now}, nil
 }
 
 func (service *Service) SetQueue(queue *jobs.Queue) { service.queue = queue }
+func (service *Service) SetCatalogFeatureAdmission(admission CatalogFeatureAdmission) {
+	service.catalogAdmission = admission
+}
 func (service *Service) SetCatalogChangedHook(hook func(context.Context, uuid.UUID) error) {
 	service.catalogChangedHook = hook
 }
@@ -153,7 +162,7 @@ func (service *Service) handleFeatures(ctx context.Context, lease jobs.Lease) er
 	}
 	changed, current, _, err := service.processFeaturesForExecution(ctx, payload.GameID, plan, &lease)
 	if err != nil {
-		return err
+		return service.catalogExecutionFailure(payload, plan, lease, err)
 	}
 	if !current {
 		return nil
@@ -169,7 +178,7 @@ func (service *Service) handleFeatures(ctx context.Context, lease jobs.Lease) er
 	embeddingPayload, _ := json.Marshal(payload)
 	ready, err := service.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: EmbeddingJobKind, Stage: "ai_embedding", Required: true, IdempotencyKey: lease.IdempotencyKey + ":embedding:v1", Payload: embeddingPayload, MaxAttempts: lease.MaxAttempts, Priority: lease.Priority}})
 	if err != nil {
-		return err
+		return service.catalogExecutionFailure(payload, plan, lease, err)
 	}
 	if !ready {
 		return jobs.ErrDeferred
@@ -187,7 +196,7 @@ func (service *Service) handleEmbedding(ctx context.Context, lease jobs.Lease) e
 	}
 	changed, _, persisted, err := service.processEmbeddingForExecution(ctx, payload.GameID, plan, &lease)
 	if err != nil {
-		return err
+		return service.catalogExecutionFailure(payload, plan, lease, err)
 	}
 	if changed {
 		if err := service.recordCatalogChangePending(ctx, lease, true); err != nil {
@@ -265,6 +274,29 @@ func (service *Service) processFeaturesForExecution(ctx context.Context, gameID 
 	cached, err := service.repository.HasGameFeatures(ctx, gameID, service.model, hash)
 	if err != nil {
 		return false, false, false, err
+	}
+	if lease != nil && lease.Lane == jobs.LaneCatalog && plan.Generation > 0 {
+		if service.catalogAdmission == nil || service.queue == nil {
+			return false, false, false, errors.New("catalog AI admission is not configured")
+		}
+		identity, err := featureLogicalKey(gameID, plan.ContentHash, plan.TextModel, plan.EmbeddingModel)
+		if err != nil {
+			return false, false, false, err
+		}
+		now := service.now().UTC()
+		granted, retryAt, err := service.catalogAdmission.ReserveCatalogFeature(ctx, *lease, identity, now)
+		if err != nil {
+			return false, false, false, err
+		}
+		if !granted {
+			if !retryAt.After(now) {
+				return false, false, false, errors.New("catalog AI admission returned an invalid retry time")
+			}
+			if err := service.queue.DeferUntil(ctx, *lease, retryAt); err != nil {
+				return false, false, false, err
+			}
+			return false, false, false, jobs.ErrDeferred
+		}
 	}
 	if cached {
 		return false, true, true, nil

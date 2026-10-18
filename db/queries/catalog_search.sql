@@ -279,6 +279,37 @@ RETURNING *;
 -- name: GetStoreReservation :one
 SELECT * FROM catalog_store_reservations WHERE steam_app_id=$1;
 
+-- Search qualification owns this row together with the per-AppID advisory
+-- lock. The id/token and candidate revision form the publication fence.
+-- name: LockSearchQualificationReservation :one
+SELECT * FROM catalog_store_reservations WHERE steam_app_id=$1 FOR UPDATE;
+
+-- name: CompleteSearchQualificationReservation :execrows
+UPDATE catalog_store_reservations SET status='complete',retry_generation=0,next_retry_at=NULL,
+  lease_until=sqlc.arg(now_at),updated_at=sqlc.arg(now_at)
+WHERE steam_app_id=sqlc.arg(steam_app_id) AND id=sqlc.arg(id)
+  AND fencing_token=sqlc.arg(fencing_token) AND status='reserved';
+
+-- name: FailSearchQualificationReservation :execrows
+UPDATE catalog_store_reservations SET status='reserved',retry_generation=sqlc.arg(retry_generation),
+  next_retry_at=sqlc.arg(next_retry_at),lease_until=sqlc.arg(lease_until),updated_at=sqlc.arg(now_at)
+WHERE steam_app_id=sqlc.arg(steam_app_id) AND id=sqlc.arg(id)
+  AND fencing_token=sqlc.arg(fencing_token) AND status='reserved';
+
+-- name: CompleteSearchQualificationWork :execrows
+UPDATE catalog_search_worklist SET status='complete',next_retry_at=NULL
+WHERE steam_app_id=sqlc.arg(steam_app_id)
+  AND COALESCE(material_run_revision,run_revision)=sqlc.arg(run_revision)::bigint
+  AND COALESCE(material_observation_ordinal,observation_ordinal)=sqlc.arg(observation_ordinal)::bigint
+  AND status='reserved';
+
+-- name: FailSearchQualificationWork :execrows
+UPDATE catalog_search_worklist SET status='reserved',next_retry_at=sqlc.arg(next_retry_at)
+WHERE steam_app_id=sqlc.arg(steam_app_id)
+  AND COALESCE(material_run_revision,run_revision)=sqlc.arg(run_revision)::bigint
+  AND COALESCE(material_observation_ordinal,observation_ordinal)=sqlc.arg(observation_ordinal)::bigint
+  AND status='reserved';
+
 -- name: RecordMetadataProvenance :exec
 INSERT INTO catalog_metadata_provenance(steam_app_id,ingress_kind,ingress_identity,run_revision,observation_ordinal,first_seen_at,last_seen_at)
 VALUES($1,$2,$3,$4,$5,$6,$6)
@@ -303,6 +334,39 @@ WHERE (w.status='pending' OR (w.status='deferred' AND w.next_retry_at<=sqlc.arg(
         WHERE sr.steam_app_id=w.steam_app_id AND sr.status='reserved'
           AND sr.lease_until<=sqlc.arg(now_at))))
   AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))=(c.material_run_revision,c.material_observation_ordinal)
+ORDER BY CASE WHEN w.status IN ('deferred','reserved') THEN 0 WHEN r.kind='reconciliation' THEN 2 ELSE 1 END,
+    w.priority DESC,w.run_revision DESC,w.observation_ordinal DESC,w.created_at,w.steam_app_id
+LIMIT 1;
+
+-- name: PeekNextIndependentMetadataWork :one
+SELECT w.run_id,w.steam_app_id,COALESCE(w.material_run_revision,w.run_revision)::bigint AS run_revision,
+    COALESCE(w.material_observation_ordinal,w.observation_ordinal)::bigint AS observation_ordinal,w.priority,r.kind,
+    c.material_fingerprint::text AS fingerprint
+FROM catalog_search_worklist w
+JOIN catalog_search_runs r ON r.id=w.run_id
+JOIN catalog_metadata_heads h ON h.steam_app_id=w.steam_app_id
+JOIN catalog_search_current c ON c.steam_app_id=w.steam_app_id
+WHERE (w.status='pending' OR (w.status='deferred' AND w.next_retry_at<=sqlc.arg(now_at))
+    OR (w.status='reserved' AND EXISTS(SELECT 1 FROM catalog_store_reservations sr
+        WHERE sr.steam_app_id=w.steam_app_id AND sr.status='reserved' AND sr.lease_until<=sqlc.arg(now_at))))
+  AND (COALESCE(w.material_run_revision,w.run_revision),COALESCE(w.material_observation_ordinal,w.observation_ordinal))=
+      (h.material_run_revision,h.material_observation_ordinal)
+  AND c.precision IN ('day','month','quarter')
+  AND CASE c.precision
+      WHEN 'day' THEN c.release_date
+      WHEN 'month' THEN make_date(c.release_year,c.release_month,1)
+      ELSE make_date(c.release_year,(c.release_quarter-1)*3+1,1)
+      END <= sqlc.arg(window_end)::date
+  AND CASE c.precision
+      WHEN 'day' THEN c.release_date
+      WHEN 'month' THEN (make_date(c.release_year,c.release_month,1)+interval '1 month - 1 day')::date
+      ELSE (make_date(c.release_year,(c.release_quarter-1)*3+1,1)+interval '3 months - 1 day')::date
+      END >= sqlc.arg(window_start)::date
+  AND (CASE c.precision
+      WHEN 'day' THEN c.release_date
+      WHEN 'month' THEN (make_date(c.release_year,c.release_month,1)+interval '1 month - 1 day')::date
+      ELSE (make_date(c.release_year,(c.release_quarter-1)*3+1,1)+interval '3 months - 1 day')::date
+      END >= sqlc.arg(today)::date OR c.review_band='positive')
 ORDER BY CASE WHEN w.status IN ('deferred','reserved') THEN 0 WHEN r.kind='reconciliation' THEN 2 ELSE 1 END,
     w.priority DESC,w.run_revision DESC,w.observation_ordinal DESC,w.created_at,w.steam_app_id
 LIMIT 1;
@@ -446,6 +510,10 @@ WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred');
 
 -- name: MarkMetadataWorkSuperseded :execrows
 UPDATE catalog_search_worklist SET status='superseded',next_retry_at=NULL
+WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred');
+
+-- name: CompleteSearchQualificationCandidate :execrows
+UPDATE catalog_search_worklist SET status='complete',next_retry_at=NULL
 WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred');
 
 -- name: DeferMetadataWork :execrows

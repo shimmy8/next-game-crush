@@ -71,6 +71,30 @@ type retryDisposition interface {
 	Retryable() bool
 }
 
+type deadLetterSuccessorProvider interface {
+	DeadLetterSuccessor() (Spec, bool)
+}
+
+type deadLetterSuccessorError struct {
+	cause error
+	spec  Spec
+}
+
+func (e *deadLetterSuccessorError) Error() string { return e.cause.Error() }
+func (e *deadLetterSuccessorError) Unwrap() error { return e.cause }
+func (e *deadLetterSuccessorError) DeadLetterSuccessor() (Spec, bool) {
+	return e.spec, true
+}
+
+// WithDeadLetterSuccessor atomically enqueues spec only if recording cause
+// transitions the currently owned attempt to dead. Ordinary retries ignore it.
+func WithDeadLetterSuccessor(cause error, spec Spec) error {
+	if cause == nil {
+		return nil
+	}
+	return &deadLetterSuccessorError{cause: cause, spec: spec}
+}
+
 const (
 	FailureRetryScheduled FailureOutcome = "retry_scheduled"
 	FailureDead           FailureOutcome = "dead"
@@ -437,6 +461,14 @@ func (q *Queue) Fail(ctx context.Context, lease Lease, cause error, retryAt time
 		return "", fmt.Errorf("finish failed attempt: %w", err)
 	}
 	if status == "dead" {
+		var successor deadLetterSuccessorProvider
+		if errors.As(cause, &successor) {
+			if spec, ok := successor.DeadLetterSuccessor(); ok {
+				if _, err := EnqueueInTx(ctx, queries, spec); err != nil {
+					return "", fmt.Errorf("enqueue dead-letter successor: %w", err)
+				}
+			}
+		}
 		if _, err := tx.Exec(ctx, `UPDATE sync_jobs parent SET status='dead', last_error='required child stage failed', updated_at=now()
 			WHERE parent.id=(SELECT parent_job_id FROM sync_jobs WHERE id=$1) AND parent.status='waiting' AND (SELECT required FROM sync_jobs WHERE id=$1)`, lease.ID); err != nil {
 			return "", fmt.Errorf("fail parent workflow: %w", err)

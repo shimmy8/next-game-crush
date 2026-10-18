@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
 )
 
@@ -49,6 +51,113 @@ func TestCatalogExecutionPayloadPinsContentModelsAndGeneration(t *testing.T) {
 	invalid, _ := json.Marshal(payload)
 	if _, err = decodeJobPayload(invalid, true, false); err == nil {
 		t.Fatal("tampered execution identity was accepted")
+	}
+}
+
+func TestCatalogAIRetryDelayCapsAtTwentyFourHours(t *testing.T) {
+	want := []time.Duration{time.Hour, 2 * time.Hour, 4 * time.Hour, 8 * time.Hour, 16 * time.Hour, 24 * time.Hour, 24 * time.Hour}
+	for index, expected := range want {
+		if got := catalogAIRetryDelay(int64(index + 1)); got != expected {
+			t.Fatalf("generation %d delay=%s want=%s", index+1, got, expected)
+		}
+	}
+}
+
+type cacheAdmissionSequence struct {
+	calls   atomic.Int32
+	retryAt time.Time
+}
+
+func (a *cacheAdmissionSequence) ReserveCatalogFeature(context.Context, jobs.Lease, string, time.Time) (bool, time.Time, error) {
+	return a.calls.Add(1) > 1, a.retryAt, nil
+}
+
+func TestCatalogCachedFeaturesStillRequireExecutionTimeAdmission(t *testing.T) {
+	db := openAIIntegrationStore(t)
+	ctx := context.Background()
+	queue := jobs.NewQueue(db)
+	repo := NewSQLRepository(db)
+	client := &blockedManualFeatures{started: make(chan struct{}), release: make(chan struct{})}
+	service, err := NewService(repo, client, "text-v1", "embedding-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetQueue(queue)
+	now := time.Now().UTC()
+	service.now = func() time.Time { return now }
+	admission := &cacheAdmissionSequence{retryAt: now.Add(time.Hour)}
+	service.SetCatalogFeatureAdmission(admission)
+
+	gameID := uuid.New()
+	details := steam.GameDetails{AppID: 422, Type: "game", Name: "Cached Recovery", ShortDescription: "stable cached features",
+		ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "Coming Soon"}}
+	snapshot, err := json.Marshal(details)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at,source_snapshot,availability)
+		VALUES($1,$2,$3,'steam_search',now(),$4,'available')`, gameID, details.AppID, details.Name, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	stored := gameEvidenceFromSnapshot(details.Name, snapshot)
+	featureHash, _, err := featureEvidenceHash(stored, "text-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = repo.SaveGameFeatures(ctx, gameID, "text-v1", featureHash, GameFeatures{Themes: []string{"cached"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	spec, err := service.PlanCatalogGameFeatureJob(ctx, gameID, steam.GameContentHash(details), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := fmt.Sprintf("%x", sha256.Sum256([]byte(spec.Kind+":"+spec.IdempotencyKey)))
+	key := fmt.Sprintf("catalog:enrichment:v1:%s:1:%s", gameID, identity)
+	spec.IdempotencyKey = key
+	spec, err = service.BindGameFeatureExecution(spec, 1, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = queue.Enqueue(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	first, err := queue.Claim(ctx, jobs.LaneCatalog, "cached-admission", time.Minute)
+	if err != nil || first == nil {
+		t.Fatalf("first claim=%+v err=%v", first, err)
+	}
+	if err = service.handleFeatures(ctx, *first); !errors.Is(err, jobs.ErrDeferred) {
+		t.Fatalf("first cached execution error=%v", err)
+	}
+	var status string
+	var attempts, embeddings int
+	var availableAt time.Time
+	if err = db.Pool.QueryRow(ctx, `SELECT status,attempts,available_at,
+		(SELECT count(*) FROM sync_jobs WHERE kind='ai.embedding') FROM sync_jobs WHERE id=$1`, first.ID).
+		Scan(&status, &attempts, &availableAt, &embeddings); err != nil {
+		t.Fatal(err)
+	}
+	if admission.calls.Load() != 1 || status != "queued" || attempts != 0 || !availableAt.Equal(admission.retryAt) || embeddings != 0 {
+		t.Fatalf("calls=%d status=%q attempts=%d available=%v embeddings=%d", admission.calls.Load(), status, attempts, availableAt, embeddings)
+	}
+
+	if _, err = db.Pool.Exec(ctx, `UPDATE sync_jobs SET available_at=now() WHERE id=$1`, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := queue.Claim(ctx, jobs.LaneCatalog, "cached-admission-next-hour", time.Minute)
+	if err != nil || second == nil || second.ID != first.ID {
+		t.Fatalf("second claim=%+v err=%v", second, err)
+	}
+	if err = service.handleFeatures(ctx, *second); !errors.Is(err, jobs.ErrDeferred) {
+		t.Fatalf("second cached execution error=%v", err)
+	}
+	if err = db.Pool.QueryRow(ctx, `SELECT status,
+		(SELECT count(*) FROM sync_jobs WHERE kind='ai.embedding') FROM sync_jobs WHERE id=$1`, second.ID).
+		Scan(&status, &embeddings); err != nil {
+		t.Fatal(err)
+	}
+	if admission.calls.Load() != 2 || status != "waiting" || embeddings != 1 {
+		t.Fatalf("calls=%d status=%q embeddings=%d", admission.calls.Load(), status, embeddings)
 	}
 }
 
