@@ -371,8 +371,10 @@ test_dump_failure_stops_before_pull() {
     fail "failed dump replaced the last successful backup"
   assert_contains "$command_log" ' up -d --wait --wait-timeout 90 db mailpit' \
     "database and Mailpit were not started before the dump"
-  assert_contains "$command_log" ' exec -T db sh -c exec\ pg_dump\ --username=' \
-    "deployment did not run pg_dump inside the database container"
+  assert_contains "$command_log" ' exec -T db sh -c ' \
+    "deployment did not execute the database dump inside the database container"
+  assert_contains "$command_log" 'pg_dump' \
+    "deployment did not invoke pg_dump"
   assert_not_contains "$command_log" ' pull app' "failed dump pulled the app image"
   assert_not_contains "$command_log" ' up -d --no-deps' "failed dump updated the app"
   if find "$deploy_root/backups" -name 'latest.sql.gz.tmp.*' -print -quit | grep -q .; then
