@@ -155,11 +155,12 @@ type WishlistItem struct {
 }
 
 type Achievement struct {
-	APIName     string
-	Name        string
-	Description string
-	Achieved    bool
-	UnlockedAt  time.Time
+	APIName        string
+	Name           string
+	Description    string
+	MetadataSource string
+	Achieved       bool
+	UnlockedAt     time.Time
 }
 
 type AchievementSummary struct {

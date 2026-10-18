@@ -67,14 +67,15 @@ type SteamIdentity struct {
 }
 
 type Service struct {
-	store       *store.Store
-	queue       *jobs.Queue
-	client      steam.Client
-	catalog     *catalog.Service
-	now         func() time.Time
-	aiJobs      AIJobPlanner
-	rankingJobs bool
-	logger      *observability.Logger
+	store                *store.Store
+	queue                *jobs.Queue
+	client               steam.Client
+	catalog              *catalog.Service
+	now                  func() time.Time
+	aiJobs               AIJobPlanner
+	rankingJobs          bool
+	logger               *observability.Logger
+	achievementSnapshots AchievementSnapshotRecorder
 }
 
 type ServiceOption func(*Service)
@@ -87,8 +88,15 @@ type AIJobPlanner interface {
 	PlanFeatureJobs(context.Context, uuid.UUID, string) ([]jobs.Spec, error)
 }
 
+type AchievementSnapshotRecorder interface {
+	RecordAchievementSnapshot(context.Context, uuid.UUID, uuid.UUID, steam.AchievementSummary, time.Time) error
+}
+
 func (s *Service) SetAIJobPlanner(planner AIJobPlanner) { s.aiJobs = planner }
-func (s *Service) EnableRankingJobs()                   { s.rankingJobs = true }
+func (s *Service) SetAchievementSnapshotRecorder(recorder AchievementSnapshotRecorder) {
+	s.achievementSnapshots = recorder
+}
+func (s *Service) EnableRankingJobs() { s.rankingJobs = true }
 
 func NewService(database *store.Store, queue *jobs.Queue, client steam.Client, catalogService *catalog.Service, options ...ServiceOption) (*Service, error) {
 	if database == nil || queue == nil || client == nil || catalogService == nil {
@@ -635,9 +643,25 @@ func (s *Service) syncAchievements(ctx context.Context, userID uuid.UUID) error 
 			finish(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, counts)
 			return err
 		}
-		raw, _ := json.Marshal(summary)
 		now := s.now().UTC()
-		if err := s.store.Queries.UpsertAchievementSummary(ctx, dbgen.UpsertAchievementSummaryParams{UserID: uuidPG(userID), GameID: game.ID, Achieved: int32(summary.Unlocked), Total: int32(summary.Total), Source: "steam", LastSuccessfulFetchAt: timestamptz(now), RawSnapshot: raw}); err != nil {
+		if achievementMetadataMissing(summary) {
+			schema, schemaState, schemaErr := s.client.AchievementSchema(ctx, appID)
+			if err := s.recordState(ctx, userID, "achievement_schema", strconv.FormatInt(appID, 10), schemaState, schemaErr); err != nil {
+				counts.failed++
+				finish(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, counts)
+				return err
+			}
+			if schemaState == steam.Available && schemaErr == nil {
+				summary = mergeAchievementSchema(summary, schema)
+			}
+		}
+		if s.achievementSnapshots != nil {
+			err = s.achievementSnapshots.RecordAchievementSnapshot(ctx, userID, uuid.UUID(game.ID.Bytes), summary, now)
+		} else {
+			raw, _ := json.Marshal(summary)
+			err = s.store.Queries.UpsertAchievementSummary(ctx, dbgen.UpsertAchievementSummaryParams{UserID: uuidPG(userID), GameID: game.ID, Achieved: int32(summary.Unlocked), Total: int32(summary.Total), Source: "steam", LastSuccessfulFetchAt: timestamptz(now), RawSnapshot: raw})
+		}
+		if err != nil {
 			counts.failed++
 			finish(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, counts)
 			return err
