@@ -28,6 +28,8 @@ For split development, start PostgreSQL and Mailpit with `docker compose up -d d
 
 The reviewed bounded catalog lives in `catalog_seed.json`. Edit AppIDs, source URLs, and observed dates together; do not replace review with HTML scraping.
 
+For production, follow [docs/vps-setup.md](docs/vps-setup.md) once to prepare the Ubuntu VPS and GitHub `production` Environment. Use [docs/deployment.md](docs/deployment.md) for routine deployments, status checks, rollback behavior, and guarded database recovery.
+
 ## Verify and diagnose
 
 ```bash
