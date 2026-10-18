@@ -34,6 +34,9 @@ Success means:
 - OpenAI may classify achievement semantics, but cannot assign completion
   weights, calculate profile vectors, score candidates, or order
   recommendations;
+- a conservative, versioned English lexical classifier can recognize only
+  narrow completion/ending phrases locally, but likewise cannot assign
+  weights or rank games;
 - Steam or OpenAI failure preserves the last successful state and never turns
   unavailable data into a successful empty achievement set; and
 - profile-summary evidence cannot omit Steam two-week activity merely because
@@ -236,11 +239,53 @@ only. Go code decides whether the class qualifies, counts distinct unlocked
 markers, applies explicit overrides, computes the fixed weight, builds profile
 vectors, derives candidate affinities, and orders recommendations.
 
-When OpenAI is disabled or unavailable, previously validated classifications
-remain usable. New or changed definitions remain `unknown` until a valid
-classification succeeds. The deterministic 100% rule remains available
-without OpenAI. This version does not introduce a lexical completion heuristic
-whose behavior could silently diverge from the versioned classifier.
+Before an OpenAI request, Go applies a conservative deterministic lexical
+classifier to normalized English name and description text. The classifier is
+versioned and uses anchored, exact/narrow phrase rules only:
+
+- phrases meaning complete or finish the game, main game, main story, story,
+  or campaign map to `base_game_completion`;
+- phrases meaning reach an ending or reach the epilogue map to
+  `base_game_ending`; and
+- every other input is a local no-match and remains unresolved for reuse or
+  OpenAI classification.
+
+After sentence-boundary splitting, Unicode case folding,
+punctuation-to-space conversion, and whitespace collapse, a positive clause
+must exactly match one of these templates:
+
+- `{complete|completed|finish|finished} [the] {game|main game|main story|story|campaign}`;
+- `{reach|reached} {an|the} {ending|epilogue}`.
+
+Braces denote a choice and brackets an optional token; no stemming, substring,
+synonym, translation, or API-name match is allowed.
+
+An explicit exclusion vetoes a local positive match when the same normalized
+definition refers to a chapter, act, mission, or level; DLC or expansion;
+New Game Plus; difficulty; speedrun; collection; all/multiple endings; or
+another meta achievement. The lexical classifier is English-only, never
+infers from an API-name fragment alone, never emits a non-qualifying semantic
+class other than `unknown`, and never emits a weight. Its exact phrase table,
+normalization identity, and exclusion table are part of a persisted
+`lexical-completion-v1` rule version.
+
+Build each classification generation from a complete deterministic merge:
+
+1. reuse a prior validated classification when the definition content hash
+   and classifier/rule identities are unchanged;
+2. apply `lexical-completion-v1` to the remaining definitions;
+3. send only unresolved definitions to OpenAI and accept only validated strict
+   results; and
+4. activate only when every current definition has one persisted result and
+   source (`reused`, `lexical`, `openai`, or `unknown`) plus rule version.
+
+When OpenAI is disabled or unavailable and no active generation exists for
+the game, unresolved definitions may be persisted as `unknown` so a complete
+generation containing local lexical matches can activate. When an active
+last-good generation already exists, a provider failure must not replace it
+with a weaker failure-derived generation; its projection also remains
+unchanged. The deterministic 100% rule and lexical matches therefore work
+locally without making provider failure negative evidence.
 
 ## 6. Deterministic Completion Weight
 
@@ -350,8 +395,8 @@ counts never include rows absent from the latest successful snapshot.
 
 `achievement_semantic_classification_generations` stores the per-game
 activation barrier: game, configured model/prompt/schema identity, expected
-definition-set hash, status, and activation time. At most one generation for a
-given configured identity is active for a game.
+definition-set hash, lexical rule version, status, and activation time. At
+most one generation for a given configured identity is active for a game.
 
 `achievement_semantic_classifications` stores validated immutable classifier
 results:
@@ -363,17 +408,21 @@ results:
 - `model`;
 - `prompt_version` and `schema_version`;
 - `input_content_hash`; and
+- `classification_source`: `reused`, `lexical`, `openai`, or `unknown`;
+- `lexical_rule_version`; and
 - `created_at`.
 
-A uniqueness key over the definition hash and classifier identity makes jobs
-idempotent. A per-game classification generation records the complete expected
-set of current classifiable definition hashes. A generation becomes active
-only after every expected key has one validated result; chunked provider calls
-may stage results but cannot expose a partial generation. A deterministic
-current-classification query selects only the active configured
-prompt/schema/model generation for the current definition. A stale
-classification is retained as history but cannot silently classify changed
-text.
+A uniqueness key over the definition hash and combined OpenAI/lexical
+classifier identity makes jobs idempotent. Unchanged content hashes reuse
+prior validated semantics rather than spending another provider call. A
+per-game classification generation records the complete expected set of
+current classifiable definition hashes and the source chosen for each result.
+A generation becomes active only after every expected key has one validated
+result; reused, lexical, and chunked provider results may stage independently
+but cannot expose a partial generation. A deterministic current-classification
+query selects only the active configured prompt/schema/model/rule generation
+for the current definition. A stale classification is retained as history but
+cannot silently classify changed text.
 
 ### 7.4 Historical evidence and current projection
 
@@ -411,10 +460,14 @@ claim that the user did not complete the game. Source-state availability
 continues to distinguish a successful non-qualifying snapshot from unknown or
 unavailable Steam data.
 
-`completion_at` is the earliest known qualifying ending unlock time. When the
-only basis is 100%, use the last unlock time from the successful 100% snapshot
-when known; otherwise leave it null rather than inventing a date. This date is
-for historical wording and auditing, not decay.
+When at least one qualifying ending exists, `completion_at` is the earliest
+known qualifying ending unlock time; that ending-derived date wins even when
+the projection basis is `both`. If qualifying endings exist but none has a
+known unlock time, leave `completion_at` null rather than borrowing the 100%
+timestamp. Only when there are no qualifying endings and the basis is 100%
+may `completion_at` use the known last-unlock time from the successful 100%
+snapshot; otherwise it is null. This date is for historical wording and
+auditing, not decay.
 
 The projection is derived entirely in Go from saved evidence and current
 validated classifications. Database constraints enforce non-negative counts,
@@ -473,15 +526,21 @@ player failure must not convert a valid shared schema into user completion.
 ### 8.3 Classification and projection jobs
 
 After a committed definition changes its content hash, enqueue an idempotent
-achievement-semantic classification generation for that game. The job may
-split a bounded definition set across provider calls, but it activates the
-generation only after the complete expected key set has validated output.
+achievement-semantic classification generation for that game. This is shared,
+game-scoped work: the `achievement.classify` payload and queue row contain no
+user ID and are not user-owned. The job first reuses unchanged definition
+hashes, applies the versioned lexical classifier, and may split the remaining
+bounded unresolved set across provider calls, but it activates the generation
+only after the complete expected key set has validated or explicitly unknown
+output.
 
-After either a successful player snapshot or a newly published relevant
-classification, enqueue/rearm a user completion projection and the existing
+After a successful player snapshot, enqueue/rearm that user's fenced
+completion projection. After a classification generation activates, list all
+existing users with observations for the game and enqueue one user-owned,
+deletion-fenced `completion.project` job for each; those jobs own the existing
 profile/recommendation rebuild chain. Replays are safe: content hashes,
-classifier identity, projection algorithm version, and existing queue
-idempotency determine whether work is already current.
+classifier identity, lexical rule version, projection algorithm version, and
+existing queue idempotency determine whether work is already current.
 
 If publisher metadata changes and the new classification generation is not
 active yet, keep the last successful completion projection while work is
@@ -568,10 +627,12 @@ Remove the semantic `LIMIT 100` from the initial SQL ordering. Load the bounded
 single-user relevant set, normalize it, and apply one deterministic selector
 in Go. The selector protects evidence in this order:
 
-1. latest explicit positive or negative feedback needed to explain an
-   override or avoidance;
+1. games with a positive inferred completion projection, including a
+   completion currently suppressed by an explicit override so the summary can
+   explain why it is not positive;
 2. games with positive Steam two-week `recently_played_minutes`;
-3. games with a positive inferred completion projection;
+3. latest explicit positive or negative feedback not already represented by
+   the completion/override tier;
 4. wishlist context; and
 5. remaining historical playtime and achievement-progress rows.
 
@@ -592,10 +653,13 @@ schema version are bumped and explicitly state:
 - an overridden completion cannot become a positive preference claim; and
 - missing dates or activity do not support recency claims.
 
-The selector must retain at least one positive two-week activity row whenever
-one exists and the cap is non-zero. Completion rows must be represented before
-unprotected wishlist/history rows. Tests with more than 100 relevant games pin
-these guarantees.
+The selector must retain completion/override facts before recent activity,
+recent activity before other explicit feedback, and at least one positive
+two-week activity row whenever one exists and capacity remains after protected
+completion facts. Completion overrides must remain explicit in the selected
+item. Completion and recent rows must be represented before unprotected
+wishlist/history rows. Tests with more than 100 relevant games pin these
+guarantees.
 
 ## 11. Failure Handling and Last-Known-Good State
 
@@ -618,13 +682,16 @@ these guarantees.
   metadata unclassified.
 - A schema result never creates or deletes a user's unlock evidence.
 
-### OpenAI classification
+### Semantic generation and OpenAI classification
 
-- Valid output appends an immutable classification and may trigger projection
+- Reusable unchanged classifications and deterministic lexical matches are
+  staged before unresolved definitions are sent to OpenAI.
+- Valid output completes an immutable generation and may trigger projection
   rebuilds.
 - Disabled, timeout, rate limit, malformed output, unknown keys, missing keys,
-  or invalid enums publish nothing and preserve the last valid classification
-  for the same current definition hash.
+  or invalid enums preserve the last active generation and projection. If no
+  active generation exists, disabled/unavailable OpenAI may publish a complete
+  local generation whose unresolved definitions are explicitly `unknown`.
 - Provider errors are reduced to the existing allowlisted safe diagnostic
   categories. Raw prompts, bodies, API keys, and provider error text are not
   logged or stored.
@@ -672,6 +739,7 @@ Introduce and persist explicit versions for:
 
 - achievement metadata normalization;
 - semantic prompt and JSON schema;
+- deterministic lexical completion rules;
 - completion projection algorithm;
 - profile algorithm/build key;
 - recommendation ranking algorithm;
@@ -763,6 +831,12 @@ supplement focused test selection, and finish with `make verify`.
 ### Classification
 
 - Every semantic class is accepted only in the versioned strict schema.
+- `lexical-completion-v1` accepts only the anchored English completion/ending
+  phrases and every explicit exclusion vetoes a local positive match.
+- The lexical classifier returns only a qualifying class or no-match/unknown;
+  it never returns a weight.
+- Unchanged definition content hashes reuse prior validated classifications;
+  changed content does not.
 - Missing, duplicate, or unknown evidence keys; unknown enums; invalid JSON;
   and unsafe output publish nothing.
 - DLC endings, meta all-endings achievements, partial progress, optional
@@ -770,8 +844,10 @@ supplement focused test selection, and finish with `make verify`.
 - Base-game endings and explicit base-game completion markers do increment it.
 - Changed normalized text changes the content hash and cannot reuse a stale
   classification.
-- OpenAI-disabled and failure cases retain prior valid classifications and
-  leave unseen definitions unknown.
+- With no active generation, OpenAI-disabled/unavailable runs can activate a
+  complete local generation from reused results, lexical results, and unknowns.
+- With an active generation, OpenAI failure cannot publish a weaker generation
+  or change the current projection.
 
 ### Projection formula
 
@@ -790,7 +866,10 @@ Table tests cover:
 - locked, DLC, meta, partial, optional, and unknown achievements: not counted;
 - additional Steam achievements after a prior 100% snapshot: historical
   completion retained;
-- missing completion date: remains null; and
+- ending-only and `both` bases use the earliest known qualifying ending date;
+- qualifying endings with unknown dates remain null even if the 100% snapshot
+  has a known last-unlock time;
+- 100%-only uses its known snapshot last-unlock time, otherwise null; and
 - repeated projection: identical output and version.
 
 ### Profile and ranking
@@ -813,8 +892,9 @@ Table tests cover:
 ### Summary evidence and presentation
 
 - With more than 100 relevant games, at least one game with positive Steam
-  two-week activity survives whenever one exists.
-- Completion rows survive before unprotected wishlist/history rows.
+  two-week activity survives whenever capacity remains after completion facts.
+- Positive and overridden completion facts precede two-week activity; two-week
+  activity precedes other explicit feedback, wishlist, and history.
 - Explicit negative overrides are supplied as such and cannot become positive
   completion prose.
 - An old completion is described as historical unless independent recent data
@@ -830,6 +910,8 @@ Table tests cover:
 - Legacy 100% rows backfill to `1.50` without external calls.
 - User deletion cascades unlocks/evidence/projections while shared definitions
   remain.
+- `achievement.classify` is shared and game-scoped, while every
+  `completion.project` job is user-owned and deletion-fenced.
 - An in-flight fenced projection/rebuild cannot recreate deleted user data.
 - Fake Steam data covers ordinary, missing-metadata, schema-fallback, private,
   and failed responses.
@@ -837,8 +919,9 @@ Table tests cover:
   output.
 - A short completed game becomes a strong profile anchor and affects a
   published deterministic ranking even with low playtime.
-- The same flow publishes successfully with OpenAI disabled when the 100%
-  deterministic rule is available.
+- The same flow publishes successfully with OpenAI disabled for both the 100%
+  deterministic rule and a first generation containing a lexical ending match
+  plus explicit unknowns for unresolved definitions.
 
 ## 17. Acceptance Criteria
 
@@ -859,18 +942,25 @@ The design is implemented when all of the following are true:
    of playtime/recent/feedback, and does not recency-decay.
 8. Latest explicit dislike/exclude suppresses the positive completion signal
    without deleting the historical fact.
-9. OpenAI supplies only versioned semantic classes; all projection, weighting,
-   affinities, scoring, evidence selection, and ordering remain deterministic
-   Go behavior.
-10. Profile-summary evidence protects Steam two-week activity and inferred
-    completion before unprotected wishlist/history rows and distinguishes
-    historical completion from current interest.
-11. New factor/evidence contracts are aligned across persistence, Go API,
+9. OpenAI supplies only versioned semantic classes; the versioned English
+   lexical fallback supplies only qualifying classes or unknown, and all
+   projection, weighting, affinities, scoring, evidence selection, and ordering
+   remain deterministic Go behavior.
+10. Classification generations deterministically merge unchanged reuse,
+    lexical results, and validated OpenAI output; provider failure can seed an
+    all-local generation only when no active generation exists and can never
+    weaken an active last-good generation or projection.
+11. `achievement.classify` is shared game-scoped work with no user ownership;
+    activation fans out to user-owned fenced `completion.project` jobs.
+12. Profile-summary evidence prioritizes positive/overridden completion facts,
+    Steam two-week activity, explicit feedback, wishlist, then history, and
+    distinguishes historical completion from current interest.
+13. New factor/evidence contracts are aligned across persistence, Go API,
     TypeScript normalization, UI, and tests; legacy rankings remain readable.
-12. Migration/backfill, user deletion, job replay, source failure, and
+14. Migration/backfill, user deletion, job replay, source failure, and
     classifier failure preserve local-first operation and last-known-good
     state.
-13. Focused race-enabled backend tests, frontend test/typecheck/lint/build, and
+15. Focused race-enabled backend tests, frontend test/typecheck/lint/build, and
     the repository-wide verification command pass with zero failures.
 
 ## 18. Follow-Up Boundary
