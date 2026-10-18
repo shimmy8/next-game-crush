@@ -228,8 +228,10 @@ assert_text_contains "$verify_job" 'pnpm@11\.25\.0' 'verify must install pnpm 11
 assert_text_contains "$verify_job" 'pnpm --dir web install --frozen-lockfile' 'verify must install locked frontend dependencies'
 assert_text_contains "$verify_job" '\[\[ -x /usr/bin/google-chrome \]\]' 'system Chrome fallback must check executable Chrome'
 assert_text_contains "$verify_job" 'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome' 'system Chrome fallback path is incorrect'
-assert_text_contains "$verify_job" "GOWORK=off TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127\\.0\\.0\\.1:55432/next_game_crush_test\\?sslmode=disable' go test -race \\./\\.\\.\\." \
+assert_text_contains "$verify_job" "GOWORK=off TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127\\.0\\.0\\.1:55432/next_game_crush_test\\?sslmode=disable' go test -json -race \\./\\.\\.\\." \
   'verify must run all backend tests with race detection against the isolated test database'
+assert_text_contains "$verify_job" '::error title=Backend race tests failed::' \
+  'backend failures must expose the failing package or test as a check annotation'
 assert_text_contains "$verify_job" 'pnpm --dir web run test' 'verify must run frontend unit tests'
 assert_text_contains "$verify_job" 'pnpm --dir web run typecheck' 'verify must run frontend type checks'
 assert_text_contains "$verify_job" 'pnpm --dir web run lint' 'verify must run frontend lint'
