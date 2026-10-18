@@ -16,14 +16,15 @@ import (
 )
 
 const (
-	defaultWebAPIBaseURL    = "https://api.steampowered.com"
-	defaultStoreBaseURL     = "https://store.steampowered.com"
-	defaultRequestTimeout   = 10 * time.Second
-	defaultMaxResponseBytes = int64(4 << 20)
-	defaultRetryBase        = 250 * time.Millisecond
-	defaultMinInterval      = 100 * time.Millisecond
-	defaultMaxConcurrent    = 4
-	defaultMaxRetries       = 2
+	defaultWebAPIBaseURL       = "https://api.steampowered.com"
+	defaultStoreBaseURL        = "https://store.steampowered.com"
+	defaultStoreServiceBaseURL = "https://partner.steam-api.com"
+	defaultRequestTimeout      = 10 * time.Second
+	defaultMaxResponseBytes    = int64(4 << 20)
+	defaultRetryBase           = 250 * time.Millisecond
+	defaultMinInterval         = 100 * time.Millisecond
+	defaultMaxConcurrent       = 4
+	defaultMaxRetries          = 2
 )
 
 var (
@@ -34,17 +35,18 @@ var (
 )
 
 type HTTPConfig struct {
-	APIKey             string
-	HTTPClient         *http.Client
-	WebAPIBaseURL      string
-	StoreBaseURL       string
-	RequestTimeout     time.Duration
-	MaxResponseBytes   int64
-	MaxRetries         int
-	RetryBase          time.Duration
-	MinRequestInterval time.Duration
-	MaxConcurrent      int
-	CacheValidators    map[CacheKey]CacheValidator
+	APIKey              string
+	HTTPClient          *http.Client
+	WebAPIBaseURL       string
+	StoreBaseURL        string
+	StoreServiceBaseURL string
+	RequestTimeout      time.Duration
+	MaxResponseBytes    int64
+	MaxRetries          int
+	RetryBase           time.Duration
+	MinRequestInterval  time.Duration
+	MaxConcurrent       int
+	CacheValidators     map[CacheKey]CacheValidator
 }
 
 // NewHTTPClient is an explicit constructor alias for callers that name the
@@ -77,6 +79,7 @@ type HTTPClient struct {
 	httpClient         *http.Client
 	webBase            *url.URL
 	storeBase          *url.URL
+	storeServiceBase   *url.URL
 	requestTimeout     time.Duration
 	maxResponseBytes   int64
 	maxRetries         int
@@ -104,6 +107,10 @@ func NewClient(cfg HTTPConfig) (*HTTPClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid Steam Store base URL: %w", err)
 	}
+	storeServiceBase, err := parseBaseURL(cfg.StoreServiceBaseURL, defaultStoreServiceBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Steam Store Service base URL: %w", err)
+	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{
 			Timeout: defaultRequestTimeout,
@@ -112,6 +119,11 @@ func NewClient(cfg HTTPConfig) (*HTTPClient, error) {
 			},
 		}
 	}
+	// Keep redirects disabled even when a caller supplies a transport/client.
+	// A Steam request URL can contain the server's API key.
+	clientCopy := *cfg.HTTPClient
+	clientCopy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	cfg.HTTPClient = &clientCopy
 	if cfg.RequestTimeout == 0 {
 		cfg.RequestTimeout = defaultRequestTimeout
 	}
@@ -154,7 +166,7 @@ func NewClient(cfg HTTPConfig) (*HTTPClient, error) {
 	}
 	return &HTTPClient{
 		apiKey: strings.TrimSpace(cfg.APIKey), httpClient: cfg.HTTPClient,
-		webBase: webBase, storeBase: storeBase, requestTimeout: cfg.RequestTimeout,
+		webBase: webBase, storeBase: storeBase, storeServiceBase: storeServiceBase, requestTimeout: cfg.RequestTimeout,
 		maxResponseBytes: cfg.MaxResponseBytes, maxRetries: cfg.MaxRetries,
 		retryBase: cfg.RetryBase, minRequestInterval: cfg.MinRequestInterval,
 		semaphore: make(chan struct{}, cfg.MaxConcurrent), validators: validators,
@@ -530,7 +542,12 @@ func (c *HTTPClient) GameDetails(ctx context.Context, appID int64) (GameDetails,
 			HeaderImage      string          `json:"header_image"`
 			Developers       []string        `json:"developers"`
 			Publishers       []string        `json:"publishers"`
-			Categories       []struct {
+			Platforms        *struct {
+				Windows *bool `json:"windows"`
+				Mac     *bool `json:"mac"`
+				Linux   *bool `json:"linux"`
+			} `json:"platforms"`
+			Categories []struct {
 				ID          int    `json:"id"`
 				Description string `json:"description"`
 			} `json:"categories"`
@@ -552,10 +569,15 @@ func (c *HTTPClient) GameDetails(ctx context.Context, appID int64) (GameDetails,
 		return GameDetails{}, ErrUnavailable
 	}
 	requiredAge, ageErr := parseAge(record.Data.RequiredAge)
-	if record.Data.AppID != appID || strings.TrimSpace(record.Data.Type) == "" || strings.TrimSpace(record.Data.Name) == "" || strings.TrimSpace(record.Data.ReleaseDate.Date) == "" || ageErr != nil {
+	if record.Data.AppID != appID || strings.TrimSpace(record.Data.Type) == "" || strings.TrimSpace(record.Data.Name) == "" || (strings.TrimSpace(record.Data.ReleaseDate.Date) == "" && !record.Data.ReleaseDate.ComingSoon) || ageErr != nil {
+		return GameDetails{}, invalidResponse(GameDetailsOperation)
+	}
+	platforms := record.Data.Platforms
+	if platforms == nil || platforms.Windows == nil || platforms.Mac == nil || platforms.Linux == nil {
 		return GameDetails{}, invalidResponse(GameDetailsOperation)
 	}
 	details := GameDetails{AppID: appID, Type: record.Data.Type, Name: record.Data.Name, RequiredAge: requiredAge, Free: record.Data.Free, ShortDescription: record.Data.ShortDescription, HeaderImage: record.Data.HeaderImage, Developers: append([]string(nil), record.Data.Developers...), Publishers: append([]string(nil), record.Data.Publishers...), ReleaseDate: ReleaseDate{ComingSoon: record.Data.ReleaseDate.ComingSoon, Raw: record.Data.ReleaseDate.Date}}
+	details.Platforms = Platforms{Windows: *platforms.Windows, Mac: *platforms.Mac, Linux: *platforms.Linux}
 	for _, category := range record.Data.Categories {
 		details.Categories = append(details.Categories, Category{ID: category.ID, Description: category.Description})
 	}
@@ -564,6 +586,51 @@ func (c *HTTPClient) GameDetails(ctx context.Context, appID int64) (GameDetails,
 	}
 	c.recordMetadata(cacheKey, response.header, false)
 	return details, nil
+}
+
+func (c *HTTPClient) DeckCompatibility(ctx context.Context, appID int64) (DeckCompatibility, Availability, error) {
+	if appID <= 0 {
+		return "", RequestFailed, invalidResponse(DeckCompatibilityOperation)
+	}
+	cacheKey := DeckCompatibilityCacheKey(appID)
+	values := url.Values{"nAppID": {strconv.FormatInt(appID, 10)}}
+	response, availability, err := c.get(ctx, cacheKey, c.storeBase, "/saleaction/ajaxgetdeckappcompatibilityreport", values)
+	if err != nil {
+		return "", availability, err
+	}
+	var payload struct {
+		Success *int `json:"success"`
+		Results *struct {
+			ResolvedCategory *int `json:"resolved_category"`
+		} `json:"results"`
+	}
+	if err := decode(response.body, &payload, DeckCompatibilityOperation); err != nil {
+		return "", RequestFailed, err
+	}
+	if payload.Success == nil {
+		return "", RequestFailed, invalidResponse(DeckCompatibilityOperation)
+	}
+	if *payload.Success != 1 {
+		return "", Unavailable, nil
+	}
+	if payload.Results == nil || payload.Results.ResolvedCategory == nil {
+		return "", RequestFailed, invalidResponse(DeckCompatibilityOperation)
+	}
+	var status DeckCompatibility
+	switch *payload.Results.ResolvedCategory {
+	case 3:
+		status = DeckVerified
+	case 2:
+		status = DeckPlayable
+	case 1:
+		status = DeckUnsupported
+	case 0:
+		status = DeckUnknown
+	default:
+		return "", RequestFailed, invalidResponse(DeckCompatibilityOperation)
+	}
+	c.recordMetadata(cacheKey, response.header, false)
+	return status, Available, nil
 }
 
 type httpResponse struct {

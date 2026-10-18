@@ -14,6 +14,10 @@ Keep the local MVP usable when optional upstreams are unavailable. Do not expand
 - Use `docs/local-demo.md` for real-account verification and troubleshooting.
 - Treat live code, migrations, generated SQL bindings, and observed test output as evidence of current behavior. Plans describe intent, not proof.
 
+## Subagent workflow
+
+- Perform every task in this repository in subagent mode: delegate the work to at least one subagent, and use the parent agent only for coordination and final reporting.
+
 ## Architecture and implementation rules
 
 - Use Go 1.27.2 with `GOWORK=off`. The backend is a modular monolith that serves the API, worker, and built React application.
@@ -47,7 +51,9 @@ CodeGraph is available as a navigation and impact-analysis aid. Its index is loc
 - Prefer `codegraph affected` plus package knowledge for focused tests, then run broader tests for shared queues, auth, sync, ranking, or lifecycle changes.
 - For backend changes, run the relevant Go tests with `-race`; use `GOWORK=off` for direct Go commands.
 - For frontend changes, run `pnpm --dir web run test`, `typecheck`, `lint`, and `build`.
+- During implementation, prefer the smallest relevant unit and integration tests. Do not rerun the full browser E2E suite after every small edit; run focused E2E only after the related end-to-end user workflow is complete or when a browser-only behavior needs proof.
 - For cross-cutting, security-sensitive, persistence, workflow, Docker, or release-ready changes, run `make verify`. If the pinned Playwright Chromium download is unavailable, use the documented explicit system-Chrome fallback and report it.
+- Run one fresh full `make verify` as the final release gate after the implementation and focused reviews have stabilized. Repeat it only when a subsequent change can affect that gate or when the previous run was interrupted or invalidated.
 - For documentation-only changes, run `git diff --check` and validate every referenced command or path that changed.
 - Do not claim a fix or completion from an agent report alone. Inspect the diff and report fresh command output with zero failures.
 

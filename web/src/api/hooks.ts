@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getCalendar, getCurrentSync, getProfile, getSyncStatus, preflightSync, startSync } from './client'
-import type { DashboardData, DashboardLoadState, PreflightResponse, SyncStatus } from './types'
+import { getRecommendationOverview, getCurrentSync, getProfile, getSyncStatus, normalizeOverview, preflightSync, startSync } from './client'
+import type { CalendarResponse, DashboardData, DashboardLoadState, DashboardReloadResult, PreflightResponse, SafeReloadReason, SyncStatus } from './types'
 
-const EMPTY_CALENDAR: DashboardData['calendar'] = { exactDates: [], month: [], quarter: [], year: [], comingSoon: [], tba: [] }
+const EMPTY_OVERVIEW = normalizeOverview({})
 
 export type Freshness = { kind: 'fresh' | 'stale' | 'unknown'; message: string }
 
-export function deriveFreshness(profile: DashboardData['profile'], calendar: DashboardData['calendar'], now = Date.now()): Freshness {
+export function deriveFreshness(profile: DashboardData['profile'], calendar: CalendarResponse, now = Date.now()): Freshness {
   if (!profile) return { kind: 'unknown', message: 'Свежесть неизвестна: профиль ещё не собран' }
   const timestamps = [profile.createdAt, ...Object.values(calendar).flat().map((item) => item.createdAt)]
   const parsed = timestamps.map((value) => Date.parse(value))
@@ -52,34 +52,44 @@ export async function pollSyncJob(jobId: string, options: PollOptions): Promise<
 
 export function useDashboardData(initialState?: DashboardLoadState) {
   const [state, setState] = useState<DashboardLoadState>(initialState ?? { status: 'loading' })
+  const stateRef = useRef<DashboardLoadState>(initialState ?? { status: 'loading' })
   const request = useRef(0)
   const abort = useRef<AbortController | null>(null)
 
-  const reload = useCallback(async () => {
+  const usableData = useCallback((value: DashboardLoadState) => value.status === 'ready' || value.status === 'stale' || value.status === 'unknown' || value.status === 'empty' ? value.data : undefined, [])
+  const publish = useCallback((value: DashboardLoadState) => { stateRef.current = value; setState(value) }, [])
+  const nonFresh = useCallback((reason: SafeReloadReason): DashboardReloadResult => {
+    const data = usableData(stateRef.current)
+    return data ? { kind: 'stale', data, reason } : { kind: 'failed', reason }
+  }, [usableData])
+
+  const reload = useCallback(async (): Promise<DashboardReloadResult> => {
     abort.current?.abort()
     const controller = new AbortController()
     abort.current = controller
     const current = ++request.current
     try {
-      const [profile, calendar] = await Promise.all([getProfile(controller.signal), getCalendar(controller.signal)])
-      if (current !== request.current || controller.signal.aborted) return
-      const data = { profile, calendar }
-      const count = Object.values(calendar).reduce((total, items) => total + items.length, 0)
-      if (!profile && count === 0) setState({ status: 'empty', data })
+      const [profile, overview] = await Promise.all([getProfile(controller.signal), getRecommendationOverview(controller.signal)])
+      if (current !== request.current) return nonFresh('superseded')
+      if (controller.signal.aborted) return nonFresh('aborted')
+      const data = { profile, overview }
+      const count = Object.values(overview.calendar).reduce((total, items) => total + items.length, 0)
+      if (!profile && count === 0) publish({ status: 'empty', data })
       else {
-        const freshness = deriveFreshness(profile, calendar)
-        if (freshness.kind === 'fresh') setState({ status: 'ready', data })
-        else setState({ status: freshness.kind, data, message: freshness.message })
+        const freshness = deriveFreshness(profile, overview.calendar)
+        if (freshness.kind === 'fresh') publish({ status: 'ready', data })
+        else publish({ status: freshness.kind, data, message: freshness.message })
       }
+      return { kind: 'fresh', data }
     } catch {
-      if (current === request.current && !controller.signal.aborted) setState((previous) => {
-        if (previous.status === 'ready' || previous.status === 'stale' || previous.status === 'unknown' || previous.status === 'empty') {
-          return { status: 'stale', data: previous.data, message: 'Не удалось обновить — показываем последние сохранённые данные' }
-        }
-        return { status: 'error', message: 'Не удалось загрузить профиль и календарь' }
-      })
+      if (current !== request.current) return nonFresh('superseded')
+      if (controller.signal.aborted) return nonFresh('aborted')
+      const previous = usableData(stateRef.current)
+      if (previous) publish({ status: 'stale', data: previous, message: 'Не удалось обновить — показываем последние сохранённые данные' })
+      else publish({ status: 'error', message: 'Не удалось загрузить профиль и календарь' })
+      return previous ? { kind: 'stale', data: previous, reason: 'request_failed' } : { kind: 'failed', reason: 'request_failed' }
     }
-  }, [])
+  }, [nonFresh, publish, usableData])
 
   useEffect(() => {
     const timer = !initialState ? window.setTimeout(() => { void reload() }, 0) : undefined
@@ -89,7 +99,7 @@ export function useDashboardData(initialState?: DashboardLoadState) {
     }
   }, [initialState, reload])
 
-  return { state, reload, emptyData: { profile: null, calendar: EMPTY_CALENDAR } as DashboardData }
+  return { state, reload, emptyData: { profile: null, overview: EMPTY_OVERVIEW } satisfies DashboardData }
 }
 
 export function useSync(csrfToken: string, onComplete: () => void) {

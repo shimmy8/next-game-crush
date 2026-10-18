@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"next-game-crush/internal/preferences"
 )
 
 const defaultBaseURL = "https://api.openai.com"
@@ -90,7 +92,7 @@ func (client *OpenAI) SummarizeProfile(ctx context.Context, input ProfileEvidenc
 	if err != nil {
 		return output, err
 	}
-	err = client.structured(ctx, "profile_summary_v2", profileInstructions, ProfilePromptVersion, profileSummarySchema(), normalized, &output)
+	err = client.structured(ctx, "profile_summary_v3", profileInstructions, ProfilePromptVersion, profileSummarySchema(), normalized, &output)
 	if err != nil {
 		return ProfileSummary{}, err
 	}
@@ -113,7 +115,11 @@ func (client *OpenAI) ExplainRecommendation(ctx context.Context, input Recommend
 	if err != nil {
 		return output, err
 	}
-	err = client.structured(ctx, "recommendation_explanation_v1", explanationInstructions, ExplanationPromptVersion, explanationSchema(), normalized, &output)
+	allowedKeys := make([]string, len(normalized.Evidence))
+	for i, item := range normalized.Evidence {
+		allowedKeys[i] = item.Key
+	}
+	err = client.structured(ctx, "recommendation-explanation-v2", explanationInstructions, ExplanationPromptVersion, explanationSchema(allowedKeys), normalized, &output)
 	if err != nil {
 		return Explanation{}, err
 	}
@@ -126,16 +132,19 @@ func (client *OpenAI) ExplainRecommendation(ctx context.Context, input Recommend
 
 func (client *OpenAI) ClassifyFeedback(ctx context.Context, input FeedbackText) (FeedbackClassification, error) {
 	var output FeedbackClassification
-	normalized, allowed, err := normalizeFeedback(input)
+	normalized, _, err := normalizeFeedback(input)
 	if err != nil {
 		return output, err
 	}
-	err = client.structured(ctx, "feedback_classification_v1", feedbackInstructions, FeedbackPromptVersion, feedbackSchema(), normalized, &output)
+	err = client.structured(ctx, "feedback_classification_v2", feedbackInstructions, FeedbackPromptVersion, feedbackSchema(), normalized, &output)
 	if err != nil {
 		return FeedbackClassification{}, err
 	}
-	if err := validateFeedbackOutput(&output, allowed); err != nil {
+	if err := ValidateFeedbackClassification(output, normalized.EvidenceKey); err != nil {
 		return FeedbackClassification{}, err
+	}
+	if output.Confidence < .7 {
+		output.Actionable = false
 	}
 	return output, nil
 }
@@ -505,14 +514,20 @@ func validateExplanationOutput(output Explanation, allowed map[string]struct{}) 
 	return validateCitations(output.EvidenceKeys, allowed)
 }
 
-func validateFeedbackOutput(output *FeedbackClassification, allowed map[string]struct{}) error {
-	if !validTaxonomy(output.Taxonomy) || !oneOf(output.Polarity, "positive", "negative", "neutral") || output.Confidence < 0 || output.Confidence > 1 || math.IsNaN(output.Confidence) {
+func ValidateFeedbackClassification(output FeedbackClassification, evidenceKey string) error {
+	if !validTaxonomy(output.Taxonomy) || !oneOf(output.Polarity, "positive", "negative", "neutral") || output.Confidence < 0 || output.Confidence > 1 || math.IsNaN(output.Confidence) || math.IsInf(output.Confidence, 0) {
 		return fmt.Errorf("%w: invalid feedback classification", ErrInvalidOutput)
 	}
-	if output.Confidence < .7 {
-		output.Actionable = false
+	if p := output.Preference; p != nil {
+		paired := output.Taxonomy == "single-player" && p.Target == preferences.ModeSinglePlayer || output.Taxonomy == "multiplayer" && p.Target != preferences.ModeSinglePlayer
+		if p.Dimension != "mode" || p.Direction != "avoid" || !preferences.ValidMode(p.Target) || output.Polarity != "negative" || !output.Actionable || output.Confidence < .7 || !paired {
+			return ErrInvalidOutput
+		}
 	}
-	return validateCitations(output.EvidenceKeys, allowed)
+	if !validOpaqueKey(evidenceKey) || len(output.EvidenceKeys) != 1 || output.EvidenceKeys[0] != evidenceKey {
+		return ErrInvalidEvidence
+	}
+	return nil
 }
 
 func validOpaqueKey(value string) bool {
@@ -576,11 +591,14 @@ func gameFeaturesSchema(allowedKeys []string) map[string]any {
 func profileSummarySchema() map[string]any {
 	return objectSchema(map[string]any{"summary": stringSchema(), "preferences": arraySchema(stringSchema(), 30), "avoidances": arraySchema(stringSchema(), 30), "uncertainty": stringSchema(), "evidence_keys": arraySchema(stringSchema(), 100)}, "summary", "preferences", "avoidances", "uncertainty", "evidence_keys")
 }
-func explanationSchema() map[string]any {
-	return objectSchema(map[string]any{"text": stringSchema(), "facts": arraySchema(stringSchema(), 30), "inferences": arraySchema(stringSchema(), 30), "uncertainty": stringSchema(), "evidence_keys": arraySchema(stringSchema(), 100)}, "text", "facts", "inferences", "uncertainty", "evidence_keys")
+func explanationSchema(allowedKeys []string) map[string]any {
+	evidenceKeys := arraySchema(map[string]any{"type": "string", "enum": append([]string(nil), allowedKeys...)}, len(allowedKeys))
+	evidenceKeys["minItems"] = 1
+	return objectSchema(map[string]any{"text": stringSchema(), "facts": arraySchema(stringSchema(), 30), "inferences": arraySchema(stringSchema(), 30), "uncertainty": stringSchema(), "evidence_keys": evidenceKeys}, "text", "facts", "inferences", "uncertainty", "evidence_keys")
 }
 func feedbackSchema() map[string]any {
-	return objectSchema(map[string]any{"taxonomy": map[string]any{"type": "string", "enum": []string{"genre", "setting", "multiplayer", "single-player", "difficulty", "length", "early-access", "already-known", "not-now", "other"}}, "polarity": map[string]any{"type": "string", "enum": []string{"positive", "negative", "neutral"}}, "confidence": map[string]any{"type": "number", "minimum": 0, "maximum": 1}, "actionable": map[string]any{"type": "boolean"}, "evidence_keys": arraySchema(stringSchema(), 1)}, "taxonomy", "polarity", "confidence", "actionable", "evidence_keys")
+	preference := objectSchema(map[string]any{"dimension": map[string]any{"type": "string", "enum": []string{"mode"}}, "target": map[string]any{"type": "string", "enum": preferences.Modes()}, "direction": map[string]any{"type": "string", "enum": []string{"avoid"}}}, "dimension", "target", "direction")
+	return objectSchema(map[string]any{"taxonomy": map[string]any{"type": "string", "enum": []string{"genre", "setting", "multiplayer", "single-player", "difficulty", "length", "early-access", "already-known", "not-now", "other"}}, "polarity": map[string]any{"type": "string", "enum": []string{"positive", "negative", "neutral"}}, "confidence": map[string]any{"type": "number", "minimum": 0, "maximum": 1}, "actionable": map[string]any{"type": "boolean"}, "preference": map[string]any{"anyOf": []any{preference, map[string]any{"type": "null"}}}, "evidence_keys": arraySchema(stringSchema(), 1)}, "taxonomy", "polarity", "confidence", "actionable", "preference", "evidence_keys")
 }
 
 var _ Client = (*OpenAI)(nil)

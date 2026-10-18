@@ -12,6 +12,7 @@ type Client interface {
 	Achievements(context.Context, string, int64) (AchievementSummary, Availability, error)
 	AchievementSchema(context.Context, int64) (AchievementSchema, Availability, error)
 	GameDetails(context.Context, int64) (GameDetails, error)
+	DeckCompatibility(context.Context, int64) (DeckCompatibility, Availability, error)
 }
 
 var _ Client = (*HTTPClient)(nil)

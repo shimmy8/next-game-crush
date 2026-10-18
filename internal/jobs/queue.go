@@ -16,13 +16,14 @@ import (
 )
 
 var ErrLeaseLost = errors.New("job lease is no longer owned")
-var ErrDeferred = errors.New("job deferred pending required child stages")
+var ErrDeferred = errors.New("job deferred")
 
 type Spec struct {
 	Kind           string
 	IdempotencyKey string
 	Payload        json.RawMessage
 	MaxAttempts    int
+	Priority       int
 	AvailableAt    time.Time
 	ParentJobID    uuid.UUID
 	Required       bool
@@ -38,10 +39,13 @@ type Lease struct {
 	Kind           string
 	Required       bool
 	Stage          string
+	UserID         uuid.UUID
 	IdempotencyKey string
 	Payload        json.RawMessage
+	Result         json.RawMessage
 	Attempts       int
 	MaxAttempts    int
+	Priority       int
 	WorkerID       string
 	FencingToken   uuid.UUID
 	LeaseUntil     time.Time
@@ -91,6 +95,15 @@ func (q *Queue) Enqueue(ctx context.Context, spec Spec) (uuid.UUID, error) {
 	if q == nil || q.store == nil {
 		return uuid.Nil, errors.New("queue store is required")
 	}
+	return EnqueueInTx(ctx, q.store.Queries, spec)
+}
+
+// EnqueueInTx enqueues using the caller's queries, so a transaction-bound
+// instance publishes the job atomically with the caller's other writes.
+func EnqueueInTx(ctx context.Context, queries *dbgen.Queries, spec Spec) (uuid.UUID, error) {
+	if queries == nil {
+		return uuid.Nil, errors.New("queue queries are required")
+	}
 	if strings.TrimSpace(spec.Kind) == "" {
 		return uuid.Nil, errors.New("job kind is required")
 	}
@@ -109,6 +122,12 @@ func (q *Queue) Enqueue(ctx context.Context, spec Spec) (uuid.UUID, error) {
 	if spec.MaxAttempts < 1 {
 		return uuid.Nil, errors.New("max attempts must be positive")
 	}
+	if spec.Priority == 0 {
+		spec.Priority = 50
+	}
+	if spec.Priority < 1 || spec.Priority > 100 {
+		return uuid.Nil, errors.New("priority must be between 1 and 100")
+	}
 	if spec.ParentJobID == uuid.Nil && !spec.Required {
 		// Root jobs are required by definition; zero-value Specs remain backwards compatible.
 		spec.Required = true
@@ -117,11 +136,11 @@ func (q *Queue) Enqueue(ctx context.Context, spec Spec) (uuid.UUID, error) {
 	if !spec.AvailableAt.IsZero() {
 		availableAt = timeToPG(spec.AvailableAt)
 	}
-	id, err := q.store.Queries.EnqueueJob(ctx, dbgen.EnqueueJobParams{
+	id, err := queries.EnqueueJob(ctx, dbgen.EnqueueJobParams{
 		ID: uuidToPG(uuid.New()), Kind: spec.Kind, IdempotencyKey: spec.IdempotencyKey,
 		Payload: spec.Payload, MaxAttempts: int32(spec.MaxAttempts), AvailableAt: availableAt,
 		ParentJobID: nullableUUID(spec.ParentJobID), Required: spec.Required, Stage: spec.Stage,
-		UserID: nullableUUID(spec.UserID),
+		UserID: nullableUUID(spec.UserID), Priority: int16(spec.Priority),
 	})
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("enqueue job: %w", err)
@@ -130,20 +149,22 @@ func (q *Queue) Enqueue(ctx context.Context, spec Spec) (uuid.UUID, error) {
 }
 
 // AwaitChildren atomically enqueues idempotent child stages and releases the
-// parent lease. The parent is re-queued only after every required child has
-// succeeded. The caller must return ErrDeferred when ready is false.
+// parent lease. The parent is re-queued once every child is terminal and no
+// required child failed. The caller must return ErrDeferred when ready is false.
 func (q *Queue) AwaitChildren(ctx context.Context, lease Lease, specs []Spec) (ready bool, err error) {
+	if q == nil || q.store == nil {
+		return false, errors.New("queue store is required")
+	}
 	tx, err := q.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return false, fmt.Errorf("begin child scheduling: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	var owned bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sync_jobs WHERE id=$1 AND status='running' AND worker_id=$2 AND fencing_token=$3 AND lease_until>now())`, lease.ID, lease.WorkerID, lease.FencingToken).Scan(&owned); err != nil {
-		return false, fmt.Errorf("verify parent lease: %w", err)
-	}
-	if !owned {
+	var owned uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT id FROM sync_jobs WHERE id=$1 AND status='running' AND worker_id=$2 AND fencing_token=$3 AND lease_until>now() FOR UPDATE`, lease.ID, lease.WorkerID, lease.FencingToken).Scan(&owned); errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrLeaseLost
+	} else if err != nil {
+		return false, fmt.Errorf("verify parent lease: %w", err)
 	}
 	queries := q.store.Queries.WithTx(tx)
 	for _, spec := range specs {
@@ -151,13 +172,7 @@ func (q *Queue) AwaitChildren(ctx context.Context, lease Lease, specs []Spec) (r
 		if !spec.Required && !spec.Optional {
 			spec.Required = true
 		}
-		if len(spec.Payload) == 0 {
-			spec.Payload = json.RawMessage(`{}`)
-		}
-		if spec.MaxAttempts == 0 {
-			spec.MaxAttempts = 3
-		}
-		if _, err := queries.EnqueueJob(ctx, dbgen.EnqueueJobParams{ID: uuidToPG(uuid.New()), Kind: spec.Kind, IdempotencyKey: spec.IdempotencyKey, Payload: spec.Payload, MaxAttempts: int32(spec.MaxAttempts), AvailableAt: pgtype.Timestamptz{}, ParentJobID: uuidToPG(lease.ID), Required: spec.Required, Stage: spec.Stage, UserID: nullableUUID(spec.UserID)}); err != nil {
+		if _, err := EnqueueInTx(ctx, queries, spec); err != nil {
 			return false, fmt.Errorf("enqueue child stage: %w", err)
 		}
 	}
@@ -179,6 +194,42 @@ func (q *Queue) AwaitChildren(ctx context.Context, lease Lease, specs []Spec) (r
 		return false, fmt.Errorf("finish deferred attempt: %w", err)
 	}
 	return false, tx.Commit(ctx)
+}
+
+// DeferUntil releases an owned lease for a future poll without spending a
+// failure attempt. Handlers must return ErrDeferred after this succeeds.
+func (q *Queue) DeferUntil(ctx context.Context, lease Lease, availableAt time.Time) error {
+	if q == nil || q.store == nil {
+		return errors.New("queue store is required")
+	}
+	if !availableAt.After(time.Now()) {
+		return errors.New("deferred availability must be in the future")
+	}
+	tx, err := q.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin deferred polling: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	queries := q.store.Queries.WithTx(tx)
+	rows, err := queries.DeferJobUntil(ctx, dbgen.DeferJobUntilParams{
+		AvailableAt: timeToPG(availableAt), ID: uuidToPG(lease.ID),
+		WorkerID: textToPG(lease.WorkerID), FencingToken: uuidToPG(lease.FencingToken),
+	})
+	if err != nil {
+		return fmt.Errorf("defer polling job: %w", err)
+	}
+	if err := requireOwnership(rows); err != nil {
+		return err
+	}
+	if err := queries.FinishDeferredAttempt(ctx, dbgen.FinishDeferredAttemptParams{
+		JobID: uuidToPG(lease.ID), WorkerID: lease.WorkerID, FencingToken: uuidToPG(lease.FencingToken),
+	}); err != nil {
+		return fmt.Errorf("finish deferred attempt: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit deferred polling: %w", err)
+	}
+	return nil
 }
 
 func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration) (*Lease, error) {
@@ -241,6 +292,10 @@ func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration)
 	if row.ParentJobID.Valid {
 		parentJobID = uuid.UUID(row.ParentJobID.Bytes)
 	}
+	userID := uuid.Nil
+	if row.UserID.Valid {
+		userID = uuid.UUID(row.UserID.Bytes)
+	}
 	if err := queries.InsertJobAttempt(ctx, dbgen.InsertJobAttemptParams{
 		ID: uuidToPG(uuid.New()), ID_2: row.ID, WorkerID: textToPG(workerID), FencingToken: uuidToPG(token),
 	}); err != nil {
@@ -251,8 +306,9 @@ func (q *Queue) Claim(ctx context.Context, workerID string, lease time.Duration)
 	}
 	return &Lease{
 		ID: jobID, ParentJobID: parentJobID, WorkflowID: workflowID,
-		Kind: row.Kind, Required: row.Required, Stage: row.Stage, IdempotencyKey: row.IdempotencyKey,
-		Payload: row.Payload, Attempts: int(row.Attempts), MaxAttempts: int(row.MaxAttempts),
+		Kind: row.Kind, Required: row.Required, Stage: row.Stage, UserID: userID, IdempotencyKey: row.IdempotencyKey,
+		Payload: row.Payload, Result: row.Result, Attempts: int(row.Attempts), MaxAttempts: int(row.MaxAttempts),
+		Priority: int(row.Priority),
 		WorkerID: workerID, FencingToken: token, LeaseUntil: row.LeaseUntil.Time,
 	}, nil
 }

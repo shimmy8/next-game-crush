@@ -1,11 +1,15 @@
 package sync
 
 import (
+	"context"
 	"sort"
+	"sync"
 	"time"
+
+	"next-game-crush/internal/steam"
 )
 
-const AchievementTargetLimit = 30
+const achievementFetchConcurrency = 4
 
 type UserGame struct {
 	AppID           int64
@@ -15,8 +19,16 @@ type UserGame struct {
 	LastPlayedAt    time.Time
 }
 
-func SelectAchievementTargets(games []UserGame, limit int) []int64 {
-	if limit <= 0 || len(games) == 0 {
+type achievementFetchResult struct {
+	summary steam.AchievementSummary
+	state   steam.Availability
+	err     error
+}
+
+type achievementFetchFunc func(context.Context, int64) (steam.AchievementSummary, steam.Availability, error)
+
+func SelectAchievementTargets(games []UserGame, cutoff time.Time) []int64 {
+	if len(games) == 0 {
 		return []int64{}
 	}
 	candidates := append([]UserGame(nil), games...)
@@ -29,16 +41,10 @@ func SelectAchievementTargets(games []UserGame, limit int) []int64 {
 		}
 		return candidates[i].AppID < candidates[j].AppID
 	})
-	if limit > len(candidates) {
-		limit = len(candidates)
-	}
-	if limit > AchievementTargetLimit {
-		limit = AchievementTargetLimit
-	}
-	result := make([]int64, 0, limit)
-	seen := make(map[int64]struct{}, limit)
+	result := make([]int64, 0, len(candidates))
+	seen := make(map[int64]struct{}, len(candidates))
 	for _, game := range candidates {
-		if game.AppID <= 0 {
+		if game.AppID <= 0 || game.LastPlayedAt.IsZero() || game.LastPlayedAt.Before(cutoff) {
 			continue
 		}
 		if _, exists := seen[game.AppID]; exists {
@@ -46,9 +52,38 @@ func SelectAchievementTargets(games []UserGame, limit int) []int64 {
 		}
 		seen[game.AppID] = struct{}{}
 		result = append(result, game.AppID)
-		if len(result) == limit {
-			break
-		}
 	}
 	return result
+}
+
+func fetchAchievementResults(ctx context.Context, targets []int64, concurrency int, fetch achievementFetchFunc) []achievementFetchResult {
+	results := make([]achievementFetchResult, len(targets))
+	if len(targets) == 0 {
+		return results
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > len(targets) {
+		concurrency = len(targets)
+	}
+
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	workers.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				summary, state, err := fetch(ctx, targets[index])
+				results[index] = achievementFetchResult{summary: summary, state: state, err: err}
+			}
+		}()
+	}
+	for index := range targets {
+		jobs <- index
+	}
+	close(jobs)
+	workers.Wait()
+	return results
 }

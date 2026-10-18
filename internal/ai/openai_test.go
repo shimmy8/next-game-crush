@@ -182,12 +182,55 @@ func TestProfileExplanationAndFeedbackStructuredOperations(t *testing.T) {
 		t.Fatalf("explanation=%#v error=%v", explanation, err)
 	}
 
-	feedbackServer := responseServer(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"taxonomy\":\"other\",\"polarity\":\"neutral\",\"confidence\":0.2,\"actionable\":true,\"evidence_keys\":[\"feedback-1\"]}"}]}]}`)
+	feedbackServer := responseServer(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"taxonomy\":\"other\",\"polarity\":\"neutral\",\"confidence\":0.2,\"actionable\":true,\"preference\":null,\"evidence_keys\":[\"feedback-1\"]}"}]}]}`)
 	feedbackClient := newTestClient(t, feedbackServer)
 	classification, err := feedbackClient.ClassifyFeedback(context.Background(), FeedbackText{EvidenceKey: "feedback-1", Text: "Maybe later"})
 	feedbackServer.Close()
 	if err != nil || classification.Actionable {
 		t.Fatalf("classification=%#v error=%v", classification, err)
+	}
+}
+
+func TestExplanationUsesV2SchemaWithOnlySuppliedCitationKeys(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"text\":\"Подходит по атмосфере.\",\"facts\":[],\"inferences\":[],\"uncertainty\":\"\",\"evidence_keys\":[\"feature-overlap-1\"]}"}]}]}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server)
+	_, err := client.ExplainRecommendation(context.Background(), RecommendationEvidence{
+		EvidenceKey: "recommendation-evidence",
+		GameName:    "Игра",
+		Evidence: []EvidenceItem{
+			{Key: "similar-game-1", Value: "Похожа на SOMA."},
+			{Key: "feature-overlap-1", Value: "Совпадают темы: horror."},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	format := request["text"].(map[string]any)["format"].(map[string]any)
+	if format["name"] != "recommendation-explanation-v2" {
+		t.Fatalf("schema name = %#v", format["name"])
+	}
+	schema := format["schema"].(map[string]any)
+	properties := schema["properties"].(map[string]any)
+	keys := properties["evidence_keys"].(map[string]any)
+	items := keys["items"].(map[string]any)
+	if got := items["enum"]; !reflect.DeepEqual(got, []any{"feature-overlap-1", "similar-game-1"}) {
+		t.Fatalf("citation enum = %#v", got)
+	}
+	if keys["minItems"] != float64(1) || keys["maxItems"] != float64(2) {
+		t.Fatalf("citation constraints = %#v", keys)
+	}
+	encoded, _ := json.Marshal(schema)
+	if strings.Contains(string(encoded), "SOMA") || strings.Contains(string(encoded), "horror") {
+		t.Fatalf("evidence values leaked into schema: %s", encoded)
 	}
 }
 

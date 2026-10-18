@@ -11,8 +11,32 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getFeedbackClassification = `-- name: GetFeedbackClassification :one
+SELECT feedback_id, taxonomy, polarity, confidence, actionable, model, input_content_hash, created_at, schema_version, preference_dimension, preference_target, preference_direction FROM feedback_classifications WHERE feedback_id = $1
+`
+
+func (q *Queries) GetFeedbackClassification(ctx context.Context, feedbackID pgtype.UUID) (FeedbackClassification, error) {
+	row := q.db.QueryRow(ctx, getFeedbackClassification, feedbackID)
+	var i FeedbackClassification
+	err := row.Scan(
+		&i.FeedbackID,
+		&i.Taxonomy,
+		&i.Polarity,
+		&i.Confidence,
+		&i.Actionable,
+		&i.Model,
+		&i.InputContentHash,
+		&i.CreatedAt,
+		&i.SchemaVersion,
+		&i.PreferenceDimension,
+		&i.PreferenceTarget,
+		&i.PreferenceDirection,
+	)
+	return i, err
+}
+
 const getFeedbackEvent = `-- name: GetFeedbackEvent :one
-SELECT id, recommendation_id, user_id, action, reason, free_text, idempotency_key,
+SELECT id, recommendation_id, user_id, action, reason, reasons, free_text, idempotency_key,
        recommendation_snapshot, previous_ranking_version, resulting_ranking_version, rebuild_job_id, created_at
 FROM feedback_events WHERE id = $1
 `
@@ -23,6 +47,7 @@ type GetFeedbackEventRow struct {
 	UserID                  pgtype.UUID        `json:"user_id"`
 	Action                  string             `json:"action"`
 	Reason                  pgtype.Text        `json:"reason"`
+	Reasons                 []string           `json:"reasons"`
 	FreeText                pgtype.Text        `json:"free_text"`
 	IdempotencyKey          string             `json:"idempotency_key"`
 	RecommendationSnapshot  []byte             `json:"recommendation_snapshot"`
@@ -41,6 +66,7 @@ func (q *Queries) GetFeedbackEvent(ctx context.Context, id pgtype.UUID) (GetFeed
 		&i.UserID,
 		&i.Action,
 		&i.Reason,
+		&i.Reasons,
 		&i.FreeText,
 		&i.IdempotencyKey,
 		&i.RecommendationSnapshot,
@@ -53,7 +79,7 @@ func (q *Queries) GetFeedbackEvent(ctx context.Context, id pgtype.UUID) (GetFeed
 }
 
 const getFeedbackEventByIdempotencyKey = `-- name: GetFeedbackEventByIdempotencyKey :one
-SELECT id, recommendation_id, user_id, action, reason, free_text, idempotency_key,
+SELECT id, recommendation_id, user_id, action, reason, reasons, free_text, idempotency_key,
        recommendation_snapshot, previous_ranking_version, resulting_ranking_version, rebuild_job_id, created_at
 FROM feedback_events WHERE idempotency_key = $1
 `
@@ -64,6 +90,7 @@ type GetFeedbackEventByIdempotencyKeyRow struct {
 	UserID                  pgtype.UUID        `json:"user_id"`
 	Action                  string             `json:"action"`
 	Reason                  pgtype.Text        `json:"reason"`
+	Reasons                 []string           `json:"reasons"`
 	FreeText                pgtype.Text        `json:"free_text"`
 	IdempotencyKey          string             `json:"idempotency_key"`
 	RecommendationSnapshot  []byte             `json:"recommendation_snapshot"`
@@ -82,6 +109,7 @@ func (q *Queries) GetFeedbackEventByIdempotencyKey(ctx context.Context, idempote
 		&i.UserID,
 		&i.Action,
 		&i.Reason,
+		&i.Reasons,
 		&i.FreeText,
 		&i.IdempotencyKey,
 		&i.RecommendationSnapshot,
@@ -111,20 +139,23 @@ func (q *Queries) LinkFeedbackRebuildJob(ctx context.Context, arg LinkFeedbackRe
 }
 
 const upsertFeedbackClassification = `-- name: UpsertFeedbackClassification :exec
-INSERT INTO feedback_classifications(feedback_id,taxonomy,polarity,confidence,actionable,model,input_content_hash,schema_version)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+INSERT INTO feedback_classifications(feedback_id,taxonomy,polarity,confidence,actionable,model,input_content_hash,schema_version,preference_dimension,preference_target,preference_direction)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 ON CONFLICT(feedback_id) DO NOTHING
 `
 
 type UpsertFeedbackClassificationParams struct {
-	FeedbackID       pgtype.UUID `json:"feedback_id"`
-	Taxonomy         string      `json:"taxonomy"`
-	Polarity         string      `json:"polarity"`
-	Confidence       float64     `json:"confidence"`
-	Actionable       bool        `json:"actionable"`
-	Model            string      `json:"model"`
-	InputContentHash string      `json:"input_content_hash"`
-	SchemaVersion    int32       `json:"schema_version"`
+	FeedbackID          pgtype.UUID `json:"feedback_id"`
+	Taxonomy            string      `json:"taxonomy"`
+	Polarity            string      `json:"polarity"`
+	Confidence          float64     `json:"confidence"`
+	Actionable          bool        `json:"actionable"`
+	Model               string      `json:"model"`
+	InputContentHash    string      `json:"input_content_hash"`
+	SchemaVersion       int32       `json:"schema_version"`
+	PreferenceDimension pgtype.Text `json:"preference_dimension"`
+	PreferenceTarget    pgtype.Text `json:"preference_target"`
+	PreferenceDirection pgtype.Text `json:"preference_direction"`
 }
 
 func (q *Queries) UpsertFeedbackClassification(ctx context.Context, arg UpsertFeedbackClassificationParams) error {
@@ -137,6 +168,9 @@ func (q *Queries) UpsertFeedbackClassification(ctx context.Context, arg UpsertFe
 		arg.Model,
 		arg.InputContentHash,
 		arg.SchemaVersion,
+		arg.PreferenceDimension,
+		arg.PreferenceTarget,
+		arg.PreferenceDirection,
 	)
 	return err
 }

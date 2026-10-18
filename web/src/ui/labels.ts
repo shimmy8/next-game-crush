@@ -49,6 +49,8 @@ const JOB_LABELS: Record<string, string> = {
   'ai.features': 'Извлечение AI-признаков',
   'ai.profile_summary': 'Краткое описание профиля',
   'catalog.refresh': 'Обновление каталога Steam',
+  'catalog.refresh_game': 'Обновление игры в каталоге',
+  'catalog.rebuild_wakeup': 'Проверка обновления рекомендаций',
   'feedback.classify': 'Обработка отзыва',
   'notifications.digest.send': 'Отправка дайджеста',
   'profile.rebuild': 'Пересборка профиля',
@@ -56,6 +58,30 @@ const JOB_LABELS: Record<string, string> = {
   'steam.catalog': 'Каталог Steam',
   'steam.source': 'Данные Steam',
   'steam.sync': 'Синхронизация Steam',
+}
+
+export const EXPLANATION_FAILURE_REASONS = [
+  'disabled',
+  'rate_limited',
+  'timeout',
+  'provider_unavailable',
+  'refusal',
+  'invalid_output',
+  'invalid_citation',
+  'unsafe_text',
+  'unknown',
+] as const
+
+const EXPLANATION_FAILURE_LABELS: Record<(typeof EXPLANATION_FAILURE_REASONS)[number], string> = {
+  disabled: 'OpenAI отключён',
+  rate_limited: 'Лимит запросов',
+  timeout: 'Тайм-аут',
+  provider_unavailable: 'Сервис недоступен',
+  refusal: 'Ответ отклонён',
+  invalid_output: 'Некорректный ответ',
+  invalid_citation: 'Некорректные ссылки на основания',
+  unsafe_text: 'Небезопасный текст',
+  unknown: 'Неизвестная ошибка AI',
 }
 
 const TAXONOMY_LABELS: Record<string, string> = {
@@ -86,6 +112,10 @@ export function stageLabel(value: string) {
 export function jobLabel(stage: string, kind: string) {
   if (stage) return stageLabel(stage)
   return JOB_LABELS[kind] ?? 'Фоновое задание'
+}
+
+export function explanationFailureLabel(value: (typeof EXPLANATION_FAILURE_REASONS)[number]) {
+  return EXPLANATION_FAILURE_LABELS[value]
 }
 
 export function taxonomyLabel(value: string) {

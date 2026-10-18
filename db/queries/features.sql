@@ -17,6 +17,12 @@ SELECT features, input_content_hash
 FROM game_features
 WHERE game_id = $1 AND model = $2;
 
+-- name: LockGameEnrichmentEvidence :one
+SELECT name,source_snapshot FROM games WHERE id=$1 FOR SHARE;
+
+-- name: LockGameEnrichmentFeatures :one
+SELECT features,input_content_hash FROM game_features WHERE game_id=$1 AND model=$2 FOR UPDATE;
+
 -- name: GetProfileSummaryByHash :one
 SELECT summary
 FROM preference_profiles

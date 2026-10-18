@@ -47,6 +47,99 @@ func TestMeIncludesSteamIdentity(t *testing.T) {
 	}
 }
 
+func TestDemoLoginUsesOwnerDataWithoutExposingSteamID(t *testing.T) {
+	repo := &handlerRepo{sessions: map[uuid.UUID]auth.Session{}, accounts: map[string]uuid.UUID{"76561197960287930": uuid.New()}}
+	service, err := auth.New(auth.Config{AppBaseURL: "http://localhost:8080", AllowedSteamID: "76561197960287930", SessionSecret: strings.Repeat("s", 32), DemoMode: true}, repo, acceptProvider{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter(Dependencies{Auth: service})
+	login := httptest.NewRequest(http.MethodPost, "/auth/demo", nil)
+	login.Header.Set("Origin", "http://localhost:8080")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, login)
+	if recorder.Code != http.StatusSeeOther {
+		t.Fatalf("demo login status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	cookies := recorder.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != auth.SessionCookieName {
+		t.Fatalf("cookies = %#v", cookies)
+	}
+	meRequest := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	meRequest.AddCookie(cookies[0])
+	meRecorder := httptest.NewRecorder()
+	router.ServeHTTP(meRecorder, meRequest)
+	if meRecorder.Code != http.StatusOK || !strings.Contains(meRecorder.Body.String(), `"accessMode":"demo"`) || strings.Contains(meRecorder.Body.String(), "steamId") {
+		t.Fatalf("demo /api/me status = %d, body = %s", meRecorder.Code, meRecorder.Body.String())
+	}
+}
+
+func TestDemoLoginRequiresExactOrigin(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		origin string
+		status int
+	}{
+		{name: "missing", status: http.StatusForbidden},
+		{name: "wrong", origin: "https://attacker.example", status: http.StatusForbidden},
+		{name: "exact", origin: "http://localhost:8080", status: http.StatusSeeOther},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &handlerRepo{sessions: map[uuid.UUID]auth.Session{}, accounts: map[string]uuid.UUID{"76561197960287930": uuid.New()}}
+			service, err := auth.New(auth.Config{AppBaseURL: "http://localhost:8080", AllowedSteamID: "76561197960287930", SessionSecret: strings.Repeat("s", 32), DemoMode: true}, repo, acceptProvider{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/auth/demo", nil)
+			if test.origin != "" {
+				req.Header.Set("Origin", test.origin)
+			}
+			recorder := httptest.NewRecorder()
+			demoLogin(service).ServeHTTP(recorder, req)
+			if recorder.Code != test.status {
+				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, test.status, recorder.Body.String())
+			}
+			wantSessions := 0
+			if test.status == http.StatusSeeOther {
+				wantSessions = 1
+			}
+			if len(repo.sessions) != wantSessions {
+				t.Fatalf("sessions = %d, want %d", len(repo.sessions), wantSessions)
+			}
+		})
+	}
+}
+
+func TestOwnerMutationGuardAllowsOnlyExplicitOwnerMode(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mode   auth.AccessMode
+		status int
+		called bool
+	}{
+		{name: "owner", mode: auth.AccessModeOwner, status: http.StatusNoContent, called: true},
+		{name: "demo", mode: auth.AccessModeDemo, status: http.StatusForbidden},
+		{name: "empty", mode: "", status: http.StatusForbidden},
+		{name: "unknown", mode: "writer", status: http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, repo := handlerService(t, "http://localhost:8080")
+			session := repo.addSession()
+			session.AccessMode = test.mode
+			repo.sessions[session.ID] = session
+			called := false
+			handler := service.Middleware(service.RequireOwner(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { called = true; w.WriteHeader(http.StatusNoContent) })))
+			req := httptest.NewRequest(http.MethodPost, "/mutation", nil)
+			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != test.status || called != test.called {
+				t.Fatalf("status = %d, called = %t; want status %d, called %t", recorder.Code, called, test.status, test.called)
+			}
+		})
+	}
+}
+
 func TestMeIdentityNullableAndFailure(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -186,7 +279,10 @@ func TestMutationRejectsMissingOrWrongCSRF(t *testing.T) {
 	}
 }
 
-type handlerRepo struct{ sessions map[uuid.UUID]auth.Session }
+type handlerRepo struct {
+	sessions map[uuid.UUID]auth.Session
+	accounts map[string]uuid.UUID
+}
 
 func (r *handlerRepo) addSession() auth.Session {
 	token := uuid.NewString() + uuid.NewString()
@@ -195,7 +291,7 @@ func (r *handlerRepo) addSession() auth.Session {
 	sum := mac.Sum(nil)
 	var id uuid.UUID
 	copy(id[:], sum[:16])
-	s := auth.Session{ID: id, Token: token, UserID: uuid.New(), SteamID: "76561197960287930", CSRFToken: "csrf", ExpiresAt: time.Now().Add(time.Hour)}
+	s := auth.Session{ID: id, Token: token, UserID: uuid.New(), SteamID: "76561197960287930", CSRFToken: "csrf", ExpiresAt: time.Now().Add(time.Hour), AccessMode: auth.AccessModeOwner}
 	r.sessions[s.ID] = s
 	return s
 }
@@ -224,6 +320,16 @@ func (r *handlerRepo) DeleteSession(_ context.Context, id uuid.UUID) error {
 	delete(r.sessions, id)
 	return nil
 }
+func (r *handlerRepo) CreateDemoSession(_ context.Context, steamID string, session auth.Session) (auth.Session, error) {
+	userID := r.accounts[steamID]
+	if userID == uuid.Nil {
+		return auth.Session{}, auth.ErrDemoUnavailable
+	}
+	session.UserID = userID
+	session.SteamID = steamID
+	r.sessions[session.ID] = session
+	return session, nil
+}
 
 type acceptProvider struct{}
 
@@ -231,7 +337,7 @@ func (acceptProvider) Verify(context.Context, url.Values) error { return nil }
 
 func handlerService(t *testing.T, baseURL string) (*auth.Service, *handlerRepo) {
 	t.Helper()
-	repo := &handlerRepo{sessions: map[uuid.UUID]auth.Session{}}
+	repo := &handlerRepo{sessions: map[uuid.UUID]auth.Session{}, accounts: map[string]uuid.UUID{}}
 	service, err := auth.New(auth.Config{AppBaseURL: baseURL, AllowedSteamID: "76561197960287930", SessionSecret: strings.Repeat("s", 32)}, repo, acceptProvider{})
 	if err != nil {
 		t.Fatal(err)

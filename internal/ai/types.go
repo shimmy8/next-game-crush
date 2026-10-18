@@ -1,9 +1,13 @@
 package ai
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
+
+	"next-game-crush/internal/preferences"
 )
 
 const EmbeddingDimensions = 1536
@@ -114,9 +118,34 @@ type FeedbackText struct {
 }
 
 type FeedbackClassification struct {
-	Taxonomy     string   `json:"taxonomy"`
-	Polarity     string   `json:"polarity"`
-	Confidence   float64  `json:"confidence"`
-	Actionable   bool     `json:"actionable"`
-	EvidenceKeys []string `json:"evidence_keys"`
+	Taxonomy     string              `json:"taxonomy"`
+	Polarity     string              `json:"polarity"`
+	Confidence   float64             `json:"confidence"`
+	Actionable   bool                `json:"actionable"`
+	Preference   *preferences.Target `json:"preference"`
+	EvidenceKeys []string            `json:"evidence_keys"`
+}
+
+// UnmarshalJSON enforces required nullable fields even when a server or fake
+// ignores the strict schema. Errors deliberately omit untrusted output values.
+func (v *FeedbackClassification) UnmarshalJSON(data []byte) error {
+	type plain FeedbackClassification
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) != nil {
+		return ErrInvalidOutput
+	}
+	for _, name := range []string{"taxonomy", "polarity", "confidence", "actionable", "preference", "evidence_keys"} {
+		field, ok := fields[name]
+		if !ok || name != "preference" && bytes.Equal(bytes.TrimSpace(field), []byte("null")) {
+			return ErrInvalidOutput
+		}
+	}
+	var decoded plain
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&decoded) != nil {
+		return ErrInvalidOutput
+	}
+	*v = FeedbackClassification(decoded)
+	return nil
 }

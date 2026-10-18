@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"next-game-crush/internal/auth"
+	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/store"
 )
 
@@ -23,19 +25,41 @@ type ComponentHealth struct {
 }
 
 type HealthReport struct {
-	Status     string                     `json:"status"`
-	Components map[string]ComponentHealth `json:"components"`
+	Status           string                        `json:"status"`
+	Components       map[string]ComponentHealth    `json:"components"`
+	DemoEnabled      bool                          `json:"demoEnabled"`
+	CatalogDiscovery *catalog.DiscoveryDiagnostics `json:"catalogDiscovery,omitempty"`
 }
 
 type JobDiagnostic struct {
-	ID        uuid.UUID `json:"id"`
-	Kind      string    `json:"kind"`
-	Stage     string    `json:"stage"`
-	Status    string    `json:"status"`
-	Attempts  int       `json:"attempts"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
-	Error     string    `json:"error,omitempty"`
+	ID           uuid.UUID              `json:"id"`
+	Kind         string                 `json:"kind"`
+	Stage        string                 `json:"stage"`
+	Status       string                 `json:"status"`
+	Attempts     int                    `json:"attempts"`
+	CreatedAt    time.Time              `json:"createdAt"`
+	UpdatedAt    time.Time              `json:"updatedAt"`
+	Error        string                 `json:"error,omitempty"`
+	Explanations *ExplanationDiagnostic `json:"explanations,omitempty"`
+}
+
+type ExplanationDiagnostic struct {
+	AIGenerated    int            `json:"aiGenerated"`
+	Deterministic  int            `json:"deterministic"`
+	None           int            `json:"none"`
+	FailureReasons map[string]int `json:"failureReasons"`
+}
+
+var explanationFailureReasonAllowlist = [...]string{
+	"disabled",
+	"rate_limited",
+	"timeout",
+	"provider_unavailable",
+	"refusal",
+	"invalid_output",
+	"invalid_citation",
+	"unsafe_text",
+	"unknown",
 }
 
 type DataService interface {
@@ -49,6 +73,15 @@ type SQLDataService struct {
 	aiEnabled      bool
 	smtpConfigured bool
 	now            func() time.Time
+	discovery      interface {
+		Diagnostics(context.Context) (catalog.DiscoveryDiagnostics, error)
+	}
+}
+
+func (s *SQLDataService) SetDiscoveryDiagnosticsReader(reader interface {
+	Diagnostics(context.Context) (catalog.DiscoveryDiagnostics, error)
+}) {
+	s.discovery = reader
 }
 
 func NewSQLDataService(database *store.Store, aiEnabled, smtpConfigured bool) *SQLDataService {
@@ -101,12 +134,15 @@ func (s *SQLDataService) deleteUserDataOnce(ctx context.Context, userID uuid.UUI
 	// FK reference can finish while DELETE waits, including inserting wishlist
 	// catalog membership. Once DELETE returns, those writers are fenced and this
 	// cleanup also removes their late catalog rows. Seed rows remain shared.
-	if _, err = tx.Exec(ctx, `DELETE FROM catalog_entries WHERE origin='wishlist'`); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM catalog_entries ce WHERE origin='wishlist'
+		AND NOT EXISTS(SELECT 1 FROM catalog_entry_sources src WHERE src.game_id=ce.game_id AND src.active)`); err != nil {
 		return err
 	}
 	// Remove game metadata discovered only through this single user's imports.
-	// Seed catalog games remain protected by their catalog_entries row.
+	// Preserve shared provenance and discovery history even after active membership ends.
 	if _, err = tx.Exec(ctx, `DELETE FROM games g WHERE NOT EXISTS(SELECT 1 FROM catalog_entries c WHERE c.game_id=g.id)
+		AND NOT EXISTS(SELECT 1 FROM catalog_entry_sources src WHERE src.game_id=g.id)
+		AND NOT EXISTS(SELECT 1 FROM catalog_discovery_observations obs WHERE obs.steam_app_id=g.steam_app_id)
 		AND NOT EXISTS(SELECT 1 FROM user_games ug WHERE ug.game_id=g.id)
 		AND NOT EXISTS(SELECT 1 FROM wishlist_entries w WHERE w.game_id=g.id)`); err != nil {
 		return err
@@ -115,7 +151,7 @@ func (s *SQLDataService) deleteUserDataOnce(ctx context.Context, userID uuid.UUI
 }
 
 func (s *SQLDataService) Jobs(ctx context.Context, userID uuid.UUID) ([]JobDiagnostic, error) {
-	rows, err := s.store.Pool.Query(ctx, `SELECT id,kind,stage,status,attempts,created_at,updated_at,last_error FROM sync_jobs WHERE user_id=$1 ORDER BY created_at DESC,id DESC LIMIT 100`, userID)
+	rows, err := s.store.Pool.Query(ctx, `SELECT id,kind,stage,status,attempts,created_at,updated_at,last_error,result FROM sync_jobs WHERE user_id=$1 ORDER BY created_at DESC,id DESC LIMIT 100`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -124,15 +160,83 @@ func (s *SQLDataService) Jobs(ctx context.Context, userID uuid.UUID) ([]JobDiagn
 	for rows.Next() {
 		var item JobDiagnostic
 		var raw *string
-		if err := rows.Scan(&item.ID, &item.Kind, &item.Stage, &item.Status, &item.Attempts, &item.CreatedAt, &item.UpdatedAt, &raw); err != nil {
+		var rawResult []byte
+		if err := rows.Scan(&item.ID, &item.Kind, &item.Stage, &item.Status, &item.Attempts, &item.CreatedAt, &item.UpdatedAt, &raw, &rawResult); err != nil {
 			return nil, err
 		}
 		if raw != nil {
 			item.Error = SanitizeDiagnosticError(*raw)
 		}
+		if item.Kind == "recommendations.rebuild" {
+			item.Explanations = parseExplanationDiagnostic(rawResult)
+		}
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+func parseExplanationDiagnostic(raw []byte) *ExplanationDiagnostic {
+	if len(raw) == 0 {
+		return nil
+	}
+	var result struct {
+		Explanations json.RawMessage `json:"explanations"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil || len(result.Explanations) == 0 || string(result.Explanations) == "null" {
+		return nil
+	}
+	var aggregate struct {
+		AIGenerated    json.RawMessage `json:"aiGenerated"`
+		Deterministic  json.RawMessage `json:"deterministic"`
+		None           json.RawMessage `json:"none"`
+		FailureReasons json.RawMessage `json:"failureReasons"`
+	}
+	if err := json.Unmarshal(result.Explanations, &aggregate); err != nil {
+		return nil
+	}
+	aiGenerated, ok := nonnegativeJSONInteger(aggregate.AIGenerated)
+	if !ok {
+		return nil
+	}
+	deterministic, ok := nonnegativeJSONInteger(aggregate.Deterministic)
+	if !ok {
+		return nil
+	}
+	none, ok := nonnegativeJSONInteger(aggregate.None)
+	if !ok {
+		return nil
+	}
+	var rawReasons map[string]json.RawMessage
+	if len(aggregate.FailureReasons) == 0 || string(aggregate.FailureReasons) == "null" || json.Unmarshal(aggregate.FailureReasons, &rawReasons) != nil {
+		return nil
+	}
+	reasons := make(map[string]int)
+	for _, reason := range explanationFailureReasonAllowlist {
+		rawCount, exists := rawReasons[reason]
+		if !exists {
+			continue
+		}
+		count, valid := nonnegativeJSONInteger(rawCount)
+		if !valid {
+			return nil
+		}
+		reasons[reason] = count
+	}
+	return &ExplanationDiagnostic{AIGenerated: aiGenerated, Deterministic: deterministic, None: none, FailureReasons: reasons}
+}
+
+func nonnegativeJSONInteger(raw json.RawMessage) (int, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var value int
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, false
+	}
+	if value < 0 {
+		return 0, true
+	}
+	return value, true
 }
 
 func (s *SQLDataService) Health(ctx context.Context) HealthReport {
@@ -147,6 +251,14 @@ func (s *SQLDataService) Health(ctx context.Context) HealthReport {
 	result.Components["database"] = db
 	result.Components["openai"] = ComponentHealth{Status: map[bool]string{true: "configured", false: "disabled"}[s.aiEnabled], CheckedAt: now}
 	result.Components["smtp"] = ComponentHealth{Status: map[bool]string{true: "configured", false: "disabled"}[s.smtpConfigured], CheckedAt: now}
+	if s.discovery != nil {
+		diagnostics, err := s.discovery.Diagnostics(ctx)
+		if err != nil {
+			result.Status = "degraded"
+			diagnostics = catalog.DiscoveryDiagnostics{PresentationStatus: catalog.PresentationStatus{Status: "degraded"}, ActiveBySource: map[string]int64{}, Reason: "diagnostics_unavailable"}
+		}
+		result.CatalogDiscovery = &diagnostics
+	}
 	var steamFresh, aiFresh, emailFresh *time.Time
 	steamErr := s.store.Pool.QueryRow(ctx, `SELECT max(last_successful_fetch_at) FROM user_source_states`).Scan(&steamFresh)
 	aiErr := s.store.Pool.QueryRow(ctx, `SELECT max(last_successful_fetch_at) FROM game_embeddings`).Scan(&aiFresh)

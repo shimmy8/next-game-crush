@@ -50,6 +50,158 @@ func TestLatestProfileReportsMissingSummaryAsUnavailable(t *testing.T) {
 	}
 }
 
+func TestLoadSignalsIncludesLastPlayedAt(t *testing.T) {
+	database := openProfileStore(t)
+	ctx := context.Background()
+	userID, gameID := uuid.New(), uuid.New()
+	lastPlayed := time.Date(2016, time.October, 18, 12, 0, 0, 0, time.UTC)
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,570,'Dota 2','test',now())`, gameID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO user_games(user_id,game_id,playtime_minutes,recently_played_minutes,last_played_at,source,last_successful_fetch_at) VALUES($1,$2,100000,0,$3,'test',now())`, userID, gameID, lastPlayed); err != nil {
+		t.Fatal(err)
+	}
+	vector := make([]float32, Dimensions)
+	vector[0] = 1
+	if err := database.PutGameEmbedding(ctx, store.GameEmbedding{GameID: gameID, Model: "embed", ContentHash: "dota", Vector: vector}); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := NewSQLRepository(database, "embed")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signals, err := repository.LoadSignals(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signals) != 1 || !signals[0].LastPlayedAt.Equal(lastPlayed) {
+		t.Fatalf("signals = %#v, want last played %s", signals, lastPlayed)
+	}
+}
+
+func TestLoadSignalsLatestDirectActionOverridesCompletionOnly(t *testing.T) {
+	database := openProfileStore(t)
+	ctx := context.Background()
+	userID, gameID, profileID := uuid.New(), uuid.New(), uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,730,'Completion fixture','test',now())`, gameID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, profileID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO user_game_completion_projections(user_id,game_id,ending_count,hundred_percent_basis,weight,basis,algorithm_version,updated_at) VALUES($1,$2,2,false,1.85,'ending','completion-v1',now())`, userID, gameID); err != nil {
+		t.Fatal(err)
+	}
+	vector := make([]float32, Dimensions)
+	vector[0] = 1
+	if err := database.PutGameEmbedding(ctx, store.GameEmbedding{GameID: gameID, Model: "embed", ContentHash: "completion", Vector: vector}); err != nil {
+		t.Fatal(err)
+	}
+	recommendationID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score) VALUES($1,$2,$3,$4,'test',1)`, recommendationID, userID, gameID, profileID); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := NewSQLRepository(database, "embed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertFeedback := func(action string, at time.Time) {
+		t.Helper()
+		if _, err := database.Pool.Exec(ctx, `INSERT INTO feedback_events(id,recommendation_id,user_id,action,idempotency_key,created_at) VALUES($1,$2,$3,$4,$5,$6)`, uuid.New(), recommendationID, userID, action, uuid.NewString(), at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertSignal := func(wantOverridden bool, wantLikes, wantDislikes int) {
+		t.Helper()
+		signals, err := repository.LoadSignals(ctx, userID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(signals) != 1 {
+			t.Fatalf("signals = %#v, want one", signals)
+		}
+		got := signals[0]
+		if got.CompletionWeight != 1.85 || got.CompletionOverridden != wantOverridden || got.Likes != wantLikes || got.Dislikes != wantDislikes {
+			t.Fatalf("signal = %#v, want completion=1.85 overridden=%v likes=%d dislikes=%d", got, wantOverridden, wantLikes, wantDislikes)
+		}
+		var weight float64
+		if err := database.Pool.QueryRow(ctx, `SELECT weight FROM user_game_completion_projections WHERE user_id=$1 AND game_id=$2`, userID, gameID).Scan(&weight); err != nil || weight != 1.85 {
+			t.Fatalf("stored projection weight = %v, err=%v", weight, err)
+		}
+	}
+
+	base := time.Date(2026, time.October, 18, 12, 0, 0, 0, time.UTC)
+	insertFeedback("dislike", base)
+	insertFeedback("like", base.Add(time.Minute))
+	assertSignal(false, 1, 1)
+	insertFeedback("dislike", base.Add(2*time.Minute))
+	assertSignal(true, 1, 2)
+	insertFeedback("like", base.Add(3*time.Minute))
+	assertSignal(false, 2, 2)
+	insertFeedback("exclude", base.Add(4*time.Minute))
+	assertSignal(true, 2, 3)
+}
+
+func TestProfileCompletionVersionMetadataAndBuildIdentity(t *testing.T) {
+	database := openProfileStore(t)
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	legacyID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata,build_key) VALUES($1,$2,1,'{"algorithmVersion":"profile-v3-direct-feedback-once"}',$3)`, legacyID, userID, "same-source-build"); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := NewSQLRepository(database, "embed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := service.rebuildWithKey(ctx, userID, "same-source-build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID == legacyID || got.Version != 2 {
+		t.Fatalf("completion build reused legacy profile: %#v", got)
+	}
+	if AlgorithmVersion != "profile-v4-achievement-completion" {
+		t.Fatalf("algorithm version = %q", AlgorithmVersion)
+	}
+	var metadata []byte
+	var buildKey string
+	if err := database.Pool.QueryRow(ctx, `SELECT algorithm_metadata,build_key FROM preference_profiles WHERE id=$1`, got.ID).Scan(&metadata, &buildKey); err != nil {
+		t.Fatal(err)
+	}
+	var values map[string]any
+	if err := json.Unmarshal(metadata, &values); err != nil {
+		t.Fatal(err)
+	}
+	if values["algorithmVersion"] != AlgorithmVersion || values["completionAlgorithmVersion"] != "completion-v1" {
+		t.Fatalf("metadata = %s", metadata)
+	}
+	if buildKey == "same-source-build" || !strings.Contains(buildKey, AlgorithmVersion) || !strings.Contains(buildKey, "completion-v1") {
+		t.Fatalf("build key = %q, want versioned completion identity", buildKey)
+	}
+	replayed, err := service.rebuildWithKey(ctx, userID, "same-source-build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ID != got.ID || replayed.Version != got.Version {
+		t.Fatalf("versioned build did not replay: first=%#v replay=%#v", got, replayed)
+	}
+}
+
 func TestLaterRebuildEnqueuesFreshIdempotentSummaryAfterDeadAttempt(t *testing.T) {
 	database := openProfileStore(t)
 	ctx := context.Background()

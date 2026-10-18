@@ -51,6 +51,7 @@ const STAGE_BY_KIND: Record<string, string> = {
   'ai.features': 'ai_features',
   'ai.profile_summary': 'profile_summary',
   'catalog.refresh': 'catalog',
+  'catalog.refresh_game': 'catalog',
   'feedback.classify': 'feedback',
   'notifications.digest.send': 'digest',
   'profile.rebuild': 'profile',

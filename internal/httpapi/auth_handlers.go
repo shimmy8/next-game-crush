@@ -145,7 +145,27 @@ func me(identityReader IdentityReadService) http.HandlerFunc {
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"authenticated": true, "steamId": session.SteamID, "csrfToken": session.CSRFToken, "expiresAt": session.ExpiresAt, "displayName": identity.DisplayName, "avatarUrl": identity.AvatarURL})
+		body := map[string]any{"authenticated": true, "accessMode": session.AccessMode, "csrfToken": session.CSRFToken, "expiresAt": session.ExpiresAt, "displayName": identity.DisplayName, "avatarUrl": identity.AvatarURL}
+		if session.AccessMode != auth.AccessModeDemo {
+			body["steamId"] = session.SteamID
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	}
+}
+
+func demoLogin(service *auth.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != service.Origin() {
+			http.Error(w, "invalid origin", http.StatusForbidden)
+			return
+		}
+		session, err := service.CreateDemoSession(r.Context())
+		if err != nil {
+			http.Error(w, "demo mode unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		service.SetSessionCookie(w, session)
+		http.Redirect(w, r, "/", http.StatusSeeOther)
 	}
 }
 

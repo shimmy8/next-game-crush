@@ -22,6 +22,7 @@ import (
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/notifications"
 	"next-game-crush/internal/observability"
+	"next-game-crush/internal/preferences"
 	"next-game-crush/internal/profile"
 	"next-game-crush/internal/recommendations"
 	"next-game-crush/internal/steam"
@@ -44,8 +45,7 @@ func New(cfg config.Config) (*App, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("open frontend build: %w", err)
 	}
-	openCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), 90*time.Second)
 	err := waitForDatabase(openCtx, time.Second, func(ctx context.Context) error {
 		connection, connectErr := pgx.Connect(ctx, cfg.DatabaseURL)
 		if connectErr != nil {
@@ -54,19 +54,23 @@ func New(cfg config.Config) (*App, error) {
 		return connection.Close(ctx)
 	})
 	if err != nil {
+		cancelOpen()
 		return nil, fmt.Errorf("wait for persistence store: %w", err)
 	}
 	db, err := store.Open(openCtx, cfg.DatabaseURL)
+	cancelOpen()
 	if err != nil {
 		return nil, fmt.Errorf("open persistence store: %w", err)
 	}
+	setupCtx, cancelSetup := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelSetup()
 	workerID, err := workerIdentity()
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
 	queue := jobs.NewQueue(db)
-	steamClient, err := steam.NewClient(steam.HTTPConfig{APIKey: cfg.SteamWebAPIKey, WebAPIBaseURL: cfg.SteamWebAPIBaseURL, StoreBaseURL: cfg.SteamStoreBaseURL})
+	steamClient, err := steam.NewClient(steam.HTTPConfig{APIKey: cfg.SteamWebAPIKey, WebAPIBaseURL: cfg.SteamWebAPIBaseURL, StoreBaseURL: cfg.SteamStoreBaseURL, StoreServiceBaseURL: cfg.SteamStoreServiceBaseURL})
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure Steam client: %w", err)
@@ -80,6 +84,14 @@ func New(cfg config.Config) (*App, error) {
 	if err != nil {
 		db.Close()
 		return nil, err
+	}
+	if err := catalogService.Bootstrap(setupCtx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("bootstrap catalog: %w", err)
+	}
+	if err := catalogService.CleanupLegacyWishlistProjection(setupCtx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("clean legacy catalog projection: %w", err)
 	}
 	syncService, err := syncservice.NewService(db, queue, steamClient, catalogService, syncservice.WithLogger(eventLogger))
 	if err != nil {
@@ -128,6 +140,22 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("register AI handlers: %w", err)
 	}
 	syncService.SetAIJobPlanner(aiService)
+	discoveryService, err := catalog.NewDiscoveryService(catalog.NewDiscoveryRepository(db), steamClient, steamClient, queue, cfg.CatalogDiscovery, eventLogger)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure catalog discovery: %w", err)
+	}
+	discoveryService.SetEnrichmentPlanner(aiService)
+	aiService.SetCatalogChangedHook(discoveryService.MarkCatalogChanged)
+	if err := discoveryService.RegisterHandlers(worker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register catalog discovery handlers: %w", err)
+	}
+	if err := discoveryService.EnsureScheduled(setupCtx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("schedule catalog discovery: %w", err)
+	}
+	syncService.SetDiscoveryNudger(discoveryService)
 	profileRepository, err := profile.NewSQLRepository(db, cfg.OpenAIEmbeddingModel)
 	if err != nil {
 		db.Close()
@@ -148,12 +176,18 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("configure recommendation repository: %w", err)
 	}
+	if err := recommendationRepository.SetHorizonDays(cfg.CatalogDiscovery.HorizonDays); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure recommendation horizon: %w", err)
+	}
 	recommendationService, err := recommendations.NewService(recommendationRepository, profileService, openAIClient)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure recommendation service: %w", err)
 	}
 	recommendationService.SetQueue(queue)
+	recommendationService.SetExplanationCache(recommendationRepository, cfg.OpenAIModel)
+	recommendationService.SetOverviewSources(recommendationRepository, discoveryService)
 	if err := recommendationService.RegisterHandlers(worker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register recommendation handlers: %w", err)
@@ -171,6 +205,20 @@ func New(cfg config.Config) (*App, error) {
 	if err := feedbackService.RegisterHandlers(worker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register feedback handlers: %w", err)
+	}
+	preferenceRepository, err := preferences.NewSQLRepository(db)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure preference repository: %w", err)
+	}
+	preferenceService, err := preferences.NewService(preferenceRepository, queue)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure preference service: %w", err)
+	}
+	if err := preferenceService.RegisterHandlers(worker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register preference handlers: %w", err)
 	}
 	notificationRepository, err := notifications.NewSQLRepository(db)
 	if err != nil {
@@ -197,19 +245,23 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("register notification handlers: %w", err)
 	}
 	syncService.EnableRankingJobs()
-	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret, FixtureAuth: cfg.FixtureAuth}, auth.NewSQLRepository(db), nil)
+	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret, FixtureAuth: cfg.FixtureAuth, DemoMode: cfg.DemoMode}, auth.NewSQLRepository(db), nil)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure authentication: %w", err)
 	}
 	deps.Auth = authService
+	deps.DemoEnabled = cfg.DemoMode
 	deps.Sync = syncService
 	deps.Identity = syncService
 	deps.Profile = profileService
+	deps.Preferences = preferenceService
 	deps.Recommendations = recommendationService
 	deps.Feedback = feedbackService
 	deps.Digests = notificationService
-	deps.Data = httpapi.NewSQLDataService(db, cfg.OpenAI.Enabled, strings.TrimSpace(cfg.SMTPURL) != "")
+	dataService := httpapi.NewSQLDataService(db, cfg.OpenAI.Enabled, strings.TrimSpace(cfg.SMTPURL) != "")
+	dataService.SetDiscoveryDiagnosticsReader(discoveryService)
+	deps.Data = dataService
 	return &App{store: db, worker: worker, server: &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpapi.NewRouter(deps),

@@ -210,6 +210,365 @@ func TestSteamVisibilityMigration(t *testing.T) {
 	}
 }
 
+func TestPreferenceAdjustmentsMigration(t *testing.T) {
+	baseURL := os.Getenv("TEST_DATABASE_URL")
+	if baseURL == "" {
+		t.Skip("TEST_DATABASE_URL is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := "upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	_ = admin.Close(ctx)
+	t.Cleanup(func() {
+		cleanup, err := pgx.Connect(context.Background(), baseURL)
+		if err == nil {
+			defer cleanup.Close(context.Background())
+			_, _ = cleanup.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+		}
+	})
+	separator := "?"
+	if strings.Contains(baseURL, "?") {
+		separator = "&"
+	}
+	database, err := sql.Open("pgx", fmt.Sprintf("%s%ssearch_path=%s%%2Cpublic", baseURL, separator, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, migrationfiles.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	if _, err = provider.UpTo(ctx, 9); err != nil {
+		t.Fatal(err)
+	}
+	user, game, profile, recommendation, feedback := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO users(id)VALUES($1)`, []any{user}},
+		{`INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at)VALUES($1,123,'Existing','catalog_seed',now())`, []any{game}},
+		{`INSERT INTO preference_profiles(id,user_id,version)VALUES($1,$2,1)`, []any{profile, user}},
+		{`INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score)VALUES($1,$2,$3,$4,'old',15)`, []any{recommendation, user, game, profile}},
+		{`INSERT INTO feedback_events(id,recommendation_id,user_id,action,idempotency_key)VALUES($1,$2,$3,'dislike','existing')`, []any{feedback, recommendation, user}},
+		{`INSERT INTO feedback_classifications(feedback_id,taxonomy,polarity,confidence,actionable,model,input_content_hash)VALUES($1,'multiplayer','negative',.9,true,'old','old-hash')`, []any{feedback}},
+	} {
+		if _, err = database.ExecContext(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = provider.UpTo(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+	var target *string
+	var hash string
+	if err = database.QueryRowContext(ctx, `SELECT preference_target,input_content_hash FROM feedback_classifications WHERE feedback_id=$1`, feedback).Scan(&target, &hash); err != nil || target != nil || hash != "old-hash" {
+		t.Fatalf("classification target=%v hash=%q err=%v", target, hash, err)
+	}
+	var score float64
+	if err = database.QueryRowContext(ctx, `SELECT score FROM recommendations WHERE id=$1`, recommendation).Scan(&score); err != nil || score != 15 {
+		t.Fatalf("ranking score=%v err=%v", score, err)
+	}
+	for _, table := range []string{"preference_adjustments", "game_modes"} {
+		var count int
+		if err = database.QueryRowContext(ctx, "SELECT count(*) FROM "+pgx.Identifier{table}.Sanitize()).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("table %s count=%d err=%v", table, count, err)
+		}
+	}
+	if _, err = provider.Down(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var exists bool
+	if err = database.QueryRowContext(ctx, `SELECT to_regclass('game_modes') IS NOT NULL`).Scan(&exists); err != nil || exists {
+		t.Fatalf("down left game_modes: %v err=%v", exists, err)
+	}
+	if err = database.QueryRowContext(ctx, `SELECT score FROM recommendations WHERE id=$1`, recommendation).Scan(&score); err != nil || score != 15 {
+		t.Fatalf("down changed old ranking: %v err=%v", score, err)
+	}
+}
+
+func TestGroundedExplanationMigrationBackfillsLegacySources(t *testing.T) {
+	baseURL := os.Getenv("TEST_DATABASE_URL")
+	if baseURL == "" {
+		t.Skip("TEST_DATABASE_URL is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := "upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	_ = admin.Close(ctx)
+	t.Cleanup(func() {
+		cleanup, cleanupErr := pgx.Connect(context.Background(), baseURL)
+		if cleanupErr == nil {
+			defer cleanup.Close(context.Background())
+			_, _ = cleanup.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+		}
+	})
+	separator := "?"
+	if strings.Contains(baseURL, "?") {
+		separator = "&"
+	}
+	database, err := sql.Open("pgx", fmt.Sprintf("%s%ssearch_path=%s%%2Cpublic", baseURL, separator, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, migrationfiles.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	if _, err = provider.UpTo(ctx, 8); err != nil {
+		t.Fatal(err)
+	}
+	userID, profileID := uuid.New(), uuid.New()
+	generatedGameID, deterministicGameID := uuid.New(), uuid.New()
+	generatedID, deterministicID := uuid.New(), uuid.New()
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO users(id) VALUES($1)`, []any{userID}},
+		{`INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,101,'Generated','catalog_seed',now()),($2,102,'Deterministic','catalog_seed',now())`, []any{generatedGameID, deterministicGameID}},
+		{`INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, []any{profileID, userID}},
+		{`INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score,explanation_generated) VALUES($1,$2,$3,$4,'legacy',2,true),($5,$2,$6,$4,'legacy',1,false)`, []any{generatedID, userID, generatedGameID, profileID, deterministicID, deterministicGameID}},
+	} {
+		if _, err = database.ExecContext(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = provider.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		id     uuid.UUID
+		source string
+	}{
+		{id: generatedID, source: "ai"},
+		{id: deterministicID, source: "deterministic"},
+	} {
+		var source string
+		var reason *string
+		if err = database.QueryRowContext(ctx, `SELECT explanation_source,explanation_failure_reason FROM recommendations WHERE id=$1`, test.id).Scan(&source, &reason); err != nil {
+			t.Fatal(err)
+		}
+		if source != test.source || reason != nil {
+			t.Fatalf("recommendation %s source=%q reason=%v, want source=%q reason=NULL", test.id, source, reason, test.source)
+		}
+	}
+}
+
+func TestGameCompatibilityMigration(t *testing.T) {
+	baseURL := os.Getenv("TEST_DATABASE_URL")
+	if baseURL == "" {
+		t.Skip("TEST_DATABASE_URL is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := "compatibility_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	_ = admin.Close(ctx)
+	t.Cleanup(func() {
+		cleanup, cleanupErr := pgx.Connect(context.Background(), baseURL)
+		if cleanupErr == nil {
+			defer cleanup.Close(context.Background())
+			_, _ = cleanup.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+		}
+	})
+	separator := "?"
+	if strings.Contains(baseURL, "?") {
+		separator = "&"
+	}
+	database, err := sql.Open("pgx", fmt.Sprintf("%s%ssearch_path=%s%%2Cpublic", baseURL, separator, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, migrationfiles.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	if _, err = provider.UpTo(ctx, 11); err != nil {
+		t.Fatal(err)
+	}
+	gameID, cascadeGameID := uuid.New(), uuid.New()
+	if _, err = database.ExecContext(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,1201,'Existing','catalog_seed',now()),($2,1202,'Cascade','catalog_seed',now())`, gameID, cascadeGameID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = provider.UpTo(ctx, 12); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err = database.QueryRowContext(ctx, `SELECT count(*) FROM game_compatibility`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("compatibility rows after upgrade = %d, err=%v; want no invented observations", count, err)
+	}
+	if _, err = database.ExecContext(ctx, `INSERT INTO game_compatibility(game_id,windows,mac,linux,platforms_last_successful_fetch_at) VALUES($1,true,false,true,now()),($2,false,true,false,now())`, gameID, cascadeGameID); err != nil {
+		t.Fatal(err)
+	}
+	var status, availability string
+	var attemptedAt, succeededAt *time.Time
+	if err = database.QueryRowContext(ctx, `SELECT deck_status,deck_availability,deck_last_attempt_at,deck_last_successful_fetch_at FROM game_compatibility WHERE game_id=$1`, gameID).Scan(&status, &availability, &attemptedAt, &succeededAt); err != nil {
+		t.Fatal(err)
+	}
+	if status != "unknown" || availability != "unknown" || attemptedAt != nil || succeededAt != nil {
+		t.Fatalf("unexpected Deck defaults: status=%q availability=%q attempt=%v success=%v", status, availability, attemptedAt, succeededAt)
+	}
+	for _, value := range []string{"verified", "playable", "unsupported", "unknown"} {
+		if _, err = database.ExecContext(ctx, `UPDATE game_compatibility SET deck_status=$1 WHERE game_id=$2`, value, gameID); err != nil {
+			t.Fatalf("Deck status %q: %v", value, err)
+		}
+	}
+	if _, err = database.ExecContext(ctx, `UPDATE game_compatibility SET deck_status='invalid' WHERE game_id=$1`, gameID); err == nil {
+		t.Fatal("invalid Deck status unexpectedly accepted")
+	}
+	if _, err = database.ExecContext(ctx, `DELETE FROM games WHERE id=$1`, cascadeGameID); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.QueryRowContext(ctx, `SELECT count(*) FROM game_compatibility WHERE game_id=$1`, cascadeGameID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("compatibility cascade count=%d err=%v", count, err)
+	}
+	if _, err = provider.Down(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var exists bool
+	if err = database.QueryRowContext(ctx, `SELECT to_regclass('game_compatibility') IS NOT NULL`).Scan(&exists); err != nil || exists {
+		t.Fatalf("down left game_compatibility: %v err=%v", exists, err)
+	}
+	var name string
+	if err = database.QueryRowContext(ctx, `SELECT name FROM games WHERE id=$1`, gameID).Scan(&name); err != nil || name != "Existing" {
+		t.Fatalf("down changed existing game: name=%q err=%v", name, err)
+	}
+	for _, table := range []string{"catalog_discovery_state", "preference_adjustments", "game_modes"} {
+		if err = database.QueryRowContext(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil || !exists {
+			t.Fatalf("down changed earlier table %s: exists=%v err=%v", table, exists, err)
+		}
+	}
+	if err = database.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='recommendations' AND column_name='explanation_source')`).Scan(&exists); err != nil || !exists {
+		t.Fatalf("down changed earlier explanation schema: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestFeedbackMultipleReasonsMigrationBackfillsLegacyReason(t *testing.T) {
+	baseURL := os.Getenv("TEST_DATABASE_URL")
+	if baseURL == "" {
+		t.Skip("TEST_DATABASE_URL is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := "feedback_reasons_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	_ = admin.Close(ctx)
+	t.Cleanup(func() {
+		cleanup, cleanupErr := pgx.Connect(context.Background(), baseURL)
+		if cleanupErr == nil {
+			defer cleanup.Close(context.Background())
+			_, _ = cleanup.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+		}
+	})
+	separator := "?"
+	if strings.Contains(baseURL, "?") {
+		separator = "&"
+	}
+	database, err := sql.Open("pgx", fmt.Sprintf("%s%ssearch_path=%s%%2Cpublic", baseURL, separator, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, migrationfiles.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer provider.Close()
+	if _, err = provider.UpTo(ctx, 12); err != nil {
+		t.Fatal(err)
+	}
+	userID, gameID, profileID, recommendationID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	eventID, trimmedEventID, unknownEventID, whitespaceEventID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO users(id) VALUES($1)`, []any{userID}},
+		{`INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,1301,'Legacy','catalog_seed',now())`, []any{gameID}},
+		{`INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, []any{profileID, userID}},
+		{`INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score) VALUES($1,$2,$3,$4,'legacy',1)`, []any{recommendationID, userID, gameID, profileID}},
+		{`INSERT INTO feedback_events(id,recommendation_id,user_id,action,reason,idempotency_key) VALUES
+			($1,$5,$6,'like','setting','legacy-reason'),
+			($2,$5,$6,'like','  genre  ','legacy-trimmed'),
+			($3,$5,$6,'like','old-client-value','legacy-unknown'),
+			($4,$5,$6,'like','   ','legacy-whitespace')`, []any{eventID, trimmedEventID, unknownEventID, whitespaceEventID, recommendationID, userID}},
+	} {
+		if _, err = database.ExecContext(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = provider.UpTo(ctx, 13); err != nil {
+		t.Fatal(err)
+	}
+	var reasons string
+	if err = database.QueryRowContext(ctx, `SELECT array_to_string(reasons, ',') FROM feedback_events WHERE id=$1`, eventID).Scan(&reasons); err != nil {
+		t.Fatal(err)
+	}
+	if reasons != "setting" {
+		t.Fatalf("backfilled reasons=%q", reasons)
+	}
+	for _, test := range []struct {
+		id   uuid.UUID
+		want string
+	}{
+		{id: trimmedEventID, want: "genre"},
+		{id: unknownEventID, want: ""},
+		{id: whitespaceEventID, want: ""},
+	} {
+		if err = database.QueryRowContext(ctx, `SELECT array_to_string(reasons, ',') FROM feedback_events WHERE id=$1`, test.id).Scan(&reasons); err != nil {
+			t.Fatal(err)
+		}
+		if reasons != test.want {
+			t.Fatalf("event %s backfilled reasons=%q, want %q", test.id, reasons, test.want)
+		}
+	}
+	if _, err = database.ExecContext(ctx, `UPDATE feedback_events SET reasons=ARRAY['unknown'] WHERE id=$1`, eventID); err == nil {
+		t.Fatal("unknown reason unexpectedly accepted")
+	}
+	if _, err = database.ExecContext(ctx, `UPDATE feedback_events SET reasons=ARRAY['genre',NULL]::text[] WHERE id=$1`, eventID); err == nil {
+		t.Fatal("NULL reason unexpectedly accepted")
+	}
+	if _, err = database.ExecContext(ctx, `UPDATE feedback_events SET reasons=ARRAY['genre','genre'] WHERE id=$1`, eventID); err == nil {
+		t.Fatal("duplicate reasons unexpectedly accepted")
+	}
+	if _, err = database.ExecContext(ctx, `UPDATE feedback_events SET reasons=ARRAY['setting','genre'] WHERE id=$1`, eventID); err == nil {
+		t.Fatal("noncanonical reason order unexpectedly accepted")
+	}
+}
+
 func TestAchievementCompletionMigrationBackfillsHundredPercentAndConstraints(t *testing.T) {
 	baseURL := os.Getenv("TEST_DATABASE_URL")
 	if baseURL == "" {

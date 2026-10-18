@@ -9,13 +9,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"next-game-crush/internal/completion"
 	"next-game-crush/internal/jobs"
 )
 
 const (
-	AlgorithmVersion  = "profile-v1"
-	JobKind           = "profile.rebuild"
-	JobPayloadVersion = 1
+	AlgorithmVersion           = "profile-v4-achievement-completion"
+	CompletionAlgorithmVersion = completion.ProjectionAlgorithmVersion
+	JobKind                    = "profile.rebuild"
+	JobPayloadVersion          = 1
 )
 
 type SummaryStatus string
@@ -26,16 +28,17 @@ const (
 )
 
 type Profile struct {
-	ID            uuid.UUID     `json:"id"`
-	UserID        uuid.UUID     `json:"-"`
-	Version       int64         `json:"version"`
-	Summary       string        `json:"summary"`
-	SummaryStatus SummaryStatus `json:"summaryStatus"`
-	Confidence    float64       `json:"confidence"`
-	EvidenceCount int           `json:"evidenceCount"`
-	Positive      []float32     `json:"-"`
-	Negative      []float32     `json:"-"`
-	CreatedAt     time.Time     `json:"createdAt"`
+	ID               uuid.UUID     `json:"id"`
+	UserID           uuid.UUID     `json:"-"`
+	Version          int64         `json:"version"`
+	Summary          string        `json:"summary"`
+	SummaryStatus    SummaryStatus `json:"summaryStatus"`
+	PositiveStrength float64       `json:"-"`
+	Confidence       float64       `json:"confidence"`
+	EvidenceCount    int           `json:"evidenceCount"`
+	Positive         []float32     `json:"-"`
+	Negative         []float32     `json:"-"`
+	CreatedAt        time.Time     `json:"createdAt"`
 }
 
 func WithSummaryState(value Profile) Profile {
@@ -57,13 +60,14 @@ type Repository interface {
 type Service struct {
 	repository Repository
 	queue      *jobs.Queue
+	now        func() time.Time
 }
 
 func NewService(repository Repository) (*Service, error) {
 	if repository == nil {
 		return nil, errors.New("profile repository is required")
 	}
-	return &Service{repository: repository}, nil
+	return &Service{repository: repository, now: time.Now}, nil
 }
 func (s *Service) SetQueue(queue *jobs.Queue) { s.queue = queue }
 func (s *Service) Rebuild(ctx context.Context, userID uuid.UUID) (Profile, error) {
@@ -74,7 +78,7 @@ func (s *Service) Rebuild(ctx context.Context, userID uuid.UUID) (Profile, error
 	if err != nil {
 		return Profile{}, fmt.Errorf("load profile signals: %w", err)
 	}
-	return s.repository.SaveProfile(ctx, userID, BuildVectors(signals), AlgorithmVersion, uuid.NewString())
+	return s.repository.SaveProfile(ctx, userID, BuildVectors(signals, s.now().UTC()), AlgorithmVersion, uuid.NewString())
 }
 
 func (s *Service) rebuildWithKey(ctx context.Context, userID uuid.UUID, buildKey string) (Profile, error) {
@@ -82,7 +86,7 @@ func (s *Service) rebuildWithKey(ctx context.Context, userID uuid.UUID, buildKey
 	if err != nil {
 		return Profile{}, fmt.Errorf("load profile signals: %w", err)
 	}
-	return s.repository.SaveProfile(ctx, userID, BuildVectors(signals), AlgorithmVersion, buildKey)
+	return s.repository.SaveProfile(ctx, userID, BuildVectors(signals, s.now().UTC()), AlgorithmVersion, buildKey)
 }
 func (s *Service) Latest(ctx context.Context, userID uuid.UUID) (Profile, error) {
 	return s.repository.LatestProfile(ctx, userID)
@@ -111,7 +115,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 				return err
 			}
 			summaryPayload, _ := json.Marshal(map[string]any{"version": 1, "profile_id": built.ID})
-			if _, err := s.queue.Enqueue(ctx, jobs.Spec{Kind: "ai.profile_summary", Stage: "profile_summary", Required: false, IdempotencyKey: lease.IdempotencyKey + ":summary:v1", Payload: summaryPayload, MaxAttempts: 3, UserID: payload.UserID}); err != nil {
+			if _, err := s.queue.Enqueue(ctx, jobs.Spec{Kind: "ai.profile_summary", Stage: "profile_summary", Required: false, IdempotencyKey: lease.IdempotencyKey + ":summary:v1", Payload: summaryPayload, MaxAttempts: 3, UserID: payload.UserID, Priority: lease.Priority}); err != nil {
 				return err
 			}
 		}

@@ -2,15 +2,18 @@ package recommendations
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/ai"
+	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/profile"
 )
@@ -23,23 +26,36 @@ const (
 type ExplanationClient interface {
 	ExplainRecommendation(context.Context, ai.RecommendationEvidence) (ai.Explanation, error)
 }
+type ExplanationCache interface {
+	GetExplanationByInput(context.Context, uuid.UUID, string, string) (ai.Explanation, bool, error)
+	PutExplanationByInput(context.Context, uuid.UUID, string, string, ai.Explanation) error
+}
 type Repository interface {
 	Candidates(context.Context, uuid.UUID, profile.Profile, int) ([]Candidate, error)
+	RankingInputs(context.Context, uuid.UUID, profile.Profile, int) (RankingInputs, error)
 	SaveRanking(context.Context, uuid.UUID, profile.Profile, []Recommendation, string) ([]Recommendation, int64, error)
-	SaveExplanation(context.Context, uuid.UUID, string, string, bool, []Evidence, []Evidence) error
-	PublishRanking(context.Context, uuid.UUID, int64) error
+	SaveExplanation(context.Context, uuid.UUID, int64, string, uuid.UUID, string, ExplanationRecord) error
+	PublishRanking(context.Context, uuid.UUID, int64, string) error
 	Latest(context.Context, uuid.UUID) ([]Recommendation, error)
 	Get(context.Context, uuid.UUID, uuid.UUID) (Recommendation, error)
 }
 type Service struct {
-	repository Repository
-	profiles   *profile.Service
-	explainer  ExplanationClient
-	limit      int
-	queue      *jobs.Queue
+	repository       Repository
+	profiles         *profile.Service
+	explainer        ExplanationClient
+	limit            int
+	queue            *jobs.Queue
+	wishlistSource   WishlistStateReader
+	discoveryStatus  catalog.DiscoveryStatusReader
+	explanationCache ExplanationCache
+	explanationModel string
 }
 
 func (s *Service) SetQueue(queue *jobs.Queue) { s.queue = queue }
+func (s *Service) SetExplanationCache(cache ExplanationCache, model string) {
+	s.explanationCache = cache
+	s.explanationModel = strings.TrimSpace(model)
+}
 
 func NewService(repository Repository, profiles *profile.Service, explainer ExplanationClient) (*Service, error) {
 	if repository == nil || profiles == nil {
@@ -48,18 +64,20 @@ func NewService(repository Repository, profiles *profile.Service, explainer Expl
 	return &Service{repository: repository, profiles: profiles, explainer: explainer, limit: 100}, nil
 }
 func (s *Service) Rebuild(ctx context.Context, userID uuid.UUID) ([]Recommendation, error) {
-	items, _, err := s.rebuild(ctx, userID, uuid.NewString())
+	items, _, _, err := s.rebuild(ctx, userID, uuid.NewString())
 	return items, err
 }
-func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string) ([]Recommendation, int64, error) {
+func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string) ([]Recommendation, int64, ExplanationStats, error) {
+	emptyStats := ExplanationStats{FailureReasons: map[ExplanationFailureReason]int{}}
 	p, err := s.profiles.Latest(ctx, userID)
 	if err != nil {
-		return nil, 0, fmt.Errorf("load current profile: %w", err)
+		return nil, 0, emptyStats, fmt.Errorf("load current profile: %w", err)
 	}
-	candidates, err := s.repository.Candidates(ctx, userID, p, s.limit)
+	input, err := s.repository.RankingInputs(ctx, userID, p, s.limit)
 	if err != nil {
-		return nil, 0, fmt.Errorf("retrieve candidates: %w", err)
+		return nil, 0, emptyStats, fmt.Errorf("retrieve candidates: %w", err)
 	}
+	candidates := input.Candidates
 	weights := DefaultWeights()
 	output := make([]Recommendation, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -67,26 +85,104 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 			continue
 		}
 		result := Score(candidate.Factors, weights)
-		output = append(output, Recommendation{GameID: candidate.GameID, Name: candidate.Name, ProfileVersion: p.Version, AlgorithmVersion: AlgorithmVersion, Score: result.Score, Confidence: clamp(candidate.Factors.Confidence * p.Confidence), Factors: candidate.Factors, Weights: weights, Release: candidate.Release})
+		item := Recommendation{GameID: candidate.GameID, Name: candidate.Name, ProfileVersion: p.Version, AlgorithmVersion: AlgorithmVersion, Score: result.Score, Confidence: clamp(candidate.Factors.Confidence * p.Confidence), Factors: candidate.Factors, Weights: weights, Wishlisted: clamp(candidate.Factors.Wishlist) > 0, Release: candidate.Release}
+		if candidate.ModePreferenceEvidence != nil {
+			item.Evidence = []Evidence{*candidate.ModePreferenceEvidence}
+		}
+		output = append(output, item)
 	}
 	output = Sort(output)
-	saved, rankingVersion, err := s.repository.SaveRanking(ctx, userID, p, output, buildKey)
+	runBuildKey := RankingBuildKey(buildKey, AlgorithmVersion, ActiveAdjustmentsDigest(input.ActiveAdjustments))
+	saved, rankingVersion, err := s.repository.SaveRanking(ctx, userID, p, output, runBuildKey)
 	if err != nil {
-		return nil, 0, fmt.Errorf("persist ranking: %w", err)
+		return nil, 0, emptyStats, fmt.Errorf("persist ranking: %w", err)
 	}
+	if len(saved) == 0 {
+		return nil, rankingVersion, emptyStats, nil
+	}
+	corpus := input.Corpus
+	stats := emptyStats
 	for i := range saved {
-		evidence := publicEvidence(saved[i])
-		explanation := Explain(ctx, s.explainer, saved[i].Name, evidence)
-		cited := citedEvidence(evidence, explanation.EvidenceKeys)
-		if err := s.repository.SaveExplanation(ctx, saved[i].ID, saved[i].Name, explanation.Text, explanation.Generated, evidence, cited); err != nil {
-			return nil, 0, err
+		candidate := corpus.Candidates[saved[i].GameID]
+		if candidate.GameID == uuid.Nil {
+			candidate.GameID = saved[i].GameID
 		}
-		saved[i].Explanation, saved[i].GeneratedExplanation, saved[i].Evidence = explanation.Text, explanation.Generated, evidence
+		selected := SelectGroundingEvidence(BuildGroundingEvidence(saved[i], candidate, corpus.Anchors, p.CreatedAt))
+		explanation, err := s.explainCached(ctx, saved[i].GameID, saved[i].Name, selected)
+		if err != nil {
+			return nil, 0, stats, fmt.Errorf("reuse explanation input: %w", err)
+		}
+		record := ExplanationRecord{Text: explanation.Text, Source: explanation.Source, FailureReason: explanation.FailureReason, Supplied: selected}
+		if explanation.Source == ExplanationSourceAI {
+			record.CitedIDs = append([]string(nil), explanation.EvidenceKeys...)
+		}
+		if err := s.repository.SaveExplanation(ctx, userID, rankingVersion, runBuildKey, saved[i].ID, saved[i].Name, record); err != nil {
+			return nil, 0, stats, fmt.Errorf("persist explanation: %w", err)
+		}
+		saved[i].Explanation = explanation.Text
+		saved[i].ExplanationSource = explanation.Source
+		saved[i].GeneratedExplanation = explanation.Source == ExplanationSourceAI
+		switch explanation.Source {
+		case ExplanationSourceAI:
+			saved[i].Evidence = PublicEvidence(citedGroundingEvidence(selected, explanation.EvidenceKeys))
+			stats.AIGenerated++
+		case ExplanationSourceDeterministic:
+			saved[i].Evidence = PublicEvidence(selected)
+			stats.Deterministic++
+		default:
+			saved[i].Evidence = []Evidence{}
+			stats.None++
+		}
+		if explanation.FailureReason != "" {
+			stats.FailureReasons[explanation.FailureReason]++
+		}
 	}
-	if err := s.repository.PublishRanking(ctx, userID, rankingVersion); err != nil {
-		return nil, 0, err
+	if err := s.repository.PublishRanking(ctx, userID, rankingVersion, runBuildKey); err != nil {
+		return nil, 0, stats, err
 	}
-	return saved, rankingVersion, nil
+	return saved, rankingVersion, stats, nil
+}
+
+func (s *Service) explainCached(ctx context.Context, gameID uuid.UUID, name string, selected []GroundingEvidence) (ExplanationResult, error) {
+	if s.explanationCache == nil || s.explanationModel == "" {
+		return Explain(ctx, s.explainer, name, selected), nil
+	}
+	public := PublicEvidence(selected)
+	input, err := json.Marshal(struct {
+		Schema, Prompt, Model, Game string
+		Evidence                    []Evidence
+	}{ai.SchemaVersion, ai.ExplanationPromptVersion, s.explanationModel, name, public})
+	if err != nil {
+		return ExplanationResult{}, err
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(input))
+	if cached, ok, err := s.explanationCache.GetExplanationByInput(ctx, gameID, s.explanationModel, hash); err != nil {
+		return ExplanationResult{}, err
+	} else if ok {
+		if result, valid := validatedCachedExplanation(cached, selected); valid {
+			return result, nil
+		}
+	}
+	result := Explain(ctx, s.explainer, name, selected)
+	if result.Source == ExplanationSourceAI {
+		if err := s.explanationCache.PutExplanationByInput(ctx, gameID, s.explanationModel, hash, ai.Explanation{Text: result.Text, EvidenceKeys: append([]string(nil), result.EvidenceKeys...), Generated: true}); err != nil {
+			return ExplanationResult{}, err
+		}
+	}
+	return result, nil
+}
+
+func validatedCachedExplanation(cached ai.Explanation, selected []GroundingEvidence) (ExplanationResult, bool) {
+	allowed := map[string]struct{}{}
+	for _, item := range selected {
+		if substantiveKind(item.Kind) {
+			allowed[item.ID] = struct{}{}
+		}
+	}
+	if !safeRussianExplanation(cached.Text) || !validExplanationCitations(cached.EvidenceKeys, allowed) {
+		return ExplanationResult{}, false
+	}
+	return ExplanationResult{Text: strings.TrimSpace(cached.Text), Source: ExplanationSourceAI, EvidenceKeys: append([]string(nil), cached.EvidenceKeys...)}, true
 }
 func citedEvidence(evidence []Evidence, ids []string) []Evidence {
 	allowed := map[string]Evidence{}
@@ -118,45 +214,194 @@ func (s *Service) Get(ctx context.Context, userID, id uuid.UUID) (Recommendation
 	}
 	return safePresentation(item), nil
 }
-func Explain(ctx context.Context, client ExplanationClient, name string, evidence []Evidence) ai.Explanation {
-	fallback := func() ai.Explanation {
-		facts := make([]string, 0, len(evidence))
-		keys := make([]string, 0, len(evidence))
-		for _, item := range evidence {
-			facts = append(facts, item.Text)
-			keys = append(keys, item.ID)
+func Explain(ctx context.Context, client ExplanationClient, name string, selected []GroundingEvidence) ExplanationResult {
+	selected = SelectGroundingEvidence(selected)
+	fallback := ExplanationResult{Text: DeterministicExplanation(selected), EvidenceKeys: groundingEvidenceIDs(selected)}
+
+	substantive := make([]GroundingEvidence, 0, 2)
+	for _, item := range selected {
+		if substantiveKind(item.Kind) {
+			substantive = append(substantive, item)
 		}
-		out := ai.DeterministicExplanation(facts)
-		out.EvidenceKeys = keys
-		return out
 	}
+	if len(substantive) == 0 {
+		if len(selected) == 0 {
+			fallback.Source = ExplanationSourceNone
+		} else {
+			fallback.Source = ExplanationSourceDeterministic
+		}
+		return fallback
+	}
+	fallback.Source = ExplanationSourceDeterministic
 	if client == nil {
-		return fallback()
+		fallback.FailureReason = ExplanationFailureDisabled
+		return fallback
 	}
-	items := make([]ai.EvidenceItem, 0, len(evidence))
-	allowed := map[string]bool{}
-	for _, item := range evidence {
-		items = append(items, ai.EvidenceItem{Key: item.ID, Value: item.Text})
-		allowed[item.ID] = true
+
+	items := make([]ai.EvidenceItem, 0, len(substantive))
+	allowed := make(map[string]struct{}, len(substantive))
+	for _, item := range substantive {
+		items = append(items, ai.EvidenceItem{Key: item.ID, Value: strings.TrimSpace(item.PublicText)})
+		allowed[item.ID] = struct{}{}
 	}
-	out, err := client.ExplainRecommendation(ctx, ai.RecommendationEvidence{EvidenceKey: "recommendation-factors", GameName: name, Evidence: items})
-	if err != nil || !safeRussianExplanation(out.Text) || len(out.EvidenceKeys) == 0 {
-		return fallback()
+	out, err := client.ExplainRecommendation(ctx, ai.RecommendationEvidence{EvidenceKey: "recommendation-evidence", GameName: name, Evidence: items})
+	if err != nil {
+		fallback.FailureReason = classifyExplanationFailure(err)
+		return fallback
 	}
-	seen := map[string]bool{}
-	for _, key := range out.EvidenceKeys {
-		if !allowed[key] || seen[key] {
-			return fallback()
+	if !safeRussianExplanation(out.Text) || containsUnsupportedAffinityClaim(out.Text) {
+		fallback.FailureReason = ExplanationFailureUnsafeText
+		return fallback
+	}
+	if !validExplanationCitations(out.EvidenceKeys, allowed) {
+		fallback.FailureReason = ExplanationFailureInvalidCitation
+		return fallback
+	}
+	return ExplanationResult{
+		Text:         strings.TrimSpace(out.Text),
+		Source:       ExplanationSourceAI,
+		EvidenceKeys: append([]string(nil), out.EvidenceKeys...),
+	}
+}
+
+func classifyExplanationFailure(err error) ExplanationFailureReason {
+	if errors.Is(err, ai.ErrCapabilityDisabled) {
+		return ExplanationFailureDisabled
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return ExplanationFailureTimeout
+	}
+	var requestErr *ai.RequestError
+	if errors.As(err, &requestErr) {
+		switch {
+		case requestErr.StatusCode == http.StatusTooManyRequests:
+			return ExplanationFailureRateLimited
+		case requestErr.StatusCode == http.StatusRequestTimeout:
+			return ExplanationFailureTimeout
+		case requestErr.StatusCode >= 500:
+			return ExplanationFailureProviderUnavailable
 		}
-		seen[key] = true
 	}
-	out.Generated = true
+	switch {
+	case errors.Is(err, ai.ErrRefusal):
+		return ExplanationFailureRefusal
+	case errors.Is(err, ai.ErrInvalidEvidence):
+		return ExplanationFailureInvalidCitation
+	case errors.Is(err, ai.ErrInvalidOutput), errors.Is(err, ai.ErrInvalidInput), errors.Is(err, ai.ErrIncomplete):
+		return ExplanationFailureInvalidOutput
+	case errors.Is(err, ai.ErrHTTP):
+		return ExplanationFailureProviderUnavailable
+	default:
+		return ExplanationFailureUnknown
+	}
+}
+
+func validExplanationCitations(keys []string, allowed map[string]struct{}) bool {
+	if len(keys) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if _, ok := allowed[key]; !ok {
+			return false
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return false
+		}
+		seen[key] = struct{}{}
+	}
+	return true
+}
+
+func containsUnsupportedAffinityClaim(text string) bool {
+	lower := strings.ToLower(text)
+	for _, token := range []string{"добавляет новое", "добавит новое", "новизн", "новый опыт", "расшир", "желаем", "список желан"} {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func groundingEvidenceIDs(items []GroundingEvidence) []string {
+	keys := make([]string, 0, len(items))
+	for _, item := range items {
+		keys = append(keys, item.ID)
+	}
+	return keys
+}
+
+// legacyGroundingEvidence keeps the pre-v2 rebuild flow safe until v2 corpus
+// persistence is wired by the next phase. It drops bookkeeping-only inputs
+// and assigns fresh opaque keys rather than exposing factor names to OpenAI.
+func legacyGroundingEvidence(items []Evidence) []GroundingEvidence {
+	result := make([]GroundingEvidence, 0, len(items))
+	for _, item := range items {
+		if validModeEvidence(item.ID, item.Text) {
+			result = append(result, GroundingEvidence{ID: item.ID, Kind: EvidenceNegativeModePreference, PublicText: item.Text, Strength: 1})
+			continue
+		}
+		kind := EvidenceFeatureOverlap
+		switch item.ID {
+		case "wishlist":
+			kind = EvidenceWishlistContext
+		case "semantic-affinity":
+			kind = EvidenceSimilarGame
+		case "playtime-affinity":
+			kind = EvidencePlaytimeAnchor
+		case "achievement-affinity":
+			kind = EvidenceAchievementAnchor
+		case "recent-activity":
+			kind = EvidenceRecentActivityAnchor
+		case "positive-feedback":
+			kind = EvidencePositiveFeedback
+		case "tag-affinity":
+			kind = EvidenceFeatureOverlap
+		default:
+			continue
+		}
+		result = append(result, GroundingEvidence{ID: fmt.Sprintf("evidence-%d", len(result)+1), Kind: kind, PublicText: item.Text, Strength: 1})
+	}
+	return result
+}
+
+func hasEvidenceID(evidence []Evidence, id string) bool {
+	for _, item := range evidence {
+		if item.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSubstantiveEvidence(evidence []Evidence) bool {
+	for _, item := range evidence {
+		switch item.ID {
+		case "semantic-affinity", "tag-affinity", "playtime-affinity", "achievement-affinity", "recent-activity", "positive-feedback":
+			return true
+		}
+	}
+	return false
+}
+
+func fallbackExplanation(evidence []Evidence) ai.Explanation {
+	facts := make([]string, 0, len(evidence))
+	keys := make([]string, 0, len(evidence))
+	for _, item := range evidence {
+		facts = append(facts, item.Text)
+		keys = append(keys, item.ID)
+	}
+	out := ai.DeterministicExplanation(facts)
+	out.EvidenceKeys = keys
+	if hasEvidenceID(evidence, "wishlist") && !hasSubstantiveEvidence(evidence) {
+		out.Text = "Игра уже в вашем списке желаемого — следим за её релизом."
+	}
 	return out
 }
 
 func safeRussianExplanation(text string) bool {
 	text = strings.TrimSpace(text)
-	if text == "" || !utf8.ValidString(text) {
+	if text == "" || !utf8.ValidString(text) || utf8.RuneCountInString(text) > 1000 || containsUnsafeEvidenceSyntax(text) || containsTechnicalEvidenceToken(text) {
 		return false
 	}
 	hasRussianLetter := false
@@ -182,6 +427,7 @@ func safeRussianExplanation(text string) bool {
 		"positivefeedback", "positive_feedback",
 		"novelty",
 		"negativefeedback", "negative_feedback",
+		"negativemodepreference", "negative_mode_preference", "negativemodepreferenceweight", "negative_mode_preference_weight",
 		"dateuncertainty", "date_uncertainty",
 		"semanticsimilarity", "semantic_similarity",
 		"negativesimilaritymultiplier", "negative_similarity_multiplier",
@@ -208,7 +454,6 @@ func publicEvidence(r Recommendation) []Evidence {
 	}
 	reasons := []reason{
 		{Evidence: Evidence{ID: "semantic-affinity", Text: "Похожа на игры, которые вам нравятся"}, contribution: affinity * r.Weights.SemanticSimilarity, order: 0},
-		{Evidence: Evidence{ID: "wishlist", Text: "Игра есть в вашем списке желаемого"}, contribution: clamp(r.Factors.Wishlist) * r.Weights.Wishlist, order: 1},
 		{Evidence: Evidence{ID: "tag-affinity", Text: "Совпадает с вашими любимыми жанрами и метками"}, contribution: clamp(r.Factors.TagAffinity) * r.Weights.TagAffinity, order: 2},
 		{Evidence: Evidence{ID: "playtime-affinity", Text: "Похожа на игры, которым вы уделяли много времени"}, contribution: clamp(r.Factors.PlaytimeAffinity) * r.Weights.PlaytimeAffinity, order: 3},
 		{Evidence: Evidence{ID: "achievement-affinity", Text: "Похожа на игры, в которых вы часто получали достижения"}, contribution: clamp(r.Factors.AchievementAffinity) * r.Weights.AchievementAffinity, order: 4},
@@ -228,23 +473,82 @@ func publicEvidence(r Recommendation) []Evidence {
 		}
 		return positive[i].order < positive[j].order
 	})
-	if len(positive) > 3 {
-		positive = positive[:3]
+	result := make([]Evidence, 0, 3)
+	correction := modeEvidence(r)
+	// Reserve one persisted human evidence slot even though the factor reduces score.
+	if correction != nil {
+		result = append(result, *correction)
 	}
-	result := make([]Evidence, len(positive))
-	for i := range positive {
-		result[i] = positive[i].Evidence
+	if r.Factors.Wishlist > 0 {
+		result = append(result, Evidence{ID: "wishlist", Text: "Игра есть в вашем списке желаемого"})
+		// Keep a real affinity signal even when novelty contributes more points.
+		for _, item := range positive {
+			if hasSubstantiveEvidence([]Evidence{item.Evidence}) {
+				result = append(result, item.Evidence)
+				break
+			}
+		}
+	}
+	for _, item := range positive {
+		if len(result) == 3 {
+			break
+		}
+		if !hasEvidenceID(result, item.ID) {
+			result = append(result, item.Evidence)
+		}
 	}
 	return result
 }
 
 func safePresentation(r Recommendation) Recommendation {
+	if r.ExplanationSource != "" {
+		if r.ExplanationSource == ExplanationSourceNone {
+			r.Explanation = neutralExplanation
+			r.GeneratedExplanation = false
+			r.Evidence = []Evidence{}
+			// Mode-preference correction is persisted ranking evidence from the
+			// same snapshot, not regenerated affinity evidence. Preserve this
+			// independent feedback presentation when legacy explanation data is
+			// discarded.
+			if !r.explanationLoaded {
+				if correction := modeEvidence(r); correction != nil {
+					r.Evidence = []Evidence{*correction}
+					r.Explanation = correction.Text
+					r.ExplanationSource = ExplanationSourceDeterministic
+				}
+			}
+			return r
+		}
+		valid := (r.ExplanationSource == ExplanationSourceAI || r.ExplanationSource == ExplanationSourceDeterministic) && safeRussianExplanation(r.Explanation)
+		for _, item := range r.Evidence {
+			grounding := GroundingEvidence{ID: item.ID, Kind: item.Kind, PublicText: item.Text, Strength: 1}
+			if !validGroundingEvidence(grounding) || item.Kind == EvidenceNegativeModePreference && clamp(r.Factors.NegativeModePreference) == 0 {
+				valid = false
+				break
+			}
+		}
+		if valid && (r.ExplanationSource != ExplanationSourceAI || len(r.Evidence) > 0) {
+			r.GeneratedExplanation = r.ExplanationSource == ExplanationSourceAI
+			return r
+		}
+		r.Explanation = neutralExplanation
+		r.ExplanationSource = ExplanationSourceNone
+		r.GeneratedExplanation = false
+		r.Evidence = []Evidence{}
+		return r
+	}
+
+	// Unversioned in-memory values are kept only for old callers/tests. SQL
+	// reads are mapped strictly in mapStoredExplanation above.
 	evidence := publicEvidence(r)
 	allowed := make(map[string]string, len(evidence))
 	for _, item := range evidence {
 		allowed[item.ID] = item.Text
 	}
 	groundedGenerated := r.GeneratedExplanation && safeRussianExplanation(r.Explanation) && len(r.Evidence) > 0
+	if hasEvidenceID(evidence, "wishlist") && !hasSubstantiveEvidence(r.Evidence) {
+		groundedGenerated = false
+	}
 	for _, item := range r.Evidence {
 		if allowed[item.ID] != item.Text {
 			groundedGenerated = false
@@ -255,11 +559,7 @@ func safePresentation(r Recommendation) Recommendation {
 	if groundedGenerated {
 		return r
 	}
-	facts := make([]string, 0, len(evidence))
-	for _, item := range evidence {
-		facts = append(facts, item.Text)
-	}
-	r.Explanation = ai.DeterministicExplanation(facts).Text
+	r.Explanation = fallbackExplanation(evidence).Text
 	r.GeneratedExplanation = false
 	return r
 }
@@ -278,7 +578,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 		if json.Unmarshal(lease.Payload, &p) != nil || p.Version != JobPayloadVersion || p.UserID == uuid.Nil {
 			return errors.New("unsupported recommendations job payload schema")
 		}
-		result, rankingVersion, err := s.rebuild(ctx, p.UserID, lease.IdempotencyKey)
+		result, rankingVersion, explanationStats, err := s.rebuild(ctx, p.UserID, lease.IdempotencyKey)
 		if err != nil {
 			return err
 		}
@@ -287,7 +587,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 			if err != nil {
 				return err
 			}
-			if err := s.queue.RecordResult(ctx, lease, map[string]any{"profileVersion": profileValue.Version, "rankingVersion": rankingVersion, "algorithmVersion": AlgorithmVersion, "recommendationCount": len(result)}); err != nil {
+			if err := s.queue.RecordResult(ctx, lease, map[string]any{"profileVersion": profileValue.Version, "rankingVersion": rankingVersion, "algorithmVersion": AlgorithmVersion, "recommendationCount": len(result), "explanations": explanationStats}); err != nil {
 				return err
 			}
 		}

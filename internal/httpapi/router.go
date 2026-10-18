@@ -21,10 +21,12 @@ type Dependencies struct {
 	Sync            SyncService
 	Identity        IdentityReadService
 	Profile         ProfileReadService
+	Preferences     PreferenceAdjustmentService
 	Recommendations RecommendationReadService
 	Feedback        FeedbackService
 	Digests         DigestService
 	Data            DataService
+	DemoEnabled     bool
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -37,39 +39,47 @@ func NewRouter(deps Dependencies) http.Handler {
 	router := chi.NewRouter()
 	router.Use(requestIDMiddleware)
 	router.Use(middleware.Recoverer)
-	router.Get("/api/health", health(deps.Data))
+	router.Get("/api/health", health(deps.Data, deps.DemoEnabled))
 	if deps.Auth != nil {
 		if deps.Auth.FixtureEnabled() {
 			router.Post("/auth/fixture", fixtureLogin(deps.Auth))
+		}
+		if deps.Auth.DemoEnabled() {
+			router.Post("/auth/demo", demoLogin(deps.Auth))
 		}
 		router.Get("/auth/steam", beginSteamLogin(deps.Auth, deps.Logger))
 		router.Get("/auth/steam/callback", completeSteamLogin(deps.Auth, deps.Logger))
 		router.With(deps.Auth.Middleware).Get("/api/me", me(deps.Identity))
 		router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/auth/logout", logout(deps.Auth))
 		if deps.Sync != nil {
-			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/sync/preflight", syncPreflight(deps.Sync))
-			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/sync", startSync(deps.Sync, deps.Observability))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/sync/preflight", syncPreflight(deps.Sync))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/sync", startSync(deps.Sync, deps.Observability))
 			router.With(deps.Auth.Middleware).Get("/api/sync/current", currentSyncStatus(deps.Sync))
 			router.With(deps.Auth.Middleware).Get("/api/sync/{id}", syncStatus(deps.Sync))
 		}
 		if deps.Profile != nil {
-			router.With(deps.Auth.Middleware).Get("/api/profile", getProfile(deps.Profile))
+			router.With(deps.Auth.Middleware).Get("/api/profile", getProfile(deps.Profile, deps.Preferences))
+		}
+		if deps.Preferences != nil {
+			router.With(deps.Auth.Middleware).Get("/api/preference-adjustments", getPreferenceAdjustments(deps.Preferences))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Delete("/api/preference-adjustments/{id}", disablePreferenceAdjustment(deps.Preferences))
 		}
 		if deps.Recommendations != nil {
+			router.With(deps.Auth.Middleware).Get("/api/recommendations/overview", getRecommendationOverview(deps.Recommendations))
 			router.With(deps.Auth.Middleware).Get("/api/calendar", getCalendar(deps.Recommendations))
 			router.With(deps.Auth.Middleware).Get("/api/recommendations/{id}", getRecommendation(deps.Recommendations))
 		}
 		if deps.Feedback != nil {
-			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/recommendations/{id}/feedback", recordFeedback(deps.Feedback, false))
-			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/recommendations/{id}/reminder", recordFeedback(deps.Feedback, true))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/recommendations/{id}/feedback", recordFeedback(deps.Feedback, false))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/recommendations/{id}/reminder", recordFeedback(deps.Feedback, true))
 			router.With(deps.Auth.Middleware).Get("/api/rankings/{version}/diff", rankingDiff(deps.Feedback))
 		}
 		if deps.Digests != nil {
-			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Post("/api/digests/test", sendTestDigest(deps.Digests))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/digests/test", sendTestDigest(deps.Digests))
 		}
 		if deps.Data != nil {
 			router.With(deps.Auth.Middleware).Get("/api/jobs", listJobs(deps.Data))
-			router.With(deps.Auth.Middleware, deps.Auth.RequireCSRF).Delete("/api/data", deleteData(deps.Data, deps.Auth))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Delete("/api/data", deleteData(deps.Data, deps.Auth))
 		}
 	}
 	if deps.Digests != nil {

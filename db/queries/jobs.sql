@@ -1,7 +1,7 @@
 -- name: EnqueueJob :one
-INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id)
-VALUES ($1, $2, $3, $4, $5, COALESCE(sqlc.narg(available_at)::timestamptz, now()), sqlc.narg(parent_job_id), sqlc.arg(required), sqlc.arg(stage), sqlc.narg(user_id))
-ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id, priority)
+VALUES ($1, $2, $3, $4, $5, COALESCE(sqlc.narg(available_at)::timestamptz, now()), sqlc.narg(parent_job_id), sqlc.arg(required), sqlc.arg(stage), sqlc.narg(user_id), sqlc.arg(priority))
+ON CONFLICT (idempotency_key) DO UPDATE SET priority = GREATEST(sync_jobs.priority, EXCLUDED.priority)
 RETURNING id;
 
 -- name: ClaimJob :one
@@ -10,7 +10,7 @@ WITH candidate AS (
     WHERE attempts < max_attempts
       AND available_at <= now()
       AND (status IN ('queued', 'retryable') OR (status = 'running' AND lease_until <= now()))
-    ORDER BY available_at, created_at
+    ORDER BY priority DESC, available_at, created_at, id
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 ), claimed AS (
@@ -78,6 +78,18 @@ WHERE id = $1 AND status = 'running' AND worker_id = $2 AND fencing_token = $3 A
 
 -- name: FinishSuccessfulAttempt :exec
 UPDATE job_attempts SET status = 'succeeded', finished_at = now()
+WHERE job_id = $1 AND worker_id = $2 AND fencing_token = $3 AND status = 'running';
+
+-- name: DeferJobUntil :execrows
+UPDATE sync_jobs SET status = 'queued', attempts = GREATEST(attempts - 1, 0),
+    available_at = sqlc.arg(available_at), worker_id = NULL, fencing_token = NULL,
+    lease_until = NULL, updated_at = now()
+WHERE id = sqlc.arg(id) AND status = 'running' AND worker_id = sqlc.arg(worker_id)
+  AND fencing_token = sqlc.arg(fencing_token) AND lease_until > now()
+  AND sqlc.arg(available_at)::timestamptz > now();
+
+-- name: FinishDeferredAttempt :exec
+UPDATE job_attempts SET status = 'waiting', finished_at = now()
 WHERE job_id = $1 AND worker_id = $2 AND fencing_token = $3 AND status = 'running';
 
 -- name: FailJob :execrows

@@ -112,6 +112,21 @@ type WorkerEvent struct {
 	Reason      Reason
 }
 
+type CatalogDiscoveryEvent struct {
+	Correlation  Correlation
+	Source       string
+	Mode         string
+	Availability string
+	Discovered   int
+	Evaluated    int
+	Admitted     int
+	Skipped      int
+	Failed       int
+	Pending      int
+	Duration     time.Duration
+	Reason       Reason
+}
+
 type Logger struct {
 	logger *slog.Logger
 }
@@ -249,6 +264,35 @@ func (l *Logger) Worker(ctx context.Context, event WorkerEvent) {
 	l.logger.LogAttrs(safeContext(ctx), level, "worker lifecycle", attrs...)
 }
 
+func (l *Logger) CatalogDiscovery(ctx context.Context, event CatalogDiscoveryEvent) {
+	if l == nil || l.logger == nil {
+		return
+	}
+	availability := allow(event.Availability, availabilities)
+	level := slog.LevelInfo
+	if availability == "unavailable" || availability == "request_failed" {
+		level = slog.LevelWarn
+	}
+	attrs := []slog.Attr{slog.String("event", "catalog_discovery")}
+	attrs = appendCorrelation(attrs, event.Correlation)
+	attrs = append(attrs,
+		slog.String("source", allow(event.Source, discoverySources)),
+		slog.String("mode", allow(event.Mode, discoveryModes)),
+		slog.String("availability", availability),
+		slog.Int("discovered", nonnegative(event.Discovered)),
+		slog.Int("evaluated", nonnegative(event.Evaluated)),
+		slog.Int("admitted", nonnegative(event.Admitted)),
+		slog.Int("skipped", nonnegative(event.Skipped)),
+		slog.Int("failed", nonnegative(event.Failed)),
+		slog.Int("pending", nonnegative(event.Pending)),
+		durationAttr("duration_ms", event.Duration),
+	)
+	if reason := safeReason(event.Reason); reason != "" {
+		attrs = append(attrs, slog.String("reason", reason))
+	}
+	l.logger.LogAttrs(safeContext(ctx), level, "catalog discovery", attrs...)
+}
+
 func appendCorrelation(attrs []slog.Attr, correlation Correlation) []slog.Attr {
 	if correlation.WorkflowID != uuid.Nil {
 		attrs = append(attrs, slog.String("workflow_id", correlation.WorkflowID.String()))
@@ -316,7 +360,9 @@ var jobStages = values("started", "heartbeat", "deferred", "succeeded", "retry_s
 var sourceStages = values("started", "finished")
 var workerStages = values("started", "stopped", "claim_failed", "completion_failed", "failure_record_failed", "renewal_failed")
 var reasons = values("timeout", "rate_limited", "upstream_unavailable", "upstream_rejected", "malformed_response", "invalid_evidence", "invalid_output", "lease_lost", "persistence_failed", "internal_error")
-var jobKinds = values("steam.sync", "catalog.refresh", "achievements.sync", "achievement.classify", "completion.project", "ai.features", "ai.embedding", "ai.profile_summary", "profile.rebuild", "recommendations.rebuild", "feedback.classify", "notifications.digest.send")
-var logicalStages = values("steam", "catalog", "achievements", "achievement_classification", "completion_projection", "ai_features", "ai_embedding", "profile_summary", "profile", "recommendations", "feedback", "digest")
+var jobKinds = values("steam.sync", "catalog.refresh", "catalog.refresh_game", "catalog.discovery.tick", "catalog.discover.incremental", "catalog.discover.backfill", "catalog.qualify", "catalog.rebuild_wakeup", "achievements.sync", "achievement.classify", "completion.project", "ai.features", "ai.embedding", "ai.profile_summary", "profile.rebuild", "recommendations.rebuild", "feedback.classify", "notifications.digest.send")
+var logicalStages = values("steam", "catalog", "catalog_discovery_tick", "catalog_discovery", "catalog_qualify", "achievements", "achievement_classification", "completion_projection", "ai_features", "ai_embedding", "profile_summary", "profile", "recommendations", "feedback", "digest")
 var sources = values("owned_games", "recently_played", "wishlist", "achievements")
 var availabilities = values("available", "unavailable", "request_failed", "not_modified")
+var discoverySources = values("steam")
+var discoveryModes = values("incremental", "backfill")

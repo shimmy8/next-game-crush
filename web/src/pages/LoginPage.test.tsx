@@ -4,10 +4,11 @@ import LoginPage from './LoginPage'
 
 describe('LoginPage', () => {
   it('renders the signed-out experience in Russian while preserving product names', () => {
-    render(<LoginPage user={null} signingOut={false} onLogout={() => undefined} />)
+    render(<LoginPage user={null} signingOut={false} onLogout={() => undefined} demoEnabled />)
 
     expect(screen.getByRole('heading', { name: 'Next Game Crush' })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Войти через Steam' })).toHaveAttribute('href', '/auth/steam')
+    expect(screen.getByRole('button', { name: 'Войти в демо-режим' })).toHaveAttribute('formAction', '/auth/demo')
     expect(screen.getByText(/Steam OpenID подтверждает владение аккаунтом/)).toBeInTheDocument()
     expect(screen.queryByText(/Sign in through Steam/)).not.toBeInTheDocument()
   })

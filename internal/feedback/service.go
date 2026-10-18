@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/preferences"
 )
 
 const (
@@ -20,7 +22,7 @@ const (
 	ActionRemind                = "remind_me"
 	JobKind                     = "feedback.classify"
 	JobPayloadVersion           = 1
-	ClassificationSchemaVersion = 1
+	ClassificationSchemaVersion = 2
 )
 
 var (
@@ -30,11 +32,14 @@ var (
 
 var taxonomy = map[string]bool{"genre": true, "setting": true, "multiplayer": true, "single-player": true, "difficulty": true, "length": true, "early-access": true, "already-known": true, "not-now": true, "other": true}
 
+var taxonomyOrder = []string{"genre", "setting", "multiplayer", "single-player", "difficulty", "length", "early-access", "already-known", "not-now", "other"}
+
 type Command struct {
 	UserID           uuid.UUID
 	RecommendationID uuid.UUID
 	Action           string
 	Reason           string
+	Reasons          []string
 	FreeText         string
 	IdempotencyKey   string
 }
@@ -49,7 +54,9 @@ type Event struct {
 	ID                                       uuid.UUID
 	UserID                                   uuid.UUID
 	RecommendationID                         uuid.UUID
+	GameID                                   uuid.UUID
 	Action, Reason, FreeText, IdempotencyKey string
+	Reasons                                  []string
 	Snapshot                                 json.RawMessage
 	PreviousRankingVersion                   int64
 	ResultingRankingVersion                  int64
@@ -65,9 +72,11 @@ type Classification struct {
 	Model            string
 	InputContentHash string
 	SchemaVersion    int
+	Preference       *preferences.Target
 }
 
 type RankingDiff struct {
+	Adjustment      *AdjustmentSummary    `json:"adjustment,omitempty"`
 	RebuildStatus   string                `json:"rebuildStatus"`
 	PreviousVersion int64                 `json:"previousVersion"`
 	CurrentVersion  int64                 `json:"currentVersion"`
@@ -75,6 +84,13 @@ type RankingDiff struct {
 	Removed         []uuid.UUID           `json:"removed"`
 	Reordered       []uuid.UUID           `json:"reordered"`
 	Classification  *ClassificationResult `json:"classification,omitempty"`
+}
+
+type AdjustmentSummary struct {
+	ID     uuid.UUID `json:"id"`
+	Label  string    `json:"label"`
+	Effect string    `json:"effect"`
+	Active bool      `json:"active"`
 }
 
 type ClassificationResult struct {
@@ -122,9 +138,13 @@ func NewService(repository Repository, classifier Classifier, model string, sche
 
 func (s *Service) Record(ctx context.Context, command Command) (Accepted, error) {
 	command.Action = strings.TrimSpace(command.Action)
-	command.Reason = strings.TrimSpace(command.Reason)
 	command.FreeText = strings.TrimSpace(command.FreeText)
 	command.IdempotencyKey = strings.TrimSpace(command.IdempotencyKey)
+	var err error
+	command, err = normalizeCommand(command)
+	if err != nil {
+		return Accepted{}, err
+	}
 	if err := validateCommand(command); err != nil {
 		return Accepted{}, err
 	}
@@ -132,11 +152,11 @@ func (s *Service) Record(ctx context.Context, command Command) (Accepted, error)
 	if err != nil {
 		return Accepted{}, err
 	}
-	if event.UserID != command.UserID || event.RecommendationID != command.RecommendationID || event.Action != command.Action || event.Reason != command.Reason || event.FreeText != command.FreeText {
+	if event.UserID != command.UserID || event.RecommendationID != command.RecommendationID || event.Action != command.Action || event.Reason != command.Reason || !slices.Equal(event.Reasons, command.Reasons) || event.FreeText != command.FreeText {
 		return Accepted{}, ErrIdempotencyConflict
 	}
 	payload, _ := json.Marshal(jobPayload{Version: JobPayloadVersion, EventID: event.ID})
-	jobID, err := s.scheduler.Enqueue(ctx, jobs.Spec{Kind: JobKind, Stage: "feedback", Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":workflow:v1", Payload: payload, MaxAttempts: 3})
+	jobID, err := s.scheduler.Enqueue(ctx, jobs.Spec{Kind: JobKind, Stage: "feedback", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":workflow:v1", Payload: payload, MaxAttempts: 3})
 	if err != nil {
 		return Accepted{}, fmt.Errorf("enqueue feedback workflow: %w", err)
 	}
@@ -146,19 +166,49 @@ func (s *Service) Record(ctx context.Context, command Command) (Accepted, error)
 	return Accepted{EventID: event.ID, RebuildJobID: jobID, PreviousRankingVersion: event.PreviousRankingVersion}, nil
 }
 
+func normalizeCommand(command Command) (Command, error) {
+	command.Reason = strings.TrimSpace(command.Reason)
+	if command.Reason != "" && len(command.Reasons) > 0 {
+		return Command{}, ErrInvalidCommand
+	}
+	input := command.Reasons
+	if command.Reason != "" {
+		input = []string{command.Reason}
+	}
+	seen := make(map[string]bool, len(input))
+	for _, raw := range input {
+		reason := strings.TrimSpace(raw)
+		if reason == "" || !taxonomy[reason] || seen[reason] {
+			return Command{}, ErrInvalidCommand
+		}
+		seen[reason] = true
+	}
+	command.Reasons = command.Reasons[:0]
+	for _, reason := range taxonomyOrder {
+		if seen[reason] {
+			command.Reasons = append(command.Reasons, reason)
+		}
+	}
+	command.Reason = ""
+	if len(command.Reasons) > 0 {
+		command.Reason = command.Reasons[0]
+	}
+	return command, nil
+}
+
 func validateCommand(command Command) error {
-	if command.UserID == uuid.Nil || command.RecommendationID == uuid.Nil || !oneOf(command.Action, ActionLike, ActionDislike, ActionRemind) || command.IdempotencyKey == "" || len(command.IdempotencyKey) > 200 || !utf8.ValidString(command.FreeText) || utf8.RuneCountInString(command.FreeText) > 500 || command.Reason != "" && !taxonomy[command.Reason] {
+	if command.UserID == uuid.Nil || command.RecommendationID == uuid.Nil || !oneOf(command.Action, ActionLike, ActionDislike, ActionRemind) || command.IdempotencyKey == "" || len(command.IdempotencyKey) > 200 || !utf8.ValidString(command.FreeText) || utf8.RuneCountInString(command.FreeText) > 500 || len(command.Reasons) > len(taxonomyOrder) || command.Reason != "" && !taxonomy[command.Reason] {
 		return ErrInvalidCommand
 	}
-	if command.Action == ActionRemind && (command.Reason != "" || command.FreeText != "") {
+	if command.Action == ActionRemind && (len(command.Reasons) > 0 || command.FreeText != "") {
 		return ErrInvalidCommand
 	}
 	return nil
 }
 
 func (s *Service) ProcessClassification(ctx context.Context, eventID uuid.UUID) error {
-	if _, err := s.repository.Classification(ctx, eventID); err == nil {
-		return nil
+	if cached, err := s.repository.Classification(ctx, eventID); err == nil {
+		return s.repository.SaveClassification(ctx, cached)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("load feedback classification: %w", err)
 	}
@@ -168,20 +218,27 @@ func (s *Service) ProcessClassification(ctx context.Context, eventID uuid.UUID) 
 	}
 	classification := deterministicClassification(event)
 	if event.FreeText != "" {
+		classification = Classification{Taxonomy: "other", Polarity: "neutral", Model: "deterministic-fallback"}
 		output, classifyErr := s.classifier.ClassifyFeedback(ctx, ai.FeedbackText{EvidenceKey: "feedback-text", Text: event.FreeText})
-		if classifyErr == nil && taxonomy[output.Taxonomy] && oneOf(output.Polarity, "positive", "negative", "neutral") && output.Confidence >= 0 && output.Confidence <= 1 {
+		if classifyErr == nil && ai.ValidateFeedbackClassification(output, "feedback-text") == nil {
 			classification.Taxonomy, classification.Polarity, classification.Confidence = output.Taxonomy, output.Polarity, output.Confidence
 			classification.Actionable = output.Actionable && output.Confidence >= .7
 			classification.Model = s.model
+			if event.Action == ActionDislike {
+				classification.Preference = output.Preference
+			}
+		} else if errors.Is(classifyErr, ai.ErrCapabilityDisabled) || errors.Is(classifyErr, ai.ErrHTTP) || errors.Is(classifyErr, context.DeadlineExceeded) {
+			classification = deterministicClassification(event)
 		}
 	}
 	classification.FeedbackID = event.ID
 	classification.SchemaVersion = ClassificationSchemaVersion
 	hashModel := classification.Model
 	if hashModel == "deterministic-fallback" {
-		hashModel = "deterministic-fallback-v1"
+		hashModel = "deterministic-fallback-v2"
 	}
-	hash, err := ai.ContentHash(JobKind, ai.SchemaVersion, ai.FeedbackPromptVersion, hashModel, map[string]string{"text": event.FreeText, "action": event.Action, "reason": event.Reason})
+	reasonsJSON, _ := json.Marshal(event.Reasons)
+	hash, err := ai.ContentHash(JobKind, ai.FeedbackSchemaVersion, ai.FeedbackPromptVersion, hashModel, map[string]string{"text": event.FreeText, "action": event.Action, "reasons": string(reasonsJSON)})
 	if err != nil {
 		return err
 	}
@@ -197,8 +254,19 @@ func deterministicClassification(event Event) Classification {
 	if event.Action == ActionDislike {
 		polarity = "negative"
 	}
-	if taxonomy[event.Reason] {
-		return Classification{Taxonomy: event.Reason, Polarity: polarity, Confidence: 1, Actionable: event.Action != ActionRemind, Model: "deterministic-fallback"}
+	primary := event.Reason
+	if len(event.Reasons) > 0 {
+		primary = event.Reasons[0]
+		if slices.Contains(event.Reasons, "multiplayer") {
+			primary = "multiplayer"
+		}
+	}
+	if taxonomy[primary] {
+		value := Classification{Taxonomy: primary, Polarity: polarity, Confidence: 1, Actionable: event.Action != ActionRemind, Model: "deterministic-fallback"}
+		if event.Action == ActionDislike && (primary == "multiplayer" || slices.Contains(event.Reasons, "multiplayer")) {
+			value.Preference = &preferences.Target{Dimension: "mode", Target: preferences.ModeMultiplayer, Direction: "avoid"}
+		}
+		return value
 	}
 	return Classification{Taxonomy: "other", Polarity: "neutral", Confidence: 0, Actionable: false, Model: "deterministic-fallback"}
 }
@@ -246,7 +314,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 			return queue.RecordResult(ctx, lease, diff)
 		}
 		profilePayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": event.UserID})
-		ready, err := queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "profile.rebuild", Stage: "profile", Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":profile:v1", Payload: profilePayload, MaxAttempts: 3}})
+		ready, err := queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "profile.rebuild", Stage: "profile", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":profile:v1", Payload: profilePayload, MaxAttempts: 3}})
 		if err != nil {
 			return err
 		}
@@ -254,7 +322,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 			return jobs.ErrDeferred
 		}
 		rankingPayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": event.UserID})
-		ready, err = queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":ranking:v1", Payload: rankingPayload, MaxAttempts: 3}})
+		ready, err = queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "recommendations.rebuild", Stage: "recommendations", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":ranking:v1", Payload: rankingPayload, MaxAttempts: 3}})
 		if err != nil {
 			return err
 		}

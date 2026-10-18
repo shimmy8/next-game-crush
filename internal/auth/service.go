@@ -22,6 +22,7 @@ var (
 	ErrReplay          = errors.New("replayed OpenID assertion")
 	ErrUserCancelled   = errors.New("OpenID authentication cancelled")
 	ErrUnauthenticated = errors.New("authentication required")
+	ErrDemoUnavailable = errors.New("demo mode is unavailable")
 	steamIDPattern     = regexp.MustCompile(`^[0-9]{17}$`)
 )
 
@@ -31,7 +32,15 @@ type Config struct {
 	SessionSecret  string
 	ProviderURL    string
 	FixtureAuth    bool
+	DemoMode       bool
 }
+
+type AccessMode string
+
+const (
+	AccessModeOwner AccessMode = "owner"
+	AccessModeDemo  AccessMode = "demo"
+)
 
 type LoginState struct {
 	Token      string
@@ -47,6 +56,7 @@ type Session struct {
 	CSRFToken  string
 	ExpiresAt  time.Time
 	ReturnPath string
+	AccessMode AccessMode
 }
 
 type Repository interface {
@@ -55,6 +65,7 @@ type Repository interface {
 	FinishLogin(context.Context, string, string, time.Time, string, Session, *uuid.UUID) (LoginState, Session, error)
 	GetSession(context.Context, uuid.UUID) (Session, error)
 	DeleteSession(context.Context, uuid.UUID) error
+	CreateDemoSession(context.Context, string, Session) (Session, error)
 }
 
 type Service struct {
@@ -66,6 +77,7 @@ type Service struct {
 	provider       Provider
 	now            func() time.Time
 	fixtureAuth    bool
+	demoMode       bool
 }
 
 type rotationContextKey struct{}
@@ -95,7 +107,7 @@ func New(cfg Config, repository Repository, provider Provider) (*Service, error)
 		provider = NewHTTPProvider(nil, cfg.ProviderURL)
 	}
 	baseURL.Path = ""
-	return &Service{baseURL: baseURL, allowedSteamID: cfg.AllowedSteamID, secret: []byte(cfg.SessionSecret), providerURL: cfg.ProviderURL, repository: repository, provider: provider, now: time.Now, fixtureAuth: cfg.FixtureAuth}, nil
+	return &Service{baseURL: baseURL, allowedSteamID: cfg.AllowedSteamID, secret: []byte(cfg.SessionSecret), providerURL: cfg.ProviderURL, repository: repository, provider: provider, now: time.Now, fixtureAuth: cfg.FixtureAuth, demoMode: cfg.DemoMode}, nil
 }
 
 func (s *Service) Begin(returnPath string) (string, error) {
@@ -193,7 +205,7 @@ func (s *Service) Complete(ctx context.Context, callback url.Values) (Session, e
 	if err != nil {
 		return Session{}, failure(err, "session_finalize", "entropy_failure", true)
 	}
-	session := Session{ID: s.sessionID(cookieToken), Token: cookieToken, SteamID: steamID, CSRFToken: csrf, ExpiresAt: s.now().Add(7 * 24 * time.Hour), ReturnPath: state.ReturnPath}
+	session := Session{ID: s.sessionID(cookieToken), Token: cookieToken, SteamID: steamID, CSRFToken: csrf, ExpiresAt: s.now().Add(7 * 24 * time.Hour), ReturnPath: state.ReturnPath, AccessMode: AccessModeOwner}
 	var oldSessionID *uuid.UUID
 	if old, ok := ctx.Value(rotationContextKey{}).(uuid.UUID); ok {
 		oldSessionID = &old
@@ -270,6 +282,22 @@ func (s *Service) WithSessionRotation(ctx context.Context, id uuid.UUID) context
 func (s *Service) Logout(ctx context.Context, id uuid.UUID) error {
 	return s.repository.DeleteSession(ctx, id)
 }
+
+func (s *Service) CreateDemoSession(ctx context.Context) (Session, error) {
+	if !s.demoMode {
+		return Session{}, ErrDemoUnavailable
+	}
+	csrf, err := randomToken(32)
+	if err != nil {
+		return Session{}, err
+	}
+	token, err := randomToken(32)
+	if err != nil {
+		return Session{}, err
+	}
+	session := Session{ID: s.sessionID(token), Token: token, SteamID: s.allowedSteamID, CSRFToken: csrf, ExpiresAt: s.now().Add(2 * time.Hour), ReturnPath: "/", AccessMode: AccessModeDemo}
+	return s.repository.CreateDemoSession(ctx, s.allowedSteamID, session)
+}
 func (s *Service) BeginFixture(string) (string, error) {
 	if !s.fixtureAuth {
 		return "", errors.New("fixture authentication is not available")
@@ -297,10 +325,11 @@ func (s *Service) CreateFixtureSession(ctx context.Context) (Session, error) {
 	if err != nil {
 		return Session{}, err
 	}
-	session := Session{ID: s.sessionID(token), Token: token, SteamID: s.allowedSteamID, CSRFToken: csrf, ExpiresAt: s.now().Add(2 * time.Hour), ReturnPath: "/"}
+	session := Session{ID: s.sessionID(token), Token: token, SteamID: s.allowedSteamID, CSRFToken: csrf, ExpiresAt: s.now().Add(2 * time.Hour), ReturnPath: "/", AccessMode: AccessModeOwner}
 	return repo.CreateFixtureSession(ctx, s.allowedSteamID, session)
 }
 func (s *Service) FixtureEnabled() bool { return s.fixtureAuth }
+func (s *Service) DemoEnabled() bool    { return s.demoMode }
 func (s *Service) ProviderURL() string  { return s.providerURL }
 func (s *Service) Origin() string       { return strings.TrimRight(s.baseURL.String(), "/") }
 func (s *Service) SecureCookies() bool  { return s.baseURL.Scheme == "https" }

@@ -50,10 +50,61 @@ type AchievementSummary struct {
 	SnapshotGeneration    int64              `json:"snapshot_generation"`
 }
 
+type CatalogDiscoveryBudget struct {
+	HourAt       pgtype.Timestamptz `json:"hour_at"`
+	Reservations []byte             `json:"reservations"`
+	Used         int32              `json:"used"`
+	Counts       []byte             `json:"counts"`
+}
+
+type CatalogDiscoveryObservation struct {
+	Source          string             `json:"source"`
+	SteamAppID      int64              `json:"steam_app_id"`
+	LastModified    pgtype.Timestamptz `json:"last_modified"`
+	Status          string             `json:"status"`
+	Precision       pgtype.Text        `json:"precision"`
+	ReleaseDate     pgtype.Date        `json:"release_date"`
+	RawReleaseText  string             `json:"raw_release_text"`
+	FirstObservedAt pgtype.Timestamptz `json:"first_observed_at"`
+	LastAttemptAt   pgtype.Timestamptz `json:"last_attempt_at"`
+	Attempts        int32              `json:"attempts"`
+	RetryGeneration int32              `json:"retry_generation"`
+	NextRetryAt     pgtype.Timestamptz `json:"next_retry_at"`
+	SafeError       string             `json:"safe_error"`
+}
+
+type CatalogDiscoveryState struct {
+	Source          string             `json:"source"`
+	Mode            string             `json:"mode"`
+	CursorAppID     int64              `json:"cursor_app_id"`
+	WatermarkAt     pgtype.Timestamptz `json:"watermark_at"`
+	ScanStartedAt   pgtype.Timestamptz `json:"scan_started_at"`
+	ScanCompletedAt pgtype.Timestamptz `json:"scan_completed_at"`
+	Availability    string             `json:"availability"`
+	LastError       string             `json:"last_error"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type CatalogEntry struct {
 	GameID  pgtype.UUID        `json:"game_id"`
-	Origin  string             `json:"origin"`
+	Origin  pgtype.Text        `json:"origin"`
 	AddedAt pgtype.Timestamptz `json:"added_at"`
+}
+
+type CatalogEntrySource struct {
+	GameID      pgtype.UUID        `json:"game_id"`
+	Source      string             `json:"source"`
+	FirstSeenAt pgtype.Timestamptz `json:"first_seen_at"`
+	LastSeenAt  pgtype.Timestamptz `json:"last_seen_at"`
+	Active      bool               `json:"active"`
+}
+
+type CatalogExplanationCache struct {
+	GameID      pgtype.UUID        `json:"game_id"`
+	Model       string             `json:"model"`
+	InputHash   string             `json:"input_hash"`
+	Explanation []byte             `json:"explanation"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
 type CatalogFetchState struct {
@@ -62,6 +113,16 @@ type CatalogFetchState struct {
 	LastAttemptAt         pgtype.Timestamptz `json:"last_attempt_at"`
 	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
 	Error                 pgtype.Text        `json:"error"`
+}
+
+type CatalogRebuildState struct {
+	UserID           pgtype.UUID        `json:"user_id"`
+	DirtyRevision    int64              `json:"dirty_revision"`
+	EnqueuedRevision int64              `json:"enqueued_revision"`
+	DirtySince       pgtype.Timestamptz `json:"dirty_since"`
+	LastEnqueuedAt   pgtype.Timestamptz `json:"last_enqueued_at"`
+	LastScheduledAt  pgtype.Timestamptz `json:"last_scheduled_at"`
+	PendingJobID     pgtype.UUID        `json:"pending_job_id"`
 }
 
 type DeletedUserTombstone struct {
@@ -110,15 +171,18 @@ type EmailDeliveryRecommendation struct {
 }
 
 type FeedbackClassification struct {
-	FeedbackID       pgtype.UUID        `json:"feedback_id"`
-	Taxonomy         string             `json:"taxonomy"`
-	Polarity         string             `json:"polarity"`
-	Confidence       float64            `json:"confidence"`
-	Actionable       bool               `json:"actionable"`
-	Model            string             `json:"model"`
-	InputContentHash string             `json:"input_content_hash"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	SchemaVersion    int32              `json:"schema_version"`
+	FeedbackID          pgtype.UUID        `json:"feedback_id"`
+	Taxonomy            string             `json:"taxonomy"`
+	Polarity            string             `json:"polarity"`
+	Confidence          float64            `json:"confidence"`
+	Actionable          bool               `json:"actionable"`
+	Model               string             `json:"model"`
+	InputContentHash    string             `json:"input_content_hash"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	SchemaVersion       int32              `json:"schema_version"`
+	PreferenceDimension pgtype.Text        `json:"preference_dimension"`
+	PreferenceTarget    pgtype.Text        `json:"preference_target"`
+	PreferenceDirection pgtype.Text        `json:"preference_direction"`
 }
 
 type FeedbackEvent struct {
@@ -134,6 +198,7 @@ type FeedbackEvent struct {
 	PreviousRankingVersion  int64              `json:"previous_ranking_version"`
 	ResultingRankingVersion pgtype.Int8        `json:"resulting_ranking_version"`
 	RebuildJobID            pgtype.UUID        `json:"rebuild_job_id"`
+	Reasons                 []string           `json:"reasons"`
 }
 
 type Game struct {
@@ -163,6 +228,18 @@ type GameAchievementDefinition struct {
 	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
 }
 
+type GameCompatibility struct {
+	GameID                         pgtype.UUID        `json:"game_id"`
+	Windows                        bool               `json:"windows"`
+	Mac                            bool               `json:"mac"`
+	Linux                          bool               `json:"linux"`
+	PlatformsLastSuccessfulFetchAt pgtype.Timestamptz `json:"platforms_last_successful_fetch_at"`
+	DeckStatus                     string             `json:"deck_status"`
+	DeckAvailability               string             `json:"deck_availability"`
+	DeckLastAttemptAt              pgtype.Timestamptz `json:"deck_last_attempt_at"`
+	DeckLastSuccessfulFetchAt      pgtype.Timestamptz `json:"deck_last_successful_fetch_at"`
+}
+
 type GameEmbedding struct {
 	GameID                pgtype.UUID        `json:"game_id"`
 	Model                 string             `json:"model"`
@@ -179,6 +256,14 @@ type GameFeature struct {
 	InputContentHash      string             `json:"input_content_hash"`
 	Features              []byte             `json:"features"`
 	Source                string             `json:"source"`
+	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
+}
+
+type GameMode struct {
+	GameID                pgtype.UUID        `json:"game_id"`
+	Mode                  string             `json:"mode"`
+	Source                string             `json:"source"`
+	SourceContentHash     string             `json:"source_content_hash"`
 	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
 }
 
@@ -224,6 +309,24 @@ type OpenidResponseNonce struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+type PreferenceAdjustment struct {
+	ID                            pgtype.UUID        `json:"id"`
+	UserID                        pgtype.UUID        `json:"user_id"`
+	SourceFeedbackID              pgtype.UUID        `json:"source_feedback_id"`
+	SourceGameID                  pgtype.UUID        `json:"source_game_id"`
+	Dimension                     string             `json:"dimension"`
+	Target                        string             `json:"target"`
+	Direction                     string             `json:"direction"`
+	Confidence                    float64            `json:"confidence"`
+	Strength                      float64            `json:"strength"`
+	Active                        bool               `json:"active"`
+	DisableRebuildJobID           pgtype.UUID        `json:"disable_rebuild_job_id"`
+	DisablePreviousRankingVersion pgtype.Int8        `json:"disable_previous_ranking_version"`
+	CreatedAt                     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                     pgtype.Timestamptz `json:"updated_at"`
+	DisabledAt                    pgtype.Timestamptz `json:"disabled_at"`
+}
+
 type PreferenceProfile struct {
 	ID                pgtype.UUID        `json:"id"`
 	UserID            pgtype.UUID        `json:"user_id"`
@@ -261,6 +364,8 @@ type Recommendation struct {
 	RankingVersion              int64              `json:"ranking_version"`
 	ExplanationEvidence         []byte             `json:"explanation_evidence"`
 	ExplanationGenerated        bool               `json:"explanation_generated"`
+	ExplanationSource           string             `json:"explanation_source"`
+	ExplanationFailureReason    pgtype.Text        `json:"explanation_failure_reason"`
 }
 
 type RecommendationFactor struct {
@@ -281,11 +386,12 @@ type RecommendationRun struct {
 }
 
 type Session struct {
-	ID        pgtype.UUID        `json:"id"`
-	UserID    pgtype.UUID        `json:"user_id"`
-	CsrfToken string             `json:"csrf_token"`
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID         pgtype.UUID        `json:"id"`
+	UserID     pgtype.UUID        `json:"user_id"`
+	CsrfToken  string             `json:"csrf_token"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	AccessMode string             `json:"access_mode"`
 }
 
 type SteamAccount struct {
@@ -319,6 +425,7 @@ type SyncJob struct {
 	Stage          string             `json:"stage"`
 	Result         []byte             `json:"result"`
 	UserID         pgtype.UUID        `json:"user_id"`
+	Priority       int16              `json:"priority"`
 }
 
 type User struct {

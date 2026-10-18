@@ -14,7 +14,7 @@
 
 - Run direct Go commands with `GOWORK=off`; use `-race` for focused backend verification.
 - PostgreSQL with pgvector remains the only persistent service.
-- Add migration `00009_game_compatibility.sql`; do not rewrite existing migrations.
+- Add migration `00012_game_compatibility.sql`; do not rewrite existing migrations `00009`-`00011`.
 - Do not edit `internal/store/sqlc/` by hand; change queries/schema and run `make sqlc`.
 - Preserve the last successful upstream-derived compatibility state on failure.
 - Deck enrichment is optional and must not block catalog refresh or deterministic recommendations.
@@ -120,7 +120,7 @@ git commit -m "feat: import Steam compatibility metadata"
 ### Task 2: Compatibility schema and generated store bindings
 
 **Files:**
-- Create: `db/migrations/00009_game_compatibility.sql`
+- Create: `db/migrations/00012_game_compatibility.sql`
 - Modify: `db/queries/catalog.sql`
 - Modify: `internal/store/migration_upgrade_test.go`
 - Modify: `internal/store/store_test.go`
@@ -133,8 +133,8 @@ git commit -m "feat: import Steam compatibility metadata"
 
 - [ ] **Step 1: Write a failing migration contract test**
 
-Add `TestGameCompatibilityMigration` that upgrades through migration 8, creates
-a game, applies migration 9, and asserts: the table exists; valid Deck states
+Add `TestGameCompatibilityMigration` that upgrades through migration 11, creates
+a game, applies migration 12, and asserts: the table exists; valid Deck states
 are accepted; an invalid state is rejected; deleting the game cascades; and a
 down migration removes the table without changing prior schema.
 
@@ -142,9 +142,9 @@ down migration removes the table without changing prior schema.
 
 Run: `TEST_DATABASE_URL="$TEST_DATABASE_URL" GOWORK=off go test ./internal/store -run TestGameCompatibilityMigration`
 
-Expected: FAIL because migration 9 does not exist.
+Expected: FAIL because migration 12 does not exist.
 
-- [ ] **Step 3: Add migration 9 and table inventory coverage**
+- [ ] **Step 3: Add migration 12 and table inventory coverage**
 
 Create the table and constraints exactly as specified. Add
 `game_compatibility` to the expected table list in `store_test.go`; the down
@@ -173,7 +173,7 @@ Expected: PASS with zero failures.
 - [ ] **Step 7: Commit the schema slice**
 
 ```bash
-git add db/migrations/00009_game_compatibility.sql db/queries/catalog.sql internal/store/migration_upgrade_test.go internal/store/store_test.go internal/store/sqlc
+git add db/migrations/00012_game_compatibility.sql db/queries/catalog.sql internal/store/migration_upgrade_test.go internal/store/store_test.go internal/store/sqlc
 git commit -m "feat: persist game compatibility state"
 ```
 
@@ -230,7 +230,7 @@ Expected: PASS with zero failures.
 
 - [ ] **Step 7: Refresh CodeGraph and inspect affected tests**
 
-Run: `codegraph sync . && codegraph affected internal/steam/types.go internal/steam/client.go internal/steam/http_client.go internal/catalog/service.go db/migrations/00009_game_compatibility.sql db/queries/catalog.sql -p .`
+Run: `codegraph sync . && codegraph affected internal/steam/types.go internal/steam/client.go internal/steam/http_client.go internal/catalog/service.go db/migrations/00012_game_compatibility.sql db/queries/catalog.sql -p .`
 
 Expected: graph is current; inspect the reported packages before proceeding.
 

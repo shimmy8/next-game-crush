@@ -2,6 +2,10 @@ package recommendations
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -9,15 +13,183 @@ import (
 	"next-game-crush/internal/ai"
 )
 
+func TestClassifyExplanationFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want ExplanationFailureReason
+	}{
+		{name: "disabled", err: ai.ErrCapabilityDisabled, want: ExplanationFailureDisabled},
+		{name: "rate limited", err: &ai.RequestError{StatusCode: http.StatusTooManyRequests, Temporary: true}, want: ExplanationFailureRateLimited},
+		{name: "deadline", err: context.DeadlineExceeded, want: ExplanationFailureTimeout},
+		{name: "request timeout", err: &ai.RequestError{StatusCode: http.StatusRequestTimeout, Temporary: true}, want: ExplanationFailureTimeout},
+		{name: "server unavailable", err: &ai.RequestError{StatusCode: http.StatusBadGateway, Temporary: true}, want: ExplanationFailureProviderUnavailable},
+		{name: "transport", err: ai.ErrHTTP, want: ExplanationFailureProviderUnavailable},
+		{name: "refusal", err: ai.ErrRefusal, want: ExplanationFailureRefusal},
+		{name: "invalid evidence", err: ai.ErrInvalidEvidence, want: ExplanationFailureInvalidCitation},
+		{name: "invalid output", err: ai.ErrInvalidOutput, want: ExplanationFailureInvalidOutput},
+		{name: "unknown", err: errors.New("private provider detail"), want: ExplanationFailureUnknown},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyExplanationFailure(test.err); got != test.want {
+				t.Fatalf("classifyExplanationFailure() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestExplainUsesOnlySelectedSubstantivePublicEvidence(t *testing.T) {
+	selected := []GroundingEvidence{
+		{ID: "feature-overlap-1", Kind: EvidenceFeatureOverlap, PublicText: "Совпадают темы: psychological horror.", Strength: 8, SourceGameIDs: []uuid.UUID{uuid.New()}},
+		{ID: "similar-game-1", Kind: EvidenceSimilarGame, PublicText: "По описанию близка к SOMA.", Strength: 7, SourceGameIDs: []uuid.UUID{uuid.New()}},
+		{ID: "wishlist-context-1", Kind: EvidenceWishlistContext, PublicText: "Вы уже добавили эту игру в желаемое — следим за датой выхода.", Strength: 20, SourceGameIDs: []uuid.UUID{uuid.New()}},
+	}
+	client := &recordingExplanationClient{output: ai.Explanation{Text: "Игра близка к SOMA по атмосфере psychological horror.", EvidenceKeys: []string{"similar-game-1", "feature-overlap-1"}}}
+	got := Explain(context.Background(), client, "Игра", selected)
+	if got.Source != ExplanationSourceAI || got.FailureReason != "" || !reflect.DeepEqual(got.EvidenceKeys, []string{"similar-game-1", "feature-overlap-1"}) {
+		t.Fatalf("result = %#v", got)
+	}
+	if client.calls != 1 || client.input.EvidenceKey != "recommendation-evidence" || client.input.GameName != "Игра" {
+		t.Fatalf("client call = %d %#v", client.calls, client.input)
+	}
+	want := []ai.EvidenceItem{
+		{Key: "feature-overlap-1", Value: "Совпадают темы: psychological horror."},
+		{Key: "similar-game-1", Value: "По описанию близка к SOMA."},
+	}
+	if !reflect.DeepEqual(client.input.Evidence, want) {
+		t.Fatalf("model evidence = %#v, want %#v", client.input.Evidence, want)
+	}
+	encoded := string(mustTestJSON(t, client.input))
+	for _, forbidden := range []string{"wishlist-context", "желаемое", "novelty", "strength", "sourceGameIds", "factor", "weight", selected[0].SourceGameIDs[0].String()} {
+		if strings.Contains(encoded, forbidden) {
+			t.Fatalf("AI input leaks %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestExplainSkipsClientWithoutSubstantiveEvidence(t *testing.T) {
+	tests := []struct {
+		name     string
+		selected []GroundingEvidence
+		source   ExplanationSource
+		text     string
+	}{
+		{name: "none", source: ExplanationSourceNone, text: "Рекомендация основана на вашем игровом профиле, но конкретных совпадений пока недостаточно."},
+		{name: "wishlist only", selected: []GroundingEvidence{{ID: "wishlist-context-1", Kind: EvidenceWishlistContext, PublicText: "Вы уже добавили эту игру в желаемое — следим за датой выхода.", Strength: 20}}, source: ExplanationSourceDeterministic, text: "Вы уже добавили эту игру в желаемое — следим за датой выхода."},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &recordingExplanationClient{}
+			got := Explain(context.Background(), client, "Игра", test.selected)
+			if client.calls != 0 || got.Source != test.source || got.FailureReason != "" || got.Text != test.text {
+				t.Fatalf("result=%#v calls=%d", got, client.calls)
+			}
+		})
+	}
+}
+
+func TestExplainFallsBackWithTypedValidationReason(t *testing.T) {
+	selected := []GroundingEvidence{{ID: "feature-overlap-1", Kind: EvidenceFeatureOverlap, PublicText: "Совпадают темы: horror.", Strength: 8}}
+	tests := []struct {
+		name   string
+		output ai.Explanation
+		err    error
+		reason ExplanationFailureReason
+	}{
+		{name: "disabled", err: ai.ErrCapabilityDisabled, reason: ExplanationFailureDisabled},
+		{name: "duplicate citation", output: ai.Explanation{Text: "Подходит по темам.", EvidenceKeys: []string{"feature-overlap-1", "feature-overlap-1"}}, reason: ExplanationFailureInvalidCitation},
+		{name: "unknown citation", output: ai.Explanation{Text: "Подходит по темам.", EvidenceKeys: []string{"unknown"}}, reason: ExplanationFailureInvalidCitation},
+		{name: "empty citation", output: ai.Explanation{Text: "Подходит по темам."}, reason: ExplanationFailureInvalidCitation},
+		{name: "unsafe language", output: ai.Explanation{Text: "This game matches your profile.", EvidenceKeys: []string{"feature-overlap-1"}}, reason: ExplanationFailureUnsafeText},
+		{name: "novelty claim", output: ai.Explanation{Text: "Игра добавляет новое к вашим интересам.", EvidenceKeys: []string{"feature-overlap-1"}}, reason: ExplanationFailureUnsafeText},
+		{name: "expanded interests claim", output: ai.Explanation{Text: "Игра расширит ваши игровые интересы.", EvidenceKeys: []string{"feature-overlap-1"}}, reason: ExplanationFailureUnsafeText},
+		{name: "wishlist claim", output: ai.Explanation{Text: "Игра в вашем списке желаемого и поэтому вам понравится.", EvidenceKeys: []string{"feature-overlap-1"}}, reason: ExplanationFailureUnsafeText},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &recordingExplanationClient{output: test.output, err: test.err}
+			got := Explain(context.Background(), client, "Игра", selected)
+			if got.Source != ExplanationSourceDeterministic || got.FailureReason != test.reason || got.Text != DeterministicExplanation(selected) || !reflect.DeepEqual(got.EvidenceKeys, []string{"feature-overlap-1"}) {
+				t.Fatalf("result = %#v", got)
+			}
+		})
+	}
+}
+
+type recordingExplanationClient struct {
+	calls  int
+	input  ai.RecommendationEvidence
+	output ai.Explanation
+	err    error
+}
+
+type memoryExplanationCache struct {
+	values map[string]ai.Explanation
+}
+
+func (c *memoryExplanationCache) GetExplanationByInput(_ context.Context, _ uuid.UUID, model, hash string) (ai.Explanation, bool, error) {
+	value, ok := c.values[model+":"+hash]
+	return value, ok, nil
+}
+
+func (c *memoryExplanationCache) PutExplanationByInput(_ context.Context, _ uuid.UUID, model, hash string, value ai.Explanation) error {
+	if c.values == nil {
+		c.values = map[string]ai.Explanation{}
+	}
+	c.values[model+":"+hash] = value
+	return nil
+}
+
+func TestRankingReusesGroundedExplanationInput(t *testing.T) {
+	client := &recordingExplanationClient{output: ai.Explanation{Text: "Совпадают важные для вас темы.", EvidenceKeys: []string{"feature-overlap-1"}}}
+	service := &Service{explainer: client}
+	cache := &memoryExplanationCache{}
+	service.SetExplanationCache(cache, "model-a")
+	gameID := uuid.New()
+	evidence := []GroundingEvidence{{ID: "feature-overlap-1", Kind: EvidenceFeatureOverlap, PublicText: "Совпадают темы: horror.", Strength: 1}}
+	for i := 0; i < 2; i++ {
+		result, err := service.explainCached(context.Background(), gameID, "Игра", evidence)
+		if err != nil || result.Source != ExplanationSourceAI {
+			t.Fatalf("result=%#v err=%v", result, err)
+		}
+	}
+	if client.calls != 1 {
+		t.Fatalf("identical input calls=%d", client.calls)
+	}
+	evidence[0].PublicText = "Совпадают темы: survival horror."
+	if _, err := service.explainCached(context.Background(), gameID, "Игра", evidence); err != nil {
+		t.Fatal(err)
+	}
+	if client.calls != 2 {
+		t.Fatalf("changed input calls=%d", client.calls)
+	}
+}
+
+func (f *recordingExplanationClient) ExplainRecommendation(_ context.Context, input ai.RecommendationEvidence) (ai.Explanation, error) {
+	f.calls++
+	f.input = input
+	return f.output, f.err
+}
+
+func mustTestJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
 func TestExplainFallsBackForRefusalAndRejectsUnknownCitation(t *testing.T) {
-	evidence := []Evidence{{ID: "wishlist", Text: "Игра есть в вашем списке желаемого"}, {ID: "tags", Text: "Совпадает с вашими любимыми жанрами и метками"}}
+	evidence := []Evidence{{ID: "wishlist", Text: "Игра есть в вашем списке желаемого"}, {ID: "tag-affinity", Text: "Совпадает с вашими любимыми жанрами и метками"}}
 	for name, client := range map[string]ExplanationClient{
 		"refusal":          fakeExplanationClient{err: ai.ErrRefusal},
-		"unknown citation": fakeExplanationClient{output: ai.Explanation{Text: "invented", EvidenceKeys: []string{"not-supplied"}, Generated: true}},
+		"unknown citation": fakeExplanationClient{output: ai.Explanation{Text: "Игра подходит вашим интересам.", EvidenceKeys: []string{"not-supplied"}, Generated: true}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			got := Explain(context.Background(), client, "Game", evidence)
-			if got.Generated || got.Text == "" || len(got.EvidenceKeys) == 0 {
+			got := Explain(context.Background(), client, "Game", legacyGroundingEvidence(evidence))
+			if got.Source == ExplanationSourceAI || got.Text == "" || len(got.EvidenceKeys) == 0 {
 				t.Fatalf("fallback = %#v", got)
 			}
 		})
@@ -25,7 +197,7 @@ func TestExplainFallsBackForRefusalAndRejectsUnknownCitation(t *testing.T) {
 }
 
 func TestExplainRejectsUnsafeGeneratedText(t *testing.T) {
-	evidence := []Evidence{{ID: "wishlist", Text: "Игра есть в вашем списке желаемого"}}
+	evidence := []GroundingEvidence{{ID: "feature-overlap-1", Kind: EvidenceFeatureOverlap, PublicText: "Совпадает с вашими любимыми жанрами и метками", Strength: 1}}
 	unsafe := map[string]string{
 		"English only":      "This game matches your preferences.",
 		"score":             "Игра подходит: deterministic score 42.500.",
@@ -37,18 +209,18 @@ func TestExplainRejectsUnsafeGeneratedText(t *testing.T) {
 	for name, text := range unsafe {
 		t.Run(name, func(t *testing.T) {
 			got := Explain(context.Background(), fakeExplanationClient{output: ai.Explanation{
-				Text: text, EvidenceKeys: []string{"wishlist"}, Generated: true,
+				Text: text, EvidenceKeys: []string{"feature-overlap-1"}, Generated: true,
 			}}, "Game", evidence)
-			if got.Generated || got.Text != "Рекомендуем, потому что: Игра есть в вашем списке желаемого." {
+			if got.Source == ExplanationSourceAI || got.Text != DeterministicExplanation(evidence) {
 				t.Fatalf("unsafe explanation accepted: %#v", got)
 			}
 		})
 	}
 
 	valid := Explain(context.Background(), fakeExplanationClient{output: ai.Explanation{
-		Text: "Эта игра уже заинтересовала вас и подходит вашим предпочтениям.", EvidenceKeys: []string{"wishlist"}, Generated: true,
+		Text: "Эта игра уже заинтересовала вас и подходит вашим предпочтениям.", EvidenceKeys: []string{"feature-overlap-1"}, Generated: true,
 	}}, "Game", evidence)
-	if !valid.Generated || valid.Text != "Эта игра уже заинтересовала вас и подходит вашим предпочтениям." {
+	if valid.Source != ExplanationSourceAI || valid.Text != "Эта игра уже заинтересовала вас и подходит вашим предпочтениям." {
 		t.Fatalf("safe Russian explanation rejected: %#v", valid)
 	}
 }
@@ -130,11 +302,11 @@ func TestSafePresentationReplacesLegacyTechnicalEvidence(t *testing.T) {
 
 func TestSafePresentationKeepsGeneratedExplanationWithPublicCitation(t *testing.T) {
 	r := Recommendation{
-		Factors:              Factors{Wishlist: 1},
+		Factors:              Factors{Wishlist: 1, TagAffinity: .5},
 		Weights:              DefaultWeights(),
 		Explanation:          "Эта игра уже заинтересовала вас.",
 		GeneratedExplanation: true,
-		Evidence:             []Evidence{{ID: "wishlist", Text: "Игра есть в вашем списке желаемого"}},
+		Evidence:             []Evidence{{ID: "tag-affinity", Text: "Совпадает с вашими любимыми жанрами и метками"}},
 	}
 
 	got := safePresentation(r)
@@ -162,7 +334,7 @@ func TestSafePresentationReplacesTechnicalGeneratedLegacyExplanation(t *testing.
 			}
 
 			got := safePresentation(r)
-			if got.GeneratedExplanation || got.Explanation != "Рекомендуем, потому что: Игра есть в вашем списке желаемого." {
+			if got.GeneratedExplanation || got.Explanation != "Игра уже в вашем списке желаемого — следим за её релизом." {
 				t.Fatalf("unsafe legacy explanation accepted: %#v", got)
 			}
 		})

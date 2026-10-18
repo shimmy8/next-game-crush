@@ -15,6 +15,8 @@ import (
 
 type SQLRepository struct{ store *store.Store }
 
+const maxActiveDemoSessionsPerOwner = 256
+
 func NewSQLRepository(database *store.Store) *SQLRepository { return &SQLRepository{store: database} }
 
 func tokenHash(value string) []byte { digest := sha256.Sum256([]byte(value)); return digest[:] }
@@ -82,7 +84,7 @@ func (r *SQLRepository) FinishLogin(ctx context.Context, stateToken, nonce strin
 			return LoginState{}, Session{}, ErrUnauthenticated
 		}
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO sessions (id,user_id,csrf_token,expires_at) VALUES ($1,$2,$3,$4)`, session.ID, userID, session.CSRFToken, session.ExpiresAt); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO sessions (id,user_id,csrf_token,expires_at,access_mode) VALUES ($1,$2,$3,$4,$5)`, session.ID, userID, session.CSRFToken, session.ExpiresAt, session.AccessMode); err != nil {
 		return LoginState{}, Session{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -93,7 +95,7 @@ func (r *SQLRepository) FinishLogin(ctx context.Context, stateToken, nonce strin
 
 func (r *SQLRepository) GetSession(ctx context.Context, id uuid.UUID) (Session, error) {
 	var session Session
-	err := r.store.Pool.QueryRow(ctx, `SELECT s.id,s.user_id,a.steam_id,s.csrf_token,s.expires_at FROM sessions s JOIN steam_accounts a ON a.user_id=s.user_id WHERE s.id=$1`, id).Scan(&session.ID, &session.UserID, &session.SteamID, &session.CSRFToken, &session.ExpiresAt)
+	err := r.store.Pool.QueryRow(ctx, `SELECT s.id,s.user_id,a.steam_id,s.csrf_token,s.expires_at,s.access_mode FROM sessions s JOIN steam_accounts a ON a.user_id=s.user_id WHERE s.id=$1`, id).Scan(&session.ID, &session.UserID, &session.SteamID, &session.CSRFToken, &session.ExpiresAt, &session.AccessMode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrUnauthenticated
 	}
@@ -128,7 +130,39 @@ func (r *SQLRepository) CreateFixtureSession(ctx context.Context, steamID string
 		return Session{}, err
 	}
 	session.UserID = userID
-	if _, err = tx.Exec(ctx, `INSERT INTO sessions(id,user_id,csrf_token,expires_at)VALUES($1,$2,$3,$4)`, session.ID, userID, session.CSRFToken, session.ExpiresAt); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO sessions(id,user_id,csrf_token,expires_at,access_mode)VALUES($1,$2,$3,$4,$5)`, session.ID, userID, session.CSRFToken, session.ExpiresAt, session.AccessMode); err != nil {
+		return Session{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return Session{}, err
+	}
+	return session, nil
+}
+
+func (r *SQLRepository) CreateDemoSession(ctx context.Context, steamID string, session Session) (Session, error) {
+	tx, err := r.store.Pool.Begin(ctx)
+	if err != nil {
+		return Session{}, err
+	}
+	defer tx.Rollback(ctx)
+	err = tx.QueryRow(ctx, `SELECT user_id FROM steam_accounts WHERE steam_id=$1 FOR UPDATE`, steamID).Scan(&session.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Session{}, ErrDemoUnavailable
+	}
+	if err != nil {
+		return Session{}, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM sessions WHERE user_id=$1 AND access_mode='demo' AND expires_at<=now()`, session.UserID); err != nil {
+		return Session{}, err
+	}
+	var active int
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE user_id=$1 AND access_mode='demo' AND expires_at>now()`, session.UserID).Scan(&active); err != nil {
+		return Session{}, err
+	}
+	if active >= maxActiveDemoSessionsPerOwner {
+		return Session{}, ErrDemoUnavailable
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO sessions(id,user_id,csrf_token,expires_at,access_mode) VALUES($1,$2,$3,$4,$5)`, session.ID, session.UserID, session.CSRFToken, session.ExpiresAt, session.AccessMode); err != nil {
 		return Session{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {

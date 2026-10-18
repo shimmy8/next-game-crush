@@ -172,6 +172,101 @@ func (q *Queries) ListCatalogGames(ctx context.Context) ([]Game, error) {
 	return items, nil
 }
 
+const listKnownCatalogGames = `-- name: ListKnownCatalogGames :many
+WITH known AS (
+    SELECT game_id FROM catalog_entries
+    UNION
+    SELECT w.game_id FROM wishlist_entries w JOIN games g ON g.id=w.game_id
+    WHERE NOT COALESCE(
+        jsonb_typeof(g.source_snapshot->'AppID')='number' AND g.source_snapshot->>'AppID'=g.steam_app_id::text
+        AND jsonb_typeof(g.source_snapshot->'Name')='string' AND btrim(g.source_snapshot->>'Name')<>''
+        AND jsonb_typeof(g.source_snapshot->'Type')='string' AND btrim(g.source_snapshot->>'Type')<>''
+        AND jsonb_typeof(g.source_snapshot->'ReleaseDate'->'ComingSoon')='boolean'
+        AND jsonb_typeof(g.source_snapshot->'ReleaseDate'->'Raw')='string'
+        AND (g.source_snapshot->'ReleaseDate'->>'ComingSoon'='true' OR btrim(g.source_snapshot->'ReleaseDate'->>'Raw')<>'')
+        AND (g.source_snapshot->'ReleaseDate'->>'ComingSoon'='false' OR lower(btrim(g.source_snapshot->>'Type'))<>'game'), false)
+)
+SELECT g.id, g.steam_app_id, g.name, g.source, g.last_successful_fetch_at, g.source_snapshot, g.created_at, g.updated_at, g.availability, g.last_attempt_at, g.content_hash FROM games g JOIN known k ON k.game_id=g.id ORDER BY g.steam_app_id
+`
+
+func (q *Queries) ListKnownCatalogGames(ctx context.Context) ([]Game, error) {
+	rows, err := q.db.Query(ctx, listKnownCatalogGames)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Game{}
+	for rows.Next() {
+		var i Game
+		if err := rows.Scan(
+			&i.ID,
+			&i.SteamAppID,
+			&i.Name,
+			&i.Source,
+			&i.LastSuccessfulFetchAt,
+			&i.SourceSnapshot,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Availability,
+			&i.LastAttemptAt,
+			&i.ContentHash,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const recordDeckCompatibilityFailure = `-- name: RecordDeckCompatibilityFailure :exec
+UPDATE game_compatibility SET
+    deck_availability = $2,
+    deck_last_attempt_at = $3
+WHERE game_id = $1
+`
+
+type RecordDeckCompatibilityFailureParams struct {
+	GameID            pgtype.UUID        `json:"game_id"`
+	DeckAvailability  string             `json:"deck_availability"`
+	DeckLastAttemptAt pgtype.Timestamptz `json:"deck_last_attempt_at"`
+}
+
+func (q *Queries) RecordDeckCompatibilityFailure(ctx context.Context, arg RecordDeckCompatibilityFailureParams) error {
+	_, err := q.db.Exec(ctx, recordDeckCompatibilityFailure, arg.GameID, arg.DeckAvailability, arg.DeckLastAttemptAt)
+	return err
+}
+
+const recordDeckCompatibilitySuccess = `-- name: RecordDeckCompatibilitySuccess :exec
+UPDATE game_compatibility SET
+    deck_status = $2,
+    deck_availability = $3,
+    deck_last_attempt_at = $4,
+    deck_last_successful_fetch_at = $5
+WHERE game_id = $1
+`
+
+type RecordDeckCompatibilitySuccessParams struct {
+	GameID                    pgtype.UUID        `json:"game_id"`
+	DeckStatus                string             `json:"deck_status"`
+	DeckAvailability          string             `json:"deck_availability"`
+	DeckLastAttemptAt         pgtype.Timestamptz `json:"deck_last_attempt_at"`
+	DeckLastSuccessfulFetchAt pgtype.Timestamptz `json:"deck_last_successful_fetch_at"`
+}
+
+func (q *Queries) RecordDeckCompatibilitySuccess(ctx context.Context, arg RecordDeckCompatibilitySuccessParams) error {
+	_, err := q.db.Exec(ctx, recordDeckCompatibilitySuccess,
+		arg.GameID,
+		arg.DeckStatus,
+		arg.DeckAvailability,
+		arg.DeckLastAttemptAt,
+		arg.DeckLastSuccessfulFetchAt,
+	)
+	return err
+}
+
 const upsertCatalogFetchState = `-- name: UpsertCatalogFetchState :exec
 INSERT INTO catalog_fetch_states (game_id, availability, last_attempt_at, last_successful_fetch_at, error)
 VALUES ($1, $2, $3, $4, $5)
@@ -251,4 +346,33 @@ func (q *Queries) UpsertCatalogGame(ctx context.Context, arg UpsertCatalogGamePa
 		&i.ContentHash,
 	)
 	return i, err
+}
+
+const upsertGamePlatforms = `-- name: UpsertGamePlatforms :exec
+INSERT INTO game_compatibility (game_id, windows, mac, linux, platforms_last_successful_fetch_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (game_id) DO UPDATE SET
+    windows = EXCLUDED.windows,
+    mac = EXCLUDED.mac,
+    linux = EXCLUDED.linux,
+    platforms_last_successful_fetch_at = EXCLUDED.platforms_last_successful_fetch_at
+`
+
+type UpsertGamePlatformsParams struct {
+	GameID                         pgtype.UUID        `json:"game_id"`
+	Windows                        bool               `json:"windows"`
+	Mac                            bool               `json:"mac"`
+	Linux                          bool               `json:"linux"`
+	PlatformsLastSuccessfulFetchAt pgtype.Timestamptz `json:"platforms_last_successful_fetch_at"`
+}
+
+func (q *Queries) UpsertGamePlatforms(ctx context.Context, arg UpsertGamePlatformsParams) error {
+	_, err := q.db.Exec(ctx, upsertGamePlatforms,
+		arg.GameID,
+		arg.Windows,
+		arg.Mac,
+		arg.Linux,
+		arg.PlatformsLastSuccessfulFetchAt,
+	)
+	return err
 }

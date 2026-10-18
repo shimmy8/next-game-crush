@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/auth"
+	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/profile"
 	"next-game-crush/internal/recommendations"
 )
@@ -18,7 +19,8 @@ func TestRankingReadEndpointsRequireAuthenticationAndUseSessionOwner(t *testing.
 	session := sessions.addSession()
 	recommendationID := uuid.New()
 	profiles := &fakeProfileReader{value: profile.Profile{ID: uuid.New(), Version: 3}}
-	recommendationsReader := &fakeRecommendationReader{items: []recommendations.Recommendation{{ID: recommendationID, Name: "Upcoming", Release: recommendations.ReleaseWindow{Precision: "month", Raw: "March 2027"}}}}
+	completionText := "Есть сходство с пройденной вами игрой SOMA."
+	recommendationsReader := &fakeRecommendationReader{items: []recommendations.Recommendation{{ID: recommendationID, Name: "Upcoming", Platforms: &recommendations.Platforms{Windows: true, Linux: true}, DeckCompatibility: recommendations.DeckVerified, Factors: recommendations.Factors{CompletionAffinity: .5}, Weights: recommendations.DefaultWeights(), Release: recommendations.ReleaseWindow{Precision: "month", Raw: "March 2027"}, Explanation: completionText, ExplanationSource: recommendations.ExplanationSourceDeterministic, Evidence: []recommendations.Evidence{{ID: "completion-anchor-1", Kind: recommendations.EvidenceCompletionAnchor, Text: completionText}}}}}
 	router := NewRouter(Dependencies{Auth: authService, Profile: profiles, Recommendations: recommendationsReader})
 
 	for _, path := range []string{"/api/profile", "/api/calendar", "/api/recommendations/" + recommendationID.String()} {
@@ -33,6 +35,42 @@ func TestRankingReadEndpointsRequireAuthenticationAndUseSessionOwner(t *testing.
 		router.ServeHTTP(response, req)
 		if response.Code != http.StatusOK {
 			t.Fatalf("%s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+		if path != "/api/profile" {
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if path == "/api/calendar" {
+				var month []map[string]json.RawMessage
+				if err := json.Unmarshal(body["month"], &month); err != nil || len(month) != 1 {
+					t.Fatalf("month=%#v err=%v", month, err)
+				}
+				body = month[0]
+			}
+			var platforms map[string]bool
+			var deck string
+			if err := json.Unmarshal(body["platforms"], &platforms); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(body["deckCompatibility"], &deck); err != nil {
+				t.Fatal(err)
+			}
+			_, macPresent := platforms["mac"]
+			if len(platforms) != 3 || !platforms["windows"] || !macPresent || platforms["mac"] || !platforms["linux"] || deck != "verified" {
+				t.Fatalf("%s compatibility=%#v/%q", path, platforms, deck)
+			}
+			var evidence []recommendations.Evidence
+			if err := json.Unmarshal(body["evidence"], &evidence); err != nil || len(evidence) != 1 || evidence[0].Kind != recommendations.EvidenceCompletionAnchor || evidence[0].Text != completionText {
+				t.Fatalf("%s completion evidence=%#v err=%v", path, evidence, err)
+			}
+			var factors, weights map[string]float64
+			if err := json.Unmarshal(body["factors"], &factors); err != nil || factors["completionAffinity"] != .5 {
+				t.Fatalf("%s completion factor=%#v err=%v", path, factors, err)
+			}
+			if err := json.Unmarshal(body["weights"], &weights); err != nil || weights["completionAffinity"] != 5 {
+				t.Fatalf("%s completion weight=%#v err=%v", path, weights, err)
+			}
 		}
 	}
 	if profiles.userID != session.UserID || recommendationsReader.userID != session.UserID {
@@ -102,6 +140,10 @@ type fakeRecommendationReader struct {
 func (f *fakeRecommendationReader) Latest(_ context.Context, userID uuid.UUID) ([]recommendations.Recommendation, error) {
 	f.userID = userID
 	return f.items, nil
+}
+func (f *fakeRecommendationReader) Overview(_ context.Context, userID uuid.UUID) (recommendations.Overview, error) {
+	f.userID = userID
+	return recommendations.BuildOverview(f.items, recommendations.WishlistSourceState{}, catalog.PresentationStatus{Status: "disabled"}), nil
 }
 func (f *fakeRecommendationReader) Get(_ context.Context, userID, id uuid.UUID) (recommendations.Recommendation, error) {
 	f.userID = userID

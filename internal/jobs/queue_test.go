@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/store"
+	dbgen "next-game-crush/internal/store/sqlc"
 )
 
 type permanentTestError struct{}
@@ -33,6 +34,277 @@ func TestEnqueueIsIdempotent(t *testing.T) {
 	}
 	if first != second {
 		t.Fatalf("IDs differ: %s != %s", first, second)
+	}
+}
+
+func TestClaimOrdersPriorityThenStableTime(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	var ids []uuid.UUID
+	for i, priority := range []int{10, 100, 50, 50, 50, 50} {
+		id, err := queue.Enqueue(ctx, Spec{Kind: "priority", IdempotencyKey: fmt.Sprintf("order:%d", i), Priority: priority, AvailableAt: base})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+		if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET created_at=$2 WHERE id=$1`, id, base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Tie breakers are available_at, created_at, then UUID, regardless of insertion order.
+	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET available_at=$2 WHERE id=$1`, ids[2], base.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET created_at=$2 WHERE id=$1`, ids[3], base.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	lastA, lastB := ids[4], ids[5]
+	if strings.Compare(lastA.String(), lastB.String()) > 0 {
+		lastA, lastB = lastB, lastA
+	}
+	for i, want := range []uuid.UUID{ids[1], ids[2], ids[3], lastA, lastB, ids[0]} {
+		lease, err := queue.Claim(ctx, "priority-test", time.Minute)
+		if err != nil || lease == nil || lease.ID != want {
+			t.Fatalf("claim %d=%#v err=%v, want %s", i, lease, err, want)
+		}
+		if err := queue.Complete(ctx, *lease); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestReenqueueRaisesButNeverLowersPriority(t *testing.T) {
+	for _, terminal := range []string{"running", "succeeded", "dead"} {
+		t.Run(terminal, func(t *testing.T) {
+			queue, db := openTestQueue(t)
+			ctx := context.Background()
+			id, err := queue.Enqueue(ctx, Spec{Kind: "original", IdempotencyKey: "duplicate", Payload: []byte(`{"original":true}`), Priority: 10, MaxAttempts: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := queue.Claim(ctx, "owner", time.Minute)
+			if err != nil || lease == nil {
+				t.Fatalf("claim=%#v err=%v", lease, err)
+			}
+			if terminal == "succeeded" {
+				if err := queue.Complete(ctx, *lease); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if terminal == "dead" {
+				if _, err := queue.Fail(ctx, *lease, permanentTestError{}, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var before []byte
+			if err := db.Pool.QueryRow(ctx, `SELECT to_jsonb(j)-'priority' FROM sync_jobs j WHERE id=$1`, id).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			for _, priority := range []int{80, 50} {
+				duplicate, err := queue.Enqueue(ctx, Spec{Kind: "replacement", IdempotencyKey: "duplicate", Payload: []byte(`{"replacement":true}`), MaxAttempts: 9, Priority: priority, AvailableAt: time.Now().Add(time.Hour)})
+				if err != nil || duplicate != id {
+					t.Fatalf("duplicate=%s err=%v", duplicate, err)
+				}
+				var after []byte
+				var stored int
+				if err := db.Pool.QueryRow(ctx, `SELECT to_jsonb(j)-'priority',priority FROM sync_jobs j WHERE id=$1`, id).Scan(&after, &stored); err != nil {
+					t.Fatal(err)
+				}
+				if stored != 80 || string(before) != string(after) {
+					t.Fatalf("duplicate changed job history or priority: stored=%d", stored)
+				}
+			}
+		})
+	}
+}
+
+func TestEnqueueInTxRollsBackAndSharesValidation(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	queries := db.Queries.WithTx(tx)
+	for _, spec := range []Spec{
+		{IdempotencyKey: "invalid"}, {Kind: "test"},
+		{Kind: "test", IdempotencyKey: "invalid", Payload: []byte(`{`)},
+		{Kind: "test", IdempotencyKey: "invalid", MaxAttempts: -1},
+		{Kind: "test", IdempotencyKey: "invalid", Priority: -1},
+		{Kind: "test", IdempotencyKey: "invalid", Priority: 101},
+	} {
+		if _, err := queue.Enqueue(ctx, spec); err == nil {
+			t.Fatalf("Enqueue accepted invalid spec: %#v", spec)
+		}
+		if _, err := EnqueueInTx(ctx, queries, spec); err == nil {
+			t.Fatalf("EnqueueInTx accepted invalid spec: %#v", spec)
+		}
+	}
+	if _, err := EnqueueInTx(ctx, nil, Spec{Kind: "test", IdempotencyKey: "nil"}); err == nil {
+		t.Fatal("nil queries accepted")
+	}
+	id, err := EnqueueInTx(ctx, queries, Spec{Kind: "test", IdempotencyKey: "rollback"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var priority, attempts int
+	var required bool
+	if err := tx.QueryRow(ctx, `SELECT priority,max_attempts,required FROM sync_jobs WHERE id=$1`, id).Scan(&priority, &attempts, &required); err != nil {
+		t.Fatal(err)
+	}
+	if priority != 50 || attempts != 3 || !required {
+		t.Fatalf("defaults=%d/%d/%v", priority, attempts, required)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE id=$1`, id).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("rolled-back enqueue remained visible")
+	}
+	// The transaction path must keep the database's deletion fencing trigger.
+	deleted := uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO deleted_user_tombstones(user_id) VALUES($1)`, deleted); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		spec Spec
+	}{
+		{name: "direct user", spec: Spec{Kind: "test", IdempotencyKey: "deleted", UserID: deleted}},
+		{name: "completion projection", spec: Spec{Kind: "completion.project", IdempotencyKey: "deleted-completion", UserID: deleted, Payload: []byte(`{"version":1}`)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tx, err := db.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := EnqueueInTx(ctx, dbgen.New(tx), test.spec); err == nil {
+				t.Fatal("transaction enqueue bypassed deleted-user fencing")
+			}
+		})
+	}
+	tx, err = db.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := EnqueueInTx(ctx, dbgen.New(tx), Spec{Kind: "achievement.classify", IdempotencyKey: "shared-classification", Payload: []byte(`{"version":1}`)}); err != nil {
+		t.Fatalf("shared achievement classification was incorrectly fenced: %v", err)
+	}
+}
+
+func TestAwaitChildrenPreservesPriorityAndAvailableAt(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	if _, err := queue.Enqueue(ctx, Spec{Kind: "parent", IdempotencyKey: "scheduled-parent"}); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := queue.Claim(ctx, "parent-worker", time.Minute)
+	if err != nil || parent == nil {
+		t.Fatalf("parent=%#v err=%v", parent, err)
+	}
+	future := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+	ready, err := queue.AwaitChildren(ctx, *parent, []Spec{{Kind: "child", IdempotencyKey: "scheduled-child", Priority: 80, AvailableAt: future, Optional: true}})
+	if err != nil || ready {
+		t.Fatalf("ready=%v err=%v", ready, err)
+	}
+	var priority int
+	var availableAt time.Time
+	var required bool
+	if err := db.Pool.QueryRow(ctx, `SELECT priority,available_at,required FROM sync_jobs WHERE idempotency_key='scheduled-child'`).Scan(&priority, &availableAt, &required); err != nil {
+		t.Fatal(err)
+	}
+	if priority != 80 || !availableAt.Equal(future) || required {
+		t.Fatalf("child priority=%d available=%v required=%v", priority, availableAt, required)
+	}
+	if lease, err := queue.Claim(ctx, "child-worker", time.Minute); err != nil || lease != nil {
+		t.Fatalf("claimed scheduled child: %#v err=%v", lease, err)
+	}
+}
+
+func TestDeferUntilIsFenced(t *testing.T) {
+	queue, db := openTestQueue(t)
+	ctx := context.Background()
+	id, err := queue.Enqueue(ctx, Spec{Kind: "poll", IdempotencyKey: "poll", MaxAttempts: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := queue.Claim(ctx, "poller", time.Minute)
+	if err != nil || first == nil {
+		t.Fatalf("claim=%#v err=%v", first, err)
+	}
+	if _, err := queue.Fail(ctx, *first, errors.New("temporary"), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := queue.Claim(ctx, "poller", time.Minute)
+	if err != nil || lease == nil || lease.Attempts != 2 {
+		t.Fatalf("claim=%#v err=%v", lease, err)
+	}
+	future := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+	stale := *lease
+	stale.FencingToken = uuid.New()
+	if err := queue.DeferUntil(ctx, stale, future); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("stale defer=%v", err)
+	}
+	for _, invalid := range []time.Time{{}, time.Now().Add(-time.Second)} {
+		if err := queue.DeferUntil(ctx, *lease, invalid); err == nil {
+			t.Fatal("accepted nonfuture defer")
+		}
+	}
+	var attempts int
+	var status string
+	if err := db.Pool.QueryRow(ctx, `SELECT status,attempts FROM sync_jobs WHERE id=$1`, id).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "running" || attempts != 2 {
+		t.Fatalf("stale defer changed %s/%d", status, attempts)
+	}
+	if err := queue.DeferUntil(ctx, *lease, future); err != nil {
+		t.Fatal(err)
+	}
+	var availableAt time.Time
+	var leaseCleared bool
+	if err := db.Pool.QueryRow(ctx, `SELECT status,attempts,available_at,worker_id IS NULL AND fencing_token IS NULL AND lease_until IS NULL FROM sync_jobs WHERE id=$1`, id).Scan(&status, &attempts, &availableAt, &leaseCleared); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || attempts != 1 || !availableAt.Equal(future) || !leaseCleared {
+		t.Fatalf("deferred=%s/%d/%v/cleared=%v", status, attempts, availableAt, leaseCleared)
+	}
+	var history, waiting, failed int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE status='waiting' AND finished_at IS NOT NULL),count(*) FILTER(WHERE status='retryable') FROM job_attempts WHERE job_id=$1`, id).Scan(&history, &waiting, &failed); err != nil {
+		t.Fatal(err)
+	}
+	if history != 2 || waiting != 1 || failed != 1 {
+		t.Fatalf("history=%d waiting=%d failed=%d", history, waiting, failed)
+	}
+	if err := queue.DeferUntil(ctx, *lease, future); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("duplicate defer=%v", err)
+	}
+	if err := queue.Complete(ctx, *lease); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("deferred completion=%v", err)
+	}
+	if got, err := queue.Claim(ctx, "other", time.Minute); err != nil || got != nil {
+		t.Fatalf("early claim=%#v err=%v", got, err)
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET available_at=now() WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := queue.Claim(ctx, "resumed", time.Minute)
+	if err != nil || resumed == nil || resumed.Attempts != 2 || resumed.FencingToken == lease.FencingToken {
+		t.Fatalf("resumed=%#v err=%v", resumed, err)
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET lease_until=now()-interval '1 second' WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.DeferUntil(ctx, *resumed, future); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("expired defer=%v", err)
 	}
 }
 

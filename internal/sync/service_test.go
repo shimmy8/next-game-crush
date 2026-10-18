@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -126,7 +127,7 @@ func TestSourceLogsAreCorrelatedAndAggregateAchievements(t *testing.T) {
 	var logs bytes.Buffer
 	service, fake, _, userID := newTestService(t, WithLogger(observability.New(slog.New(slog.NewJSONHandler(&logs, nil)))))
 	fake.mu.Lock()
-	fake.owned = append(fake.owned, steam.OwnedGame{AppID: 11, Name: "Second Game"})
+	fake.owned = append(fake.owned, steam.OwnedGame{AppID: 11, Name: "Second Game", LastPlayedAt: fake.owned[0].LastPlayedAt})
 	fake.mu.Unlock()
 	correlation := observability.Correlation{WorkflowID: uuid.New(), JobID: uuid.New(), ParentJobID: uuid.New()}
 	if err := service.Run(observability.WithCorrelation(context.Background(), correlation), userID); err != nil {
@@ -294,10 +295,11 @@ func TestCompleteSourceLogCanaryPreservesLastKnownGoodState(t *testing.T) {
 	if _, err := db.Pool.Exec(context.Background(), `UPDATE steam_accounts SET steam_id='steam-id-canary' WHERE user_id=$1`, userID); err != nil {
 		t.Fatal(err)
 	}
+	playedAt := service.now()
 	fake.mu.Lock()
 	fake.summary = steam.PlayerSummary{Visibility: steam.VisibilityPublic, DisplayName: "display-name-canary", AvatarURL: "https://avatars.cloudflare.steamstatic.com/avatar-canary.jpg"}
-	fake.owned = []steam.OwnedGame{{AppID: ownedAppID, Name: "owned-game-canary", PlaytimeForever: 600}}
-	fake.recent = []steam.RecentGame{{AppID: ownedAppID, Name: "recent-game-canary", PlaytimeForever: 600, PlaytimeTwoWeeks: 30}}
+	fake.owned = []steam.OwnedGame{{AppID: ownedAppID, Name: "owned-game-canary", PlaytimeForever: 600, LastPlayedAt: playedAt}}
+	fake.recent = []steam.RecentGame{{AppID: ownedAppID, Name: "recent-game-canary", PlaytimeForever: 600, PlaytimeTwoWeeks: 30, LastPlayedAt: playedAt}}
 	fake.wishlist = []steam.WishlistItem{{AppID: wishlistAppID, Priority: 1}}
 	fake.details[wishlistAppID] = steam.GameDetails{AppID: wishlistAppID, Type: "game", Name: "wishlist-game-canary", ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "Coming Soon"}}
 	fake.mu.Unlock()
@@ -349,7 +351,7 @@ func TestAchievementLogAggregatesUnavailableAndFailedTargets(t *testing.T) {
 	var logs bytes.Buffer
 	service, fake, _, userID := newTestService(t, WithLogger(observability.New(slog.New(slog.NewJSONHandler(&logs, nil)))))
 	fake.mu.Lock()
-	fake.owned = append(fake.owned, steam.OwnedGame{AppID: 11, Name: "Second"})
+	fake.owned = append(fake.owned, steam.OwnedGame{AppID: 11, Name: "Second", LastPlayedAt: fake.owned[0].LastPlayedAt})
 	fake.mu.Unlock()
 	if err := service.importSteam(context.Background(), userID); err != nil {
 		t.Fatal(err)
@@ -381,7 +383,7 @@ func TestAchievementLogPropagatesSelectedSafeDiagnosticWithoutIdentifiers(t *tes
 	var logs bytes.Buffer
 	service, fake, _, userID := newTestService(t, WithLogger(observability.New(slog.New(slog.NewJSONHandler(&logs, nil)))))
 	fake.mu.Lock()
-	fake.owned = append(fake.owned, steam.OwnedGame{AppID: 987654321, Name: "achievement-game-canary"})
+	fake.owned = append(fake.owned, steam.OwnedGame{AppID: 987654321, Name: "achievement-game-canary", LastPlayedAt: fake.owned[0].LastPlayedAt})
 	fake.mu.Unlock()
 	if err := service.importSteam(context.Background(), userID); err != nil {
 		t.Fatal(err)
@@ -449,7 +451,7 @@ func TestAchievementNotModifiedPreservesAggregateSuccessAndSelectedFailure(t *te
 			service, fake, _, userID := newTestService(t, WithLogger(observability.New(slog.New(slog.NewJSONHandler(&logs, nil)))))
 			if test.wantAvailable == 1 && test.wantFailed == 1 {
 				fake.mu.Lock()
-				fake.owned = append(fake.owned, steam.OwnedGame{AppID: 11, Name: "Second"})
+				fake.owned = append(fake.owned, steam.OwnedGame{AppID: 11, Name: "Second", LastPlayedAt: fake.owned[0].LastPlayedAt})
 				fake.mu.Unlock()
 			}
 			if err := service.importSteam(context.Background(), userID); err != nil {
@@ -770,6 +772,177 @@ func TestCatalogFailurePreservesLastGoodSnapshot(t *testing.T) {
 	}
 }
 
+func TestCatalogPersistsPlatformsAndDeckStatuses(t *testing.T) {
+	for _, status := range []steam.DeckCompatibility{steam.DeckVerified, steam.DeckPlayable, steam.DeckUnsupported, steam.DeckUnknown} {
+		t.Run(string(status), func(t *testing.T) {
+			service, fake, db, _ := newTestService(t)
+			fake.details[30] = steam.GameDetails{AppID: 30, Type: "game", Name: "Seed", Platforms: steam.Platforms{Windows: true, Linux: true}, ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "Nov 2026"}}
+			fake.deckStatuses[30] = status
+			if err := service.catalog.RefreshKnown(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			got := readCatalogCompatibility(t, db, 30)
+			if !got.Windows || got.Mac || !got.Linux || got.DeckStatus != string(status) || got.DeckAvailability != string(steam.Available) {
+				t.Fatalf("compatibility = %+v", got)
+			}
+			if !got.PlatformsLastSuccessfulFetchAt.Valid || !got.DeckLastAttemptAt.Valid || !got.DeckLastSuccessfulFetchAt.Valid {
+				t.Fatalf("compatibility freshness missing: %+v", got)
+			}
+		})
+	}
+}
+
+func TestCatalogDeckFailurePreservesLastSuccess(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		availability steam.Availability
+		err          error
+		want         steam.Availability
+	}{
+		{name: "rate limited", availability: steam.RequestFailed, err: &steam.RequestError{Operation: steam.DeckCompatibilityOperation, StatusCode: http.StatusTooManyRequests}, want: steam.RequestFailed},
+		{name: "malformed", availability: steam.RequestFailed, err: steam.ErrInvalidResponse, want: steam.RequestFailed},
+		{name: "timeout", availability: steam.RequestFailed, err: context.DeadlineExceeded, want: steam.RequestFailed},
+		{name: "unavailable", availability: steam.Unavailable, want: steam.Unavailable},
+		{name: "not modified", availability: steam.NotModified, err: steam.ErrNotModified, want: steam.NotModified},
+		{name: "unsafe availability", availability: steam.Availability("unsafe upstream detail"), err: errors.New("unsafe upstream detail"), want: steam.RequestFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, fake, db, _ := newTestService(t)
+			ctx := context.Background()
+			fake.deckStatuses[30] = steam.DeckVerified
+			if err := service.catalog.RefreshKnown(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// Fix old freshness explicitly; the catalog clock is independent of sync's clock.
+			if _, err := db.Pool.Exec(ctx, `UPDATE game_compatibility SET platforms_last_successful_fetch_at='2026-01-01',deck_last_attempt_at='2026-01-01',deck_last_successful_fetch_at='2026-01-01'`); err != nil {
+				t.Fatal(err)
+			}
+			before := readCatalogCompatibility(t, db, 30)
+			fake.deckStatuses[30], fake.deckAvailability[30], fake.deckErrors[30] = steam.DeckUnknown, test.availability, test.err
+			details := fake.details[30]
+			details.Platforms = steam.Platforms{Mac: true}
+			fake.details[30] = details
+			if err := service.catalog.RefreshKnown(ctx); err != nil {
+				t.Fatalf("optional Deck failure aborted catalog: %v", err)
+			}
+			after := readCatalogCompatibility(t, db, 30)
+			if after.DeckStatus != before.DeckStatus || after.DeckLastSuccessfulFetchAt != before.DeckLastSuccessfulFetchAt || after.DeckAvailability != string(test.want) || !after.DeckLastAttemptAt.Time.After(before.DeckLastAttemptAt.Time) {
+				t.Fatalf("Deck state lost last success: before=%+v after=%+v", before, after)
+			}
+			if after.Windows || !after.Mac || after.Linux || !after.PlatformsLastSuccessfulFetchAt.Time.After(before.PlatformsLastSuccessfulFetchAt.Time) {
+				t.Fatalf("platform refresh blocked by Deck failure: %+v", after)
+			}
+		})
+	}
+}
+
+func TestCatalogStoreFailurePreservesCompatibility(t *testing.T) {
+	service, fake, db, _ := newTestService(t)
+	ctx := context.Background()
+	fake.deckStatuses[30] = steam.DeckVerified
+	if err := service.catalog.RefreshKnown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := readCatalogCompatibility(t, db, 30)
+	fake.detailErrors[30] = steam.ErrInvalidResponse
+	fake.deckStatuses[30] = steam.DeckUnsupported
+	if err := service.catalog.RefreshKnown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if after := readCatalogCompatibility(t, db, 30); after != before {
+		t.Fatalf("Store failure changed compatibility: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestCatalogCompatibilityPersistenceFailureAbortsRefresh(t *testing.T) {
+	for _, stage := range []string{"platforms", "deck success", "deck failure"} {
+		t.Run(stage, func(t *testing.T) {
+			service, fake, db, _ := newTestService(t)
+			ctx := context.Background()
+			details := fake.details[30]
+			details.Platforms = steam.Platforms{Windows: true, Linux: true}
+			fake.details[30], fake.deckStatuses[30] = details, steam.DeckVerified
+			if err := service.catalog.RefreshKnown(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Pool.Exec(ctx, `UPDATE game_compatibility SET platforms_last_successful_fetch_at='2026-01-01',deck_last_attempt_at='2026-01-01',deck_last_successful_fetch_at='2026-01-01'`); err != nil {
+				t.Fatal(err)
+			}
+			before := readCatalogCompatibility(t, db, 30)
+			beforeGame, err := db.Queries.GetGameByAppID(ctx, 30)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeReleases, err := db.Queries.GetReleaseHistory(ctx, beforeGame.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var beforeFetch []byte
+			if err := db.Pool.QueryRow(ctx, `SELECT to_jsonb(f) FROM catalog_fetch_states f WHERE game_id=$1`, beforeGame.ID).Scan(&beforeFetch); err != nil {
+				t.Fatal(err)
+			}
+			details.Name, details.Platforms, details.ReleaseDate.Raw = "Updated catalog metadata", steam.Platforms{Mac: true}, "Dec 2026"
+			fake.details[30], fake.deckStatuses[30] = details, steam.DeckUnsupported
+			when := "NEW.deck_last_attempt_at IS DISTINCT FROM OLD.deck_last_attempt_at"
+			wantError := "record Deck compatibility success:"
+			if stage == "platforms" {
+				when = "NEW.platforms_last_successful_fetch_at IS DISTINCT FROM OLD.platforms_last_successful_fetch_at"
+				wantError = "save catalog platforms:"
+			}
+			if stage == "deck failure" {
+				fake.deckAvailability[30], fake.deckErrors[30] = steam.RequestFailed, steam.ErrInvalidResponse
+				wantError = "record Deck compatibility failure:"
+			}
+			if _, err := db.Pool.Exec(ctx, `CREATE FUNCTION reject_compatibility_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected compatibility failure'; END $$; CREATE TRIGGER reject_compatibility_write BEFORE UPDATE ON game_compatibility FOR EACH ROW WHEN (`+when+`) EXECUTE FUNCTION reject_compatibility_write()`); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.catalog.RefreshKnown(ctx); err == nil || !strings.Contains(err.Error(), wantError) {
+				t.Fatalf("refresh error = %v, want %s", err, wantError)
+			}
+			after := readCatalogCompatibility(t, db, 30)
+			afterGame, err := db.Queries.GetGameByAppID(ctx, 30)
+			if err != nil {
+				t.Fatal(err)
+			}
+			afterReleases, err := db.Queries.GetReleaseHistory(ctx, beforeGame.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stage == "platforms" {
+				var afterFetch []byte
+				if err := db.Pool.QueryRow(ctx, `SELECT to_jsonb(f) FROM catalog_fetch_states f WHERE game_id=$1`, beforeGame.ID).Scan(&afterFetch); err != nil {
+					t.Fatal(err)
+				}
+				if after != before || !reflect.DeepEqual(afterGame, beforeGame) || !reflect.DeepEqual(afterReleases, beforeReleases) || !bytes.Equal(afterFetch, beforeFetch) {
+					t.Fatal("platform persistence failure did not roll back compatibility, metadata, release history, and fetch state together")
+				}
+				return
+			}
+			if after.Windows || !after.Mac || after.Linux || !after.PlatformsLastSuccessfulFetchAt.Time.After(before.PlatformsLastSuccessfulFetchAt.Time) {
+				t.Fatalf("Deck persistence failure lost committed platform refresh: %+v", after)
+			}
+			if after.DeckStatus != before.DeckStatus || after.DeckAvailability != before.DeckAvailability || after.DeckLastAttemptAt != before.DeckLastAttemptAt || after.DeckLastSuccessfulFetchAt != before.DeckLastSuccessfulFetchAt {
+				t.Fatalf("Deck persistence failure changed prior Deck observation: before=%+v after=%+v", before, after)
+			}
+			if afterGame.Name != details.Name || bytes.Equal(afterGame.SourceSnapshot, beforeGame.SourceSnapshot) || afterGame.ContentHash == beforeGame.ContentHash || !afterGame.LastSuccessfulFetchAt.Time.After(beforeGame.LastSuccessfulFetchAt.Time) {
+				t.Fatal("Deck persistence failure lost committed catalog metadata")
+			}
+			if len(afterReleases) != len(beforeReleases)+1 || afterReleases[len(afterReleases)-1].RawText.String != details.ReleaseDate.Raw {
+				t.Fatal("Deck persistence failure lost committed release observation")
+			}
+		})
+	}
+}
+
+func readCatalogCompatibility(t *testing.T, db *store.Store, appID int64) dbgen.GameCompatibility {
+	t.Helper()
+	var row dbgen.GameCompatibility
+	if err := db.Pool.QueryRow(context.Background(), `SELECT c.* FROM game_compatibility c JOIN games g ON g.id=c.game_id WHERE g.steam_app_id=$1`, appID).Scan(&row.GameID, &row.Windows, &row.Mac, &row.Linux, &row.PlatformsLastSuccessfulFetchAt, &row.DeckStatus, &row.DeckAvailability, &row.DeckLastAttemptAt, &row.DeckLastSuccessfulFetchAt); err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
 func TestReleaseChangeAppendsHistory(t *testing.T) {
 	service, fake, db, userID := newTestService(t)
 	if err := service.Run(context.Background(), userID); err != nil {
@@ -1041,6 +1214,120 @@ func TestSyncStatusExposesCatalogDegradation(t *testing.T) {
 	t.Fatalf("catalog degradation missing from status: %#v", status.Stages)
 }
 
+type discoveryNudgeStub struct{ calls int }
+
+func (n *discoveryNudgeStub) Nudge(context.Context) error { n.calls++; return nil }
+
+func TestSyncNudgesDiscoveryOnlyAfterCompletion(t *testing.T) {
+	service, _, db, userID := newTestService(t)
+	service.EnableRankingJobs()
+	nudger := &discoveryNudgeStub{}
+	service.SetDiscoveryNudger(nudger)
+	jobID, err := service.Start(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range []string{"catalog", "achievements", "profile", "recommendations"} {
+		if _, err := db.Pool.Exec(context.Background(), `INSERT INTO sync_jobs(id,kind,idempotency_key,parent_job_id,stage,status,required,user_id,priority)
+			VALUES($1,$2,$3,$4,$5,'succeeded',true,$6,100)`, uuid.New(), stage+".test", jobID.String()+":"+stage, jobID, stage, userID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lease, err := service.queue.Claim(context.Background(), "nudge-test", time.Minute)
+	if err != nil || lease == nil || lease.ID != jobID {
+		t.Fatalf("claim=%+v err=%v", lease, err)
+	}
+	if err := service.handleSteamSync(context.Background(), *lease); err != nil {
+		t.Fatal(err)
+	}
+	if nudger.calls != 1 {
+		t.Fatalf("nudge calls=%d", nudger.calls)
+	}
+}
+
+func TestFailedSyncDoesNotNudgeDiscovery(t *testing.T) {
+	service, _, db, userID := newTestService(t)
+	service.EnableRankingJobs()
+	nudger := &discoveryNudgeStub{}
+	service.SetDiscoveryNudger(nudger)
+	jobID, err := service.Start(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(context.Background(), `INSERT INTO sync_jobs(id,kind,idempotency_key,parent_job_id,stage,status,required,user_id,priority,last_error)
+		VALUES($1,'catalog.test',$2,$3,'catalog','dead',true,$4,100,'upstream_unavailable')`, uuid.New(), jobID.String()+":catalog", jobID, userID); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.queue.Claim(context.Background(), "failed-nudge-test", time.Minute)
+	if err != nil || lease == nil || lease.ID != jobID {
+		t.Fatalf("claim=%+v err=%v", lease, err)
+	}
+	if err := service.handleSteamSync(context.Background(), *lease); err == nil {
+		t.Fatal("failed required sync child was accepted")
+	}
+	if nudger.calls != 0 {
+		t.Fatalf("nudge calls=%d, want 0", nudger.calls)
+	}
+}
+
+func TestKnownRefreshFansOutIntoIndependentJobs(t *testing.T) {
+	service, _, db, userID := newTestService(t)
+	if err := service.importSteam(context.Background(), userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.catalog.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	profileID := uuid.New()
+	if _, err := db.Pool.Exec(context.Background(), `INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, profileID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(context.Background(), `INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key,published) VALUES
+		($1,$3,$4,1,'test','fanout-old',true),
+		($2,$3,$4,2,'test','fanout-latest',true)`, uuid.New(), uuid.New(), userID, profileID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(context.Background(), `INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score,ranking_version)
+		SELECT $1::uuid,$3::uuid,id,$4::uuid,'test',1,1 FROM games WHERE steam_app_id=20
+		UNION ALL
+		SELECT $2::uuid,$3::uuid,id,$4::uuid,'test',1,2 FROM games WHERE steam_app_id=30`, uuid.New(), uuid.New(), userID, profileID); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(Payload{Version: PayloadVersion, UserID: userID})
+	id, err := service.queue.Enqueue(context.Background(), jobs.Spec{Kind: "catalog.refresh", Stage: "catalog", IdempotencyKey: "fanout:catalog:v1", Payload: payload, UserID: userID, Priority: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.queue.Claim(context.Background(), "fanout-test", time.Minute)
+	if err != nil || lease == nil || lease.ID != id {
+		t.Fatalf("claim=%+v err=%v", lease, err)
+	}
+	if err := service.handleCatalogRefresh(context.Background(), *lease); !errors.Is(err, jobs.ErrDeferred) {
+		t.Fatalf("fanout error=%v", err)
+	}
+	var count int
+	var minPriority, maxPriority int
+	if err := db.Pool.QueryRow(context.Background(), `SELECT count(*),min(priority),max(priority) FROM sync_jobs WHERE parent_job_id=$1 AND kind='catalog.refresh_game'`, id).Scan(&count, &minPriority, &maxPriority); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || minPriority != 50 || maxPriority != 80 {
+		t.Fatalf("fanout count=%d priorities=%d..%d", count, minPriority, maxPriority)
+	}
+	var oldPriority, latestPriority int
+	if err := db.Pool.QueryRow(context.Background(), `SELECT
+		max(priority) FILTER (WHERE payload->>'app_id'='20'),
+		max(priority) FILTER (WHERE payload->>'app_id'='30')
+		FROM sync_jobs WHERE parent_job_id=$1 AND kind='catalog.refresh_game'`, id).Scan(&oldPriority, &latestPriority); err != nil {
+		t.Fatal(err)
+	}
+	if oldPriority != 50 || latestPriority != 80 {
+		t.Fatalf("old/latest priorities=%d/%d, want 50/80", oldPriority, latestPriority)
+	}
+	if lease.Priority != 100 {
+		t.Fatalf("lease priority=%d", lease.Priority)
+	}
+}
+
 type fakeSteam struct {
 	mu                                                          sync.Mutex
 	owned                                                       []steam.OwnedGame
@@ -1049,6 +1336,9 @@ type fakeSteam struct {
 	ownedAvailability, recentAvailability, wishlistAvailability steam.Availability
 	details                                                     map[int64]steam.GameDetails
 	detailErrors                                                map[int64]error
+	deckStatuses                                                map[int64]steam.DeckCompatibility
+	deckAvailability                                            map[int64]steam.Availability
+	deckErrors                                                  map[int64]error
 	achievementAvailability                                     map[int64]steam.Availability
 	achievementErrors                                           map[int64]error
 	achievementSchemas                                          map[int64]steam.AchievementSchema
@@ -1121,6 +1411,20 @@ func (f *fakeSteam) GameDetails(_ context.Context, appID int64) (steam.GameDetai
 	return steam.GameDetails{}, steam.ErrUnavailable
 }
 
+func (f *fakeSteam) DeckCompatibility(_ context.Context, appID int64) (steam.DeckCompatibility, steam.Availability, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	status, ok := f.deckStatuses[appID]
+	if !ok {
+		status = steam.DeckUnknown
+	}
+	availability, ok := f.deckAvailability[appID]
+	if !ok {
+		availability = steam.Available
+	}
+	return status, availability, f.deckErrors[appID]
+}
+
 func newTestService(t *testing.T, options ...ServiceOption) (*Service, *fakeSteam, *store.Store, uuid.UUID) {
 	t.Helper()
 	db := openSyncStore(t)
@@ -1138,6 +1442,9 @@ func newTestService(t *testing.T, options ...ServiceOption) (*Service, *fakeStea
 		20: {AppID: 20, Type: "game", Name: "Wish", ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "Nov 2026"}},
 		30: {AppID: 30, Type: "game", Name: "Seed", ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "Nov 2026"}},
 	}}
+	fake.deckStatuses = make(map[int64]steam.DeckCompatibility)
+	fake.deckAvailability = make(map[int64]steam.Availability)
+	fake.deckErrors = make(map[int64]error)
 	cat, err := catalog.NewService(db, fake, catalog.Seed{Version: 1, ObservedDate: "2026-10-17", Entries: []catalog.SeedEntry{{AppID: 30, ReleaseWindow: "Nov 2026", SourceURL: "https://store.steampowered.com/app/30/", ObservedDate: "2026-10-17"}}})
 	if err != nil {
 		t.Fatal(err)

@@ -8,7 +8,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"next-game-crush/internal/ai"
+	"next-game-crush/internal/preferences"
 	"next-game-crush/internal/store"
+	dbgen "next-game-crush/internal/store/sqlc"
 )
 
 type SQLRepository struct{ store *store.Store }
@@ -21,12 +25,15 @@ func NewSQLRepository(database *store.Store) (*SQLRepository, error) {
 }
 
 func (r *SQLRepository) Record(ctx context.Context, command Command) (Event, bool, error) {
+	if command.Reasons == nil {
+		command.Reasons = []string{}
+	}
 	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Event{}, false, err
 	}
 	defer tx.Rollback(ctx)
-	if existing, existingErr := scanEvent(tx.QueryRow(ctx, `SELECT id,recommendation_id,user_id,action,reason,free_text,idempotency_key,recommendation_snapshot,previous_ranking_version,resulting_ranking_version,rebuild_job_id FROM feedback_events WHERE idempotency_key=$1`, command.IdempotencyKey)); existingErr == nil {
+	if existing, existingErr := scanEvent(tx.QueryRow(ctx, `SELECT id,recommendation_id,user_id,action,reason,reasons,free_text,idempotency_key,recommendation_snapshot,previous_ranking_version,resulting_ranking_version,rebuild_job_id,(SELECT game_id FROM recommendations WHERE id=feedback_events.recommendation_id) FROM feedback_events WHERE idempotency_key=$1`, command.IdempotencyKey)); existingErr == nil {
 		if err := tx.Commit(ctx); err != nil {
 			return Event{}, false, err
 		}
@@ -49,13 +56,13 @@ func (r *SQLRepository) Record(ctx context.Context, command Command) (Event, boo
 		return Event{}, false, err
 	}
 	id := uuid.New()
-	commandTag, err := tx.Exec(ctx, `INSERT INTO feedback_events(id,recommendation_id,user_id,action,reason,free_text,idempotency_key,recommendation_snapshot,previous_ranking_version)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(idempotency_key) DO NOTHING`, id, command.RecommendationID, command.UserID, command.Action, nullable(command.Reason), nullable(command.FreeText), command.IdempotencyKey, snapshot, rankingVersion)
+	commandTag, err := tx.Exec(ctx, `INSERT INTO feedback_events(id,recommendation_id,user_id,action,reason,reasons,free_text,idempotency_key,recommendation_snapshot,previous_ranking_version)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(idempotency_key) DO NOTHING`, id, command.RecommendationID, command.UserID, command.Action, nullable(command.Reason), command.Reasons, nullable(command.FreeText), command.IdempotencyKey, snapshot, rankingVersion)
 	if err != nil {
 		return Event{}, false, err
 	}
 	created := commandTag.RowsAffected() == 1
-	event, err := scanEvent(tx.QueryRow(ctx, `SELECT id,recommendation_id,user_id,action,reason,free_text,idempotency_key,recommendation_snapshot,previous_ranking_version,resulting_ranking_version,rebuild_job_id FROM feedback_events WHERE idempotency_key=$1`, command.IdempotencyKey))
+	event, err := scanEvent(tx.QueryRow(ctx, `SELECT id,recommendation_id,user_id,action,reason,reasons,free_text,idempotency_key,recommendation_snapshot,previous_ranking_version,resulting_ranking_version,rebuild_job_id,(SELECT game_id FROM recommendations WHERE id=feedback_events.recommendation_id) FROM feedback_events WHERE idempotency_key=$1`, command.IdempotencyKey))
 	if err != nil {
 		return Event{}, false, err
 	}
@@ -77,7 +84,7 @@ func (r *SQLRepository) LinkRebuildJob(ctx context.Context, eventID, jobID uuid.
 }
 
 func (r *SQLRepository) Event(ctx context.Context, id uuid.UUID) (Event, error) {
-	return scanEvent(r.store.Pool.QueryRow(ctx, `SELECT id,recommendation_id,user_id,action,reason,free_text,idempotency_key,recommendation_snapshot,previous_ranking_version,resulting_ranking_version,rebuild_job_id FROM feedback_events WHERE id=$1`, id))
+	return scanEvent(r.store.Pool.QueryRow(ctx, `SELECT id,recommendation_id,user_id,action,reason,reasons,free_text,idempotency_key,recommendation_snapshot,previous_ranking_version,resulting_ranking_version,rebuild_job_id,(SELECT game_id FROM recommendations WHERE id=feedback_events.recommendation_id) FROM feedback_events WHERE id=$1`, id))
 }
 
 type rowScanner interface{ Scan(...any) error }
@@ -87,7 +94,7 @@ func scanEvent(row rowScanner) (Event, error) {
 	var reason, text *string
 	var resultingVersion *int64
 	var jobID *uuid.UUID
-	if err := row.Scan(&event.ID, &event.RecommendationID, &event.UserID, &event.Action, &reason, &text, &event.IdempotencyKey, &event.Snapshot, &event.PreviousRankingVersion, &resultingVersion, &jobID); err != nil {
+	if err := row.Scan(&event.ID, &event.RecommendationID, &event.UserID, &event.Action, &reason, &event.Reasons, &text, &event.IdempotencyKey, &event.Snapshot, &event.PreviousRankingVersion, &resultingVersion, &jobID, &event.GameID); err != nil {
 		return Event{}, err
 	}
 	if reason != nil {
@@ -106,15 +113,60 @@ func scanEvent(row rowScanner) (Event, error) {
 }
 
 func (r *SQLRepository) Classification(ctx context.Context, eventID uuid.UUID) (Classification, error) {
-	var value Classification
-	err := r.store.Pool.QueryRow(ctx, `SELECT feedback_id,taxonomy,polarity,confidence,actionable,model,input_content_hash,schema_version FROM feedback_classifications WHERE feedback_id=$1`, eventID).Scan(&value.FeedbackID, &value.Taxonomy, &value.Polarity, &value.Confidence, &value.Actionable, &value.Model, &value.InputContentHash, &value.SchemaVersion)
-	return value, err
+	row, err := r.store.Queries.GetFeedbackClassification(ctx, pgtype.UUID{Bytes: eventID, Valid: true})
+	if err != nil {
+		return Classification{}, err
+	}
+	return classificationFromRow(row), nil
 }
 
+func classificationFromRow(row dbgen.FeedbackClassification) Classification {
+	value := Classification{FeedbackID: uuid.UUID(row.FeedbackID.Bytes), Taxonomy: row.Taxonomy, Polarity: row.Polarity, Confidence: row.Confidence, Actionable: row.Actionable, Model: row.Model, InputContentHash: row.InputContentHash, SchemaVersion: int(row.SchemaVersion)}
+	if row.PreferenceDimension.Valid && row.PreferenceTarget.Valid && row.PreferenceDirection.Valid {
+		value.Preference = &preferences.Target{Dimension: row.PreferenceDimension.String, Target: preferences.Mode(row.PreferenceTarget.String), Direction: row.PreferenceDirection.String}
+	}
+	return value
+}
+
+// SaveClassification inserts immutable history and materializes its projection
+// atomically. Always reread the winning history row after an insert conflict.
 func (r *SQLRepository) SaveClassification(ctx context.Context, value Classification) error {
-	_, err := r.store.Pool.Exec(ctx, `INSERT INTO feedback_classifications(feedback_id,taxonomy,polarity,confidence,actionable,model,input_content_hash,schema_version)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(feedback_id) DO NOTHING`, value.FeedbackID, value.Taxonomy, value.Polarity, value.Confidence, value.Actionable, value.Model, value.InputContentHash, value.SchemaVersion)
-	return err
+	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var userID uuid.UUID
+	var action string
+	if err = tx.QueryRow(ctx, `SELECT user_id,action FROM feedback_events WHERE id=$1 FOR UPDATE`, value.FeedbackID).Scan(&userID, &action); err != nil {
+		return err
+	}
+	query := r.store.Queries.WithTx(tx)
+	params := dbgen.UpsertFeedbackClassificationParams{FeedbackID: pgtype.UUID{Bytes: value.FeedbackID, Valid: true}, Taxonomy: value.Taxonomy, Polarity: value.Polarity, Confidence: value.Confidence, Actionable: value.Actionable, Model: value.Model, InputContentHash: value.InputContentHash, SchemaVersion: int32(value.SchemaVersion)}
+	if p := value.Preference; p != nil {
+		params.PreferenceDimension = pgtype.Text{String: p.Dimension, Valid: true}
+		params.PreferenceTarget = pgtype.Text{String: string(p.Target), Valid: true}
+		params.PreferenceDirection = pgtype.Text{String: p.Direction, Valid: true}
+	}
+	if err = query.UpsertFeedbackClassification(ctx, params); err != nil {
+		return err
+	}
+	row, err := query.GetFeedbackClassification(ctx, params.FeedbackID)
+	if err != nil {
+		return err
+	}
+	stored := classificationFromRow(row)
+	if p := stored.Preference; p != nil && stored.SchemaVersion >= 2 && action == ActionDislike {
+		output := ai.FeedbackClassification{Taxonomy: stored.Taxonomy, Polarity: stored.Polarity, Confidence: stored.Confidence, Actionable: stored.Actionable, Preference: p, EvidenceKeys: []string{"feedback-text"}}
+		if err = ai.ValidateFeedbackClassification(output, "feedback-text"); err != nil {
+			return err
+		}
+		_, err = query.UpsertPreferenceAdjustmentFromFeedback(ctx, dbgen.UpsertPreferenceAdjustmentFromFeedbackParams{ID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, UserID: pgtype.UUID{Bytes: userID, Valid: true}, SourceFeedbackID: params.FeedbackID, Dimension: p.Dimension, Target: string(p.Target), Direction: p.Direction, Confidence: stored.Confidence, Strength: 1})
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (r *SQLRepository) FinalizeRanking(ctx context.Context, eventID uuid.UUID) (int64, error) {
@@ -157,10 +209,16 @@ func (r *SQLRepository) RankingDiff(ctx context.Context, userID uuid.UUID, previ
 	var classConfidence *float64
 	var classActionable *bool
 	var err error
+	disableWorkflow := false
+	var feedbackID, disableAdjustmentID uuid.UUID
 	if jobID != uuid.Nil {
-		err = r.store.Pool.QueryRow(ctx, `SELECT j.status,f.resulting_ranking_version,fc.taxonomy,fc.polarity,fc.confidence,fc.actionable FROM feedback_events f JOIN sync_jobs j ON j.id=f.rebuild_job_id LEFT JOIN feedback_classifications fc ON fc.feedback_id=f.id WHERE f.user_id=$1 AND f.previous_ranking_version=$2 AND f.rebuild_job_id=$3`, userID, previousVersion, jobID).Scan(&status, &resultingVersion, &classTaxonomy, &classPolarity, &classConfidence, &classActionable)
+		err = r.store.Pool.QueryRow(ctx, `SELECT f.id,j.status,f.resulting_ranking_version,fc.taxonomy,fc.polarity,fc.confidence,fc.actionable FROM feedback_events f JOIN sync_jobs j ON j.id=f.rebuild_job_id LEFT JOIN feedback_classifications fc ON fc.feedback_id=f.id WHERE f.user_id=$1 AND f.previous_ranking_version=$2 AND f.rebuild_job_id=$3`, userID, previousVersion, jobID).Scan(&feedbackID, &status, &resultingVersion, &classTaxonomy, &classPolarity, &classConfidence, &classActionable)
 	} else {
-		err = r.store.Pool.QueryRow(ctx, `SELECT j.status,f.resulting_ranking_version,fc.taxonomy,fc.polarity,fc.confidence,fc.actionable FROM feedback_events f JOIN sync_jobs j ON j.id=f.rebuild_job_id LEFT JOIN feedback_classifications fc ON fc.feedback_id=f.id WHERE f.user_id=$1 AND f.previous_ranking_version=$2 ORDER BY f.created_at DESC,f.id DESC LIMIT 1`, userID, previousVersion).Scan(&status, &resultingVersion, &classTaxonomy, &classPolarity, &classConfidence, &classActionable)
+		err = r.store.Pool.QueryRow(ctx, `SELECT f.id,j.status,f.resulting_ranking_version,fc.taxonomy,fc.polarity,fc.confidence,fc.actionable FROM feedback_events f JOIN sync_jobs j ON j.id=f.rebuild_job_id LEFT JOIN feedback_classifications fc ON fc.feedback_id=f.id WHERE f.user_id=$1 AND f.previous_ranking_version=$2 ORDER BY f.created_at DESC,f.id DESC LIMIT 1`, userID, previousVersion).Scan(&feedbackID, &status, &resultingVersion, &classTaxonomy, &classPolarity, &classConfidence, &classActionable)
+	}
+	if errors.Is(err, pgx.ErrNoRows) && jobID != uuid.Nil {
+		err = r.store.Pool.QueryRow(ctx, `SELECT a.id,root.status,CASE WHEN child.status='succeeded' THEN (child.result->>'rankingVersion')::bigint END FROM preference_adjustments a JOIN sync_jobs root ON root.id=a.disable_rebuild_job_id AND root.user_id=a.user_id AND root.kind='preferences.disable' LEFT JOIN sync_jobs child ON child.parent_job_id=root.id AND child.user_id=a.user_id AND child.idempotency_key='adjustment:'||a.id::text||':disable:ranking:v1' WHERE a.user_id=$1 AND a.disable_previous_ranking_version=$2 AND a.disable_rebuild_job_id=$3`, userID, previousVersion, jobID).Scan(&disableAdjustmentID, &status, &resultingVersion)
+		disableWorkflow = err == nil
 	}
 	if err != nil {
 		return RankingDiff{}, err
@@ -171,6 +229,17 @@ func (r *SQLRepository) RankingDiff(ctx context.Context, userID uuid.UUID, previ
 	}
 	if resultingVersion != nil {
 		result.CurrentVersion = *resultingVersion
+	} else if disableWorkflow {
+		result.CurrentVersion = previousVersion
+	}
+	var adjustmentID uuid.UUID
+	var target string
+	var active bool
+	err = r.store.Pool.QueryRow(ctx, `SELECT id,target,active FROM preference_adjustments WHERE user_id=$1 AND (source_feedback_id=$2 OR id=$3)`, userID, feedbackID, disableAdjustmentID).Scan(&adjustmentID, &target, &active)
+	if err == nil {
+		result.Adjustment = &AdjustmentSummary{ID: adjustmentID, Label: preferences.ModeLabel(preferences.Mode(target)), Effect: "понижаем в рекомендациях", Active: active}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return RankingDiff{}, err
 	}
 	if classTaxonomy != nil && classPolarity != nil && classConfidence != nil && classActionable != nil {
 		result.Classification = &ClassificationResult{Taxonomy: *classTaxonomy, Polarity: *classPolarity, Confidence: *classConfidence, Actionable: *classActionable}
@@ -210,7 +279,7 @@ func (r *SQLRepository) ranking(ctx context.Context, userID uuid.UUID, version i
 	if version < 1 {
 		return []rankedRecommendation{}, nil
 	}
-	rows, err := r.store.Pool.Query(ctx, `SELECT r.id,r.game_id FROM recommendations r JOIN games g ON g.id=r.game_id WHERE r.user_id=$1 AND r.ranking_version=$2 AND EXISTS(SELECT 1 FROM recommendation_runs run WHERE run.user_id=$1 AND run.ranking_version=$2 AND run.published) ORDER BY r.score DESC,lower(g.name),g.id`, userID, version)
+	rows, err := r.store.Pool.Query(ctx, `SELECT r.id,r.game_id FROM recommendations r JOIN games g ON g.id=r.game_id WHERE r.user_id=$1 AND r.ranking_version=$2 AND EXISTS(SELECT 1 FROM recommendation_runs run WHERE run.user_id=$1 AND run.ranking_version=$2 AND run.published) ORDER BY r.score DESC,lower(g.name) COLLATE "C",g.name COLLATE "C",g.id`, userID, version)
 	if err != nil {
 		return nil, fmt.Errorf("load ranking version: %w", err)
 	}

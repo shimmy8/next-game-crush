@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	pgvector "github.com/pgvector/pgvector-go"
 	"next-game-crush/internal/store"
 )
@@ -31,23 +32,31 @@ func (r *SQLRepository) LoadSignals(ctx context.Context, userID uuid.UUID) ([]Si
 	rows, err := r.store.Pool.Query(ctx, `WITH relevant AS (
 		SELECT game_id FROM user_games WHERE user_id=$1 UNION
 		SELECT game_id FROM wishlist_entries WHERE user_id=$1 UNION
-		SELECT rec.game_id FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id WHERE f.user_id=$1
+		SELECT rec.game_id FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id WHERE f.user_id=$1 UNION
+		SELECT game_id FROM user_game_completion_projections WHERE user_id=$1
 	), feedback AS (
 		SELECT rec.game_id,
-			(count(*) FILTER (WHERE f.action='like') + count(*) FILTER (WHERE fc.actionable AND fc.polarity='positive'))::int likes,
-			(count(*) FILTER (WHERE f.action IN ('dislike','exclude')) + count(*) FILTER (WHERE fc.actionable AND fc.polarity='negative'))::int dislikes
+			(count(*) FILTER (WHERE f.action='like'))::int likes,
+			(count(*) FILTER (WHERE f.action IN ('dislike','exclude')))::int dislikes
 		FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id
-		LEFT JOIN feedback_classifications fc ON fc.feedback_id=f.id
 		WHERE f.user_id=$1 GROUP BY rec.game_id
+	), latest_direct AS (
+		SELECT DISTINCT ON (rec.game_id) rec.game_id,f.action
+		FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id
+		WHERE f.user_id=$1 AND f.action IN ('like','dislike','exclude')
+		ORDER BY rec.game_id,f.created_at DESC,f.id DESC
 	)
-	SELECT rel.game_id,e.embedding,COALESCE(ug.playtime_minutes,0),COALESCE(ug.recently_played_minutes,0),
+	SELECT rel.game_id,e.embedding,COALESCE(ug.playtime_minutes,0),COALESCE(ug.recently_played_minutes,0),ug.last_played_at,
 		CASE WHEN COALESCE(a.total,0)>0 THEN a.achieved::float8/a.total ELSE 0 END,
+		COALESCE(cp.weight,0),COALESCE(ld.action IN ('dislike','exclude'),false),
 		(w.game_id IS NOT NULL),COALESCE(f.likes,0),COALESCE(f.dislikes,0)
 	FROM relevant rel JOIN game_embeddings e ON e.game_id=rel.game_id AND e.model=$2
 	LEFT JOIN user_games ug ON ug.user_id=$1 AND ug.game_id=rel.game_id
 	LEFT JOIN wishlist_entries w ON w.user_id=$1 AND w.game_id=rel.game_id
 	LEFT JOIN achievement_summaries a ON a.user_id=$1 AND a.game_id=rel.game_id
-	LEFT JOIN feedback f ON f.game_id=rel.game_id ORDER BY rel.game_id`, userID, r.embeddingModel)
+	LEFT JOIN user_game_completion_projections cp ON cp.user_id=$1 AND cp.game_id=rel.game_id
+	LEFT JOIN feedback f ON f.game_id=rel.game_id
+	LEFT JOIN latest_direct ld ON ld.game_id=rel.game_id ORDER BY rel.game_id`, userID, r.embeddingModel)
 	if err != nil {
 		return nil, err
 	}
@@ -56,8 +65,12 @@ func (r *SQLRepository) LoadSignals(ctx context.Context, userID uuid.UUID) ([]Si
 	for rows.Next() {
 		var s Signal
 		var vector pgvector.Vector
-		if err := rows.Scan(&s.GameID, &vector, &s.PlaytimeMinutes, &s.RecentMinutes, &s.AchievementRatio, &s.Wishlisted, &s.Likes, &s.Dislikes); err != nil {
+		var lastPlayedAt pgtype.Timestamptz
+		if err := rows.Scan(&s.GameID, &vector, &s.PlaytimeMinutes, &s.RecentMinutes, &lastPlayedAt, &s.AchievementRatio, &s.CompletionWeight, &s.CompletionOverridden, &s.Wishlisted, &s.Likes, &s.Dislikes); err != nil {
 			return nil, err
+		}
+		if lastPlayedAt.Valid {
+			s.LastPlayedAt = lastPlayedAt.Time.UTC()
 		}
 		s.Vector = append([]float32(nil), vector.Slice()...)
 		result = append(result, s)
@@ -66,6 +79,7 @@ func (r *SQLRepository) LoadSignals(ctx context.Context, userID uuid.UUID) ([]Si
 }
 
 func (r *SQLRepository) SaveProfile(ctx context.Context, userID uuid.UUID, vectors Vectors, algorithm, buildKey string) (Profile, error) {
+	buildKey = profileBuildKey(buildKey, algorithm)
 	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return Profile{}, err
@@ -90,7 +104,7 @@ func (r *SQLRepository) SaveProfile(ctx context.Context, userID uuid.UUID, vecto
 		return Profile{}, err
 	}
 	id, created := uuid.New(), r.now().UTC()
-	metadata, _ := json.Marshal(map[string]any{"algorithmVersion": algorithm, "confidence": vectors.Confidence, "evidenceCount": vectors.Evidence})
+	metadata, _ := json.Marshal(map[string]any{"algorithmVersion": algorithm, "completionAlgorithmVersion": CompletionAlgorithmVersion, "confidence": vectors.Confidence, "evidenceCount": vectors.Evidence, "positiveStrength": vectors.PositiveStrength})
 	if _, err = tx.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata,created_at,build_key) VALUES($1,$2,$3,$4,$5,$6)`, id, userID, version, metadata, created, nullableBuildKey(buildKey)); err != nil {
 		return Profile{}, err
 	}
@@ -106,7 +120,7 @@ func (r *SQLRepository) SaveProfile(ctx context.Context, userID uuid.UUID, vecto
 	if err = tx.Commit(ctx); err != nil {
 		return Profile{}, err
 	}
-	return WithSummaryState(Profile{ID: id, UserID: userID, Version: version, Confidence: vectors.Confidence, EvidenceCount: vectors.Evidence, Positive: vectors.Positive, Negative: vectors.Negative, CreatedAt: created}), nil
+	return WithSummaryState(Profile{ID: id, UserID: userID, Version: version, PositiveStrength: vectors.PositiveStrength, Confidence: vectors.Confidence, EvidenceCount: vectors.Evidence, Positive: vectors.Positive, Negative: vectors.Negative, CreatedAt: created}), nil
 }
 
 func (r *SQLRepository) LatestProfile(ctx context.Context, userID uuid.UUID) (Profile, error) {
@@ -130,11 +144,16 @@ func (r *SQLRepository) profileVersion(ctx context.Context, userID uuid.UUID, ve
 		p.Summary = *summary
 	}
 	var values struct {
-		Confidence    float64 `json:"confidence"`
-		EvidenceCount int     `json:"evidenceCount"`
+		Confidence       float64  `json:"confidence"`
+		EvidenceCount    int      `json:"evidenceCount"`
+		PositiveStrength *float64 `json:"positiveStrength"`
 	}
 	_ = json.Unmarshal(metadata, &values)
 	p.Confidence, p.EvidenceCount = finite01(values.Confidence), values.EvidenceCount
+	p.PositiveStrength = 1
+	if values.PositiveStrength != nil {
+		p.PositiveStrength = finite01(*values.PositiveStrength)
+	}
 	rows, err := r.store.Pool.Query(ctx, `SELECT polarity,embedding FROM profile_embeddings WHERE profile_id=$1 AND model=$2`, p.ID, r.embeddingModel)
 	if err != nil {
 		return Profile{}, err
@@ -178,6 +197,13 @@ func nullableBuildKey(value string) any {
 		return nil
 	}
 	return value
+}
+
+func profileBuildKey(source, algorithm string) string {
+	if source == "" {
+		return ""
+	}
+	return source + ":" + algorithm + ":" + CompletionAlgorithmVersion
 }
 
 var _ Repository = (*SQLRepository)(nil)

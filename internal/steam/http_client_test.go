@@ -377,6 +377,9 @@ func TestGameDetailsContractAndMalformedReleaseDate(t *testing.T) {
 		if len(details.Categories) != 1 || len(details.Genres) != 1 {
 			t.Fatalf("details categories/genres = %#v/%#v", details.Categories, details.Genres)
 		}
+		if details.Platforms != (Platforms{Windows: true, Mac: false, Linux: true}) {
+			t.Fatalf("platforms = %#v", details.Platforms)
+		}
 	})
 
 	t.Run("malformed date remains raw", func(t *testing.T) {
@@ -391,6 +394,149 @@ func TestGameDetailsContractAndMalformedReleaseDate(t *testing.T) {
 			t.Fatalf("release date = %#v", details.ReleaseDate)
 		}
 	})
+
+	for _, test := range []struct {
+		name, platforms string
+	}{
+		{name: "missing platforms"},
+		{name: "null platforms", platforms: `,"platforms":null`},
+		{name: "missing member", platforms: `,"platforms":{"windows":true,"mac":false}`},
+		{name: "non boolean member", platforms: `,"platforms":{"windows":true,"mac":"false","linux":true}`},
+		{name: "null member", platforms: `,"platforms":{"windows":true,"mac":null,"linux":true}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("ETag", `"invalid-platforms"`)
+				_, _ = fmt.Fprintf(w, `{"620":{"success":true,"data":{"type":"game","name":"Portal 2","steam_appid":620,"required_age":0,"release_date":{"coming_soon":true,"date":"Coming Soon"}%s}}}`, test.platforms)
+			}), HTTPConfig{})
+			if _, err := client.GameDetails(context.Background(), 620); !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("error = %v", err)
+			}
+			if _, ok := client.CacheMetadata(GameDetailsCacheKey(620)); ok {
+				t.Fatal("invalid platforms published cache metadata")
+			}
+		})
+	}
+}
+
+func TestDeckCompatibilityContracts(t *testing.T) {
+	for _, test := range []struct {
+		name, fixture, body string
+		want                DeckCompatibility
+		availability        Availability
+		invalid             bool
+	}{
+		{name: "verified", fixture: "deck_compatibility_verified.json", want: DeckVerified, availability: Available},
+		{name: "playable", fixture: "deck_compatibility_playable.json", want: DeckPlayable, availability: Available},
+		{name: "unsupported", fixture: "deck_compatibility_unsupported.json", want: DeckUnsupported, availability: Available},
+		{name: "unknown", fixture: "deck_compatibility_unknown.json", want: DeckUnknown, availability: Available},
+		{name: "unavailable", body: `{"success":0}`, availability: Unavailable},
+		{name: "other unsuccessful result", body: `{"success":2}`, availability: Unavailable},
+		{name: "missing success", body: `{"results":{"resolved_category":3}}`, availability: RequestFailed, invalid: true},
+		{name: "missing results", body: `{"success":1}`, availability: RequestFailed, invalid: true},
+		{name: "null results", body: `{"success":1,"results":null}`, availability: RequestFailed, invalid: true},
+		{name: "missing category", body: `{"success":1,"results":{}}`, availability: RequestFailed, invalid: true},
+		{name: "null category", body: `{"success":1,"results":{"resolved_category":null}}`, availability: RequestFailed, invalid: true},
+		{name: "unknown category", body: `{"success":1,"results":{"resolved_category":4}}`, availability: RequestFailed, invalid: true},
+		{name: "negative category", body: `{"success":1,"results":{"resolved_category":-1}}`, availability: RequestFailed, invalid: true},
+		{name: "string category", body: `{"success":1,"results":{"resolved_category":"3"}}`, availability: RequestFailed, invalid: true},
+		{name: "malformed JSON", body: `{upstream-body-canary`, availability: RequestFailed, invalid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/saleaction/ajaxgetdeckappcompatibilityreport" || r.URL.Query().Get("nAppID") != "620" || r.URL.Query().Has("key") {
+					t.Errorf("incorrect public Deck request contract")
+				}
+				w.Header().Set("ETag", `"deck-v1"`)
+				if test.fixture != "" {
+					serveFixture(t, w, test.fixture)
+					return
+				}
+				_, _ = w.Write([]byte(test.body))
+			}), HTTPConfig{})
+			got, availability, err := client.DeckCompatibility(context.Background(), 620)
+			if got != test.want || availability != test.availability || errors.Is(err, ErrInvalidResponse) != test.invalid || (!test.invalid && err != nil) {
+				t.Fatalf("status = %q, availability = %q, err = %v", got, availability, err)
+			}
+			if err != nil && (strings.Contains(err.Error(), "upstream-body-canary") || strings.Contains(err.Error(), "http")) {
+				t.Fatal("Deck error exposed upstream data")
+			}
+			metadata, ok := client.CacheMetadata(DeckCompatibilityCacheKey(620))
+			if ok != (test.availability == Available) || (ok && metadata.ETag != `"deck-v1"`) {
+				t.Fatalf("cache metadata = %#v, present = %v", metadata, ok)
+			}
+		})
+	}
+
+	for _, appID := range []int64{0, -1} {
+		t.Run(fmt.Sprintf("invalid AppID %d", appID), func(t *testing.T) {
+			client := fixtureClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Error("invalid AppID made a request")
+			}), HTTPConfig{})
+			got, availability, err := client.DeckCompatibility(context.Background(), appID)
+			if got != "" || availability != RequestFailed || !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("status = %q, availability = %q, err = %v", got, availability, err)
+			}
+		})
+	}
+}
+
+func TestDeckCompatibilityCacheAndRequestFailures(t *testing.T) {
+	t.Run("resource scoped validators and last valid metadata", func(t *testing.T) {
+		var firstCalls int
+		client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			appID := r.URL.Query().Get("nAppID")
+			w.Header().Set("ETag", `"deck-`+appID+`"`)
+			if appID == "620" {
+				firstCalls++
+				if firstCalls > 1 {
+					if r.Header.Get("If-None-Match") != `"deck-620"` {
+						t.Error("Deck validator not retained")
+					}
+					w.Header().Set("ETag", `"invalid-deck"`)
+					_, _ = w.Write([]byte(`{"success":1,"results":{"resolved_category":99}}`))
+					return
+				}
+			} else if r.Header.Get("If-None-Match") != "" {
+				t.Error("Deck validator leaked between games")
+			}
+			serveFixture(t, w, "deck_compatibility_verified.json")
+		}), HTTPConfig{})
+		for _, appID := range []int64{620, 440} {
+			if _, _, err := client.DeckCompatibility(context.Background(), appID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		first, _ := client.CacheMetadata(DeckCompatibilityCacheKey(620))
+		second, _ := client.CacheMetadata(DeckCompatibilityCacheKey(440))
+		if first.ETag != `"deck-620"` || second.ETag != `"deck-440"` {
+			t.Fatalf("Deck metadata = %#v / %#v", first, second)
+		}
+		if _, _, err := client.DeckCompatibility(context.Background(), 620); !errors.Is(err, ErrInvalidResponse) {
+			t.Fatalf("invalid category error = %v", err)
+		}
+		after, _ := client.CacheMetadata(DeckCompatibilityCacheKey(620))
+		if after != first {
+			t.Fatal("invalid Deck response replaced successful metadata")
+		}
+	})
+
+	for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprintf("HTTP %d", status), func(t *testing.T) {
+			client := fixtureClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte("upstream-body-canary"))
+			}), HTTPConfig{MaxRetries: -1})
+			got, availability, err := client.DeckCompatibility(context.Background(), 620)
+			var requestErr *RequestError
+			if got != "" || availability != RequestFailed || !errors.As(err, &requestErr) || requestErr.Operation != DeckCompatibilityOperation || requestErr.StatusCode != status {
+				t.Fatalf("status = %q, availability = %q, err = %v", got, availability, err)
+			}
+			if strings.Contains(err.Error(), "upstream-body-canary") || strings.Contains(err.Error(), "http://") {
+				t.Fatal("Deck HTTP error exposed upstream data")
+			}
+		})
+	}
 }
 
 func TestHTTPFailuresAreTypedRetryableAndSanitized(t *testing.T) {
@@ -510,7 +656,7 @@ func TestCacheMetadataIsResourceScopedAndOnlyPublishedAfterValidation(t *testing
 			serveFixture(t, w, "malformed_response.json")
 			return
 		}
-		_, _ = fmt.Fprintf(w, `{"%s":{"success":true,"data":{"type":"game","name":"Game %s","steam_appid":%s,"required_age":0,"release_date":{"coming_soon":true,"date":"Coming Soon"}}}}`, appID, appID, appID)
+		_, _ = fmt.Fprintf(w, `{"%s":{"success":true,"data":{"type":"game","name":"Game %s","steam_appid":%s,"required_age":0,"platforms":{"windows":true,"mac":false,"linux":false},"release_date":{"coming_soon":true,"date":"Coming Soon"}}}}`, appID, appID, appID)
 	}), HTTPConfig{})
 	if _, err := client.GameDetails(context.Background(), 620); err != nil {
 		t.Fatal(err)

@@ -71,12 +71,14 @@ const (
 type Operation string
 
 const (
-	OwnedGamesOperation     Operation = "owned_games"
-	RecentlyPlayedOperation Operation = "recently_played"
-	WishlistOperation       Operation = "wishlist"
-	AchievementsOperation   Operation = "achievements"
-	GameDetailsOperation    Operation = "game_details"
-	PlayerSummaryOperation  Operation = "player_summary"
+	OwnedGamesOperation        Operation = "owned_games"
+	RecentlyPlayedOperation    Operation = "recently_played"
+	WishlistOperation          Operation = "wishlist"
+	AchievementsOperation      Operation = "achievements"
+	GameDetailsOperation       Operation = "game_details"
+	PlayerSummaryOperation     Operation = "player_summary"
+	AppListOperation           Operation = "app_list"
+	DeckCompatibilityOperation Operation = "deck_compatibility"
 )
 
 const AchievementSchemaOperation Operation = "achievement_schema"
@@ -110,6 +112,10 @@ func AchievementSchemaCacheKey(appID int64) CacheKey {
 
 func GameDetailsCacheKey(appID int64) CacheKey {
 	return CacheKey{Operation: GameDetailsOperation, Resource: strconv.FormatInt(appID, 10)}
+}
+
+func DeckCompatibilityCacheKey(appID int64) CacheKey {
+	return CacheKey{Operation: DeckCompatibilityOperation, Resource: strconv.FormatInt(appID, 10)}
 }
 
 type CacheValidator struct {
@@ -199,6 +205,21 @@ type ReleaseDate struct {
 	Raw        string
 }
 
+type Platforms struct {
+	Windows bool
+	Mac     bool
+	Linux   bool
+}
+
+type DeckCompatibility string
+
+const (
+	DeckVerified    DeckCompatibility = "verified"
+	DeckPlayable    DeckCompatibility = "playable"
+	DeckUnsupported DeckCompatibility = "unsupported"
+	DeckUnknown     DeckCompatibility = "unknown"
+)
+
 type GameDetails struct {
 	AppID            int64
 	Type             string
@@ -212,4 +233,5 @@ type GameDetails struct {
 	Categories       []Category
 	Genres           []Genre
 	ReleaseDate      ReleaseDate
+	Platforms        Platforms
 }

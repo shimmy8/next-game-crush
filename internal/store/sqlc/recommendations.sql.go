@@ -12,9 +12,9 @@ import (
 )
 
 const getLatestRecommendations = `-- name: GetLatestRecommendations :many
-SELECT r.id, r.user_id, r.game_id, r.profile_id, r.algorithm_version, r.score, r.text_model, r.embedding_model, r.explanation, r.explanation_input_content_hash, r.created_at, r.ranking_version, r.explanation_evidence, r.explanation_generated, g.name FROM recommendations r JOIN games g ON g.id=r.game_id
+SELECT r.id, r.user_id, r.game_id, r.profile_id, r.algorithm_version, r.score, r.text_model, r.embedding_model, r.explanation, r.explanation_input_content_hash, r.created_at, r.ranking_version, r.explanation_evidence, r.explanation_generated, r.explanation_source, r.explanation_failure_reason, g.name FROM recommendations r JOIN games g ON g.id=r.game_id
 WHERE r.user_id=$1 AND r.ranking_version=(SELECT max(ranking_version) FROM recommendation_runs WHERE user_id=$1 AND published)
-ORDER BY r.score DESC, lower(g.name), g.id
+ORDER BY r.score DESC, lower(g.name) COLLATE "C", g.name COLLATE "C", g.id
 `
 
 type GetLatestRecommendationsRow struct {
@@ -32,6 +32,8 @@ type GetLatestRecommendationsRow struct {
 	RankingVersion              int64              `json:"ranking_version"`
 	ExplanationEvidence         []byte             `json:"explanation_evidence"`
 	ExplanationGenerated        bool               `json:"explanation_generated"`
+	ExplanationSource           string             `json:"explanation_source"`
+	ExplanationFailureReason    pgtype.Text        `json:"explanation_failure_reason"`
 	Name                        string             `json:"name"`
 }
 
@@ -59,6 +61,8 @@ func (q *Queries) GetLatestRecommendations(ctx context.Context, userID pgtype.UU
 			&i.RankingVersion,
 			&i.ExplanationEvidence,
 			&i.ExplanationGenerated,
+			&i.ExplanationSource,
+			&i.ExplanationFailureReason,
 			&i.Name,
 		); err != nil {
 			return nil, err
@@ -88,7 +92,7 @@ func (q *Queries) GetRecommendationFactors(ctx context.Context, recommendationID
 }
 
 const getRecommendationForUser = `-- name: GetRecommendationForUser :one
-SELECT r.id, r.user_id, r.game_id, r.profile_id, r.algorithm_version, r.score, r.text_model, r.embedding_model, r.explanation, r.explanation_input_content_hash, r.created_at, r.ranking_version, r.explanation_evidence, r.explanation_generated, g.name FROM recommendations r JOIN games g ON g.id=r.game_id
+SELECT r.id, r.user_id, r.game_id, r.profile_id, r.algorithm_version, r.score, r.text_model, r.embedding_model, r.explanation, r.explanation_input_content_hash, r.created_at, r.ranking_version, r.explanation_evidence, r.explanation_generated, r.explanation_source, r.explanation_failure_reason, g.name FROM recommendations r JOIN games g ON g.id=r.game_id
 WHERE r.id=$1 AND r.user_id=$2
 `
 
@@ -112,6 +116,8 @@ type GetRecommendationForUserRow struct {
 	RankingVersion              int64              `json:"ranking_version"`
 	ExplanationEvidence         []byte             `json:"explanation_evidence"`
 	ExplanationGenerated        bool               `json:"explanation_generated"`
+	ExplanationSource           string             `json:"explanation_source"`
+	ExplanationFailureReason    pgtype.Text        `json:"explanation_failure_reason"`
 	Name                        string             `json:"name"`
 }
 
@@ -133,6 +139,8 @@ func (q *Queries) GetRecommendationForUser(ctx context.Context, arg GetRecommend
 		&i.RankingVersion,
 		&i.ExplanationEvidence,
 		&i.ExplanationGenerated,
+		&i.ExplanationSource,
+		&i.ExplanationFailureReason,
 		&i.Name,
 	)
 	return i, err

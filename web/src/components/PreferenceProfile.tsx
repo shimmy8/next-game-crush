@@ -1,10 +1,10 @@
-import type { PreferenceProfileData } from '../api/types'
+import type { PreferenceProfileData, RankingDiff } from '../api/types'
+import PreferenceAdjustments from './PreferenceAdjustments'
 
-export default function PreferenceProfile({ profile }: { profile: PreferenceProfileData | null }) {
+export default function PreferenceProfile({ profile, csrfToken, onRankingUpdated, readOnly = false }: { profile: PreferenceProfileData | null; csrfToken?: string; onRankingUpdated?: (diff: RankingDiff) => void; readOnly?: boolean }) {
   return (
-    <aside className="profile-card" aria-labelledby="taste-title">
+    <aside className="profile-card" aria-label="Профиль вкуса">
       <div className="eyebrow">Профиль вкуса</div>
-      <h2 id="taste-title">Ваша игровая ДНК</h2>
       {profile ? (
         <>
           <p>{profile.summary || 'Профиль собран из вашей библиотеки и активности.'}</p>
@@ -14,6 +14,7 @@ export default function PreferenceProfile({ profile }: { profile: PreferenceProf
             <summary>На чём это основано</summary>
             <p>{profile.evidenceCount} сигналов из игр, активности, списка желаемого и достижений. Версия профиля {profile.version}.</p>
           </details>
+          {csrfToken && <PreferenceAdjustments adjustments={profile.adjustments ?? []} csrfToken={csrfToken} onRankingUpdated={onRankingUpdated} readOnly={readOnly} />}
         </>
       ) : <p className="muted">Синхронизируйте Steam, чтобы собрать персональный профиль.</p>}
     </aside>

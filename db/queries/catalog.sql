@@ -4,6 +4,22 @@ SELECT * FROM games WHERE steam_app_id = $1;
 -- name: ListCatalogGames :many
 SELECT g.* FROM games g JOIN catalog_entries ce ON ce.game_id = g.id ORDER BY g.steam_app_id;
 
+-- name: ListKnownCatalogGames :many
+WITH known AS (
+    SELECT game_id FROM catalog_entries
+    UNION
+    SELECT w.game_id FROM wishlist_entries w JOIN games g ON g.id=w.game_id
+    WHERE NOT COALESCE(
+        jsonb_typeof(g.source_snapshot->'AppID')='number' AND g.source_snapshot->>'AppID'=g.steam_app_id::text
+        AND jsonb_typeof(g.source_snapshot->'Name')='string' AND btrim(g.source_snapshot->>'Name')<>''
+        AND jsonb_typeof(g.source_snapshot->'Type')='string' AND btrim(g.source_snapshot->>'Type')<>''
+        AND jsonb_typeof(g.source_snapshot->'ReleaseDate'->'ComingSoon')='boolean'
+        AND jsonb_typeof(g.source_snapshot->'ReleaseDate'->'Raw')='string'
+        AND (g.source_snapshot->'ReleaseDate'->>'ComingSoon'='true' OR btrim(g.source_snapshot->'ReleaseDate'->>'Raw')<>'')
+        AND (g.source_snapshot->'ReleaseDate'->>'ComingSoon'='false' OR lower(btrim(g.source_snapshot->>'Type'))<>'game'), false)
+)
+SELECT g.* FROM games g JOIN known k ON k.game_id=g.id ORDER BY g.steam_app_id;
+
 -- name: UpsertCatalogGame :one
 INSERT INTO games (id, steam_app_id, name, source, last_successful_fetch_at, source_snapshot, availability, last_attempt_at, content_hash)
 VALUES ($1, $2, $3, $4, $5, $6, 'available', $5, $7)
@@ -53,3 +69,26 @@ ON CONFLICT (game_id) DO UPDATE SET
     last_attempt_at = EXCLUDED.last_attempt_at,
     last_successful_fetch_at = COALESCE(EXCLUDED.last_successful_fetch_at, catalog_fetch_states.last_successful_fetch_at),
     error = EXCLUDED.error;
+
+-- name: UpsertGamePlatforms :exec
+INSERT INTO game_compatibility (game_id, windows, mac, linux, platforms_last_successful_fetch_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (game_id) DO UPDATE SET
+    windows = EXCLUDED.windows,
+    mac = EXCLUDED.mac,
+    linux = EXCLUDED.linux,
+    platforms_last_successful_fetch_at = EXCLUDED.platforms_last_successful_fetch_at;
+
+-- name: RecordDeckCompatibilitySuccess :exec
+UPDATE game_compatibility SET
+    deck_status = $2,
+    deck_availability = $3,
+    deck_last_attempt_at = $4,
+    deck_last_successful_fetch_at = $5
+WHERE game_id = $1;
+
+-- name: RecordDeckCompatibilityFailure :exec
+UPDATE game_compatibility SET
+    deck_availability = $2,
+    deck_last_attempt_at = $3
+WHERE game_id = $1;

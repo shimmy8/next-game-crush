@@ -51,6 +51,17 @@ func (s *Service) RequireCSRF(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Service) RequireOwner(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		session, ok := SessionFromContext(r.Context())
+		if !ok || session.AccessMode != AccessModeOwner {
+			http.Error(w, "demo mode is read-only", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func SessionFromContext(ctx context.Context) (Session, bool) {
 	session, ok := ctx.Value(sessionContextKey{}).(Session)
 	return session, ok

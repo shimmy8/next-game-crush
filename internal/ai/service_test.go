@@ -2,11 +2,14 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/jobs"
@@ -36,6 +39,171 @@ func TestContentHashCacheSkipsRemoteCall(t *testing.T) {
 	}
 	if client.featureCalls != 0 {
 		t.Fatalf("remote calls = %d", client.featureCalls)
+	}
+}
+
+func TestCatalogChangedHookReplaysAfterPostCommitFailure(t *testing.T) {
+	for _, kind := range []string{FeaturesJobKind, EmbeddingJobKind} {
+		t.Run(kind, func(t *testing.T) {
+			gameID := uuid.New()
+			repository := &fakeRepository{game: StoredGameEvidence{Name: "Portal"}}
+			client := &fakeClient{
+				features: GameFeatures{Themes: []string{"puzzle"}, Mechanics: []string{}, Modes: []string{}, Tone: []string{}, EvidenceKeys: []string{"title"}},
+				vectors:  [][]float32{make([]float32, EmbeddingDimensions)},
+			}
+			service, err := NewService(repository, client, "gpt-6-luna", "text-embedding-3-small")
+			if err != nil {
+				t.Fatal(err)
+			}
+			hookCalls := 0
+			service.SetCatalogChangedHook(func(context.Context, uuid.UUID) error {
+				hookCalls++
+				if hookCalls == 1 {
+					return errors.New("transient rebuild scheduling failure")
+				}
+				return nil
+			})
+			payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID})
+			lease := jobs.Lease{Kind: kind, IdempotencyKey: "catalog:hook-replay:" + kind, Payload: payload, Attempts: 1}
+			run := service.handleFeatures
+			if kind == EmbeddingJobKind {
+				run = service.handleEmbedding
+			}
+			if err := run(context.Background(), lease); err == nil {
+				t.Fatal("first hook failure was not returned")
+			}
+			lease.Attempts = 2
+			lease.Result, _ = json.Marshal(catalogChangeResult{Pending: true})
+			if err := run(context.Background(), lease); err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			if hookCalls != 2 {
+				t.Fatalf("hook calls=%d, want replay after committed cache write", hookCalls)
+			}
+		})
+	}
+}
+
+func TestCatalogChangedHookFailureDefersOwnedLease(t *testing.T) {
+	db := openAIIntegrationStore(t)
+	queue := jobs.NewQueue(db)
+	gameID := uuid.New()
+	repository := &fakeRepository{game: StoredGameEvidence{Name: "Portal"}}
+	client := &fakeClient{
+		features: GameFeatures{Themes: []string{"puzzle"}, Mechanics: []string{}, Modes: []string{}, Tone: []string{}, EvidenceKeys: []string{"title"}},
+		vectors:  [][]float32{make([]float32, EmbeddingDimensions)},
+	}
+	service, err := NewService(repository, client, "gpt-6-luna", "text-embedding-3-small")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetQueue(queue)
+	hookCalls := 0
+	service.SetCatalogChangedHook(func(context.Context, uuid.UUID) error {
+		hookCalls++
+		if hookCalls == 1 {
+			return errors.New("temporary scheduler failure")
+		}
+		return nil
+	})
+	payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID})
+	jobID, err := queue.Enqueue(context.Background(), jobs.Spec{Kind: EmbeddingJobKind, IdempotencyKey: "catalog:hook-replay:" + EmbeddingJobKind, Payload: payload, MaxAttempts: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := queue.Claim(context.Background(), "hook-replay", time.Minute)
+	if err != nil || lease == nil || lease.ID != jobID {
+		t.Fatalf("claim=%+v err=%v", lease, err)
+	}
+	if err := service.handleEmbedding(context.Background(), *lease); !errors.Is(err, jobs.ErrDeferred) {
+		t.Fatalf("first attempt=%v, want deferred", err)
+	}
+	if _, err := db.Pool.Exec(context.Background(), `UPDATE sync_jobs SET available_at=now() WHERE id=$1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := queue.Claim(context.Background(), "hook-replay", time.Minute)
+	if err != nil || retry == nil || retry.ID != jobID || retry.Attempts != 1 {
+		t.Fatalf("retry=%+v err=%v", retry, err)
+	}
+	err = service.handleEmbedding(context.Background(), *retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hookCalls != 2 {
+		t.Fatalf("hook calls=%d, want 2", hookCalls)
+	}
+}
+
+func TestFeatureParentNotifiesCatalogOnceAfterEmbeddingChild(t *testing.T) {
+	for _, failFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fail_first_%t", failFirst), func(t *testing.T) {
+			db := openAIIntegrationStore(t)
+			queue := jobs.NewQueue(db)
+			gameID := uuid.New()
+			repository := &fakeRepository{game: StoredGameEvidence{Name: "Portal"}}
+			client := &fakeClient{features: GameFeatures{Themes: []string{"puzzle"}, Mechanics: []string{}, Modes: []string{}, Tone: []string{}, EvidenceKeys: []string{"title"}}}
+			service, _ := NewService(repository, client, "gpt-6-luna", "text-embedding-3-small")
+			service.SetQueue(queue)
+			hookCalls := 0
+			service.SetCatalogChangedHook(func(context.Context, uuid.UUID) error {
+				hookCalls++
+				if failFirst && hookCalls == 1 {
+					return errors.New("temporary scheduler failure")
+				}
+				return nil
+			})
+			payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, GameID: gameID})
+			parentID, err := queue.Enqueue(context.Background(), jobs.Spec{Kind: FeaturesJobKind, IdempotencyKey: "catalog:feature-lifecycle", Payload: payload})
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent, err := queue.Claim(context.Background(), "feature-lifecycle", time.Minute)
+			if err != nil || parent == nil || parent.ID != parentID {
+				t.Fatalf("parent=%+v err=%v", parent, err)
+			}
+			if err := service.handleFeatures(context.Background(), *parent); !errors.Is(err, jobs.ErrDeferred) || hookCalls != 0 {
+				t.Fatalf("first parent=%v hooks=%d", err, hookCalls)
+			}
+			repository.cachedEmbedding = true
+			child, err := queue.Claim(context.Background(), "feature-lifecycle", time.Minute)
+			if err != nil || child == nil || child.Kind != EmbeddingJobKind {
+				t.Fatalf("child=%+v err=%v", child, err)
+			}
+			if err := service.handleEmbedding(context.Background(), *child); err != nil {
+				t.Fatal(err)
+			}
+			if err := queue.Complete(context.Background(), *child); err != nil {
+				t.Fatal(err)
+			}
+			parent, err = queue.Claim(context.Background(), "feature-lifecycle", time.Minute)
+			if err != nil || parent == nil || parent.ID != parentID {
+				t.Fatalf("resumed parent=%+v err=%v", parent, err)
+			}
+			err = service.handleFeatures(context.Background(), *parent)
+			if failFirst {
+				if !errors.Is(err, jobs.ErrDeferred) {
+					t.Fatalf("feature hook failure=%v, want deferred", err)
+				}
+				if _, err := db.Pool.Exec(context.Background(), `UPDATE sync_jobs SET available_at=now() WHERE id=$1`, parentID); err != nil {
+					t.Fatal(err)
+				}
+				parent, err = queue.Claim(context.Background(), "feature-lifecycle", time.Minute)
+				if err != nil || parent == nil || parent.ID != parentID {
+					t.Fatalf("hook retry parent=%+v err=%v", parent, err)
+				}
+				err = service.handleFeatures(context.Background(), *parent)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCalls := 1
+			if failFirst {
+				wantCalls = 2
+			}
+			if hookCalls != wantCalls {
+				t.Fatalf("hook calls=%d, want %d", hookCalls, wantCalls)
+			}
+		})
 	}
 }
 
@@ -111,6 +279,7 @@ type fakeRepository struct {
 	gameIDs             []uuid.UUID
 	profileEvidence     ProfileEvidence
 	cachedFeatures      bool
+	cachedEmbedding     bool
 	savedFeatures       bool
 	savedEmbedding      bool
 	savedProfileSummary bool
@@ -129,13 +298,15 @@ func (f *fakeRepository) HasGameFeatures(context.Context, uuid.UUID, string, str
 }
 func (f *fakeRepository) SaveGameFeatures(context.Context, uuid.UUID, string, string, GameFeatures) error {
 	f.savedFeatures = true
+	f.cachedFeatures = true
 	return nil
 }
 func (f *fakeRepository) HasGameEmbedding(context.Context, uuid.UUID, string, string) (bool, error) {
-	return false, nil
+	return f.cachedEmbedding, nil
 }
 func (f *fakeRepository) SaveGameEmbedding(context.Context, uuid.UUID, string, string, []float32) error {
 	f.savedEmbedding = true
+	f.cachedEmbedding = true
 	return nil
 }
 func (f *fakeRepository) LoadProfileEvidence(context.Context, uuid.UUID) (ProfileEvidence, error) {

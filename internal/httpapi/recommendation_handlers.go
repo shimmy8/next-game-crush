@@ -13,6 +13,7 @@ import (
 )
 
 type RecommendationReadService interface {
+	Overview(context.Context, uuid.UUID) (recommendations.Overview, error)
 	Latest(context.Context, uuid.UUID) ([]recommendations.Recommendation, error)
 	Get(context.Context, uuid.UUID, uuid.UUID) (recommendations.Recommendation, error)
 }

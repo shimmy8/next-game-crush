@@ -70,6 +70,57 @@ func TestSQLRepositoryPersistsHashedOneTimeAuthMaterial(t *testing.T) {
 	}
 }
 
+func TestSQLRepositoryBoundsActiveDemoSessionsWithoutInvalidatingVisitors(t *testing.T) {
+	database := openAuthTestStore(t)
+	repository := NewSQLRepository(database)
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO steam_accounts(user_id,steam_id) VALUES($1,$2)`, userID, allowedSteamID); err != nil {
+		t.Fatal(err)
+	}
+	ownerID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO sessions(id,user_id,csrf_token,expires_at,access_mode) VALUES($1,$2,'owner',now()+interval '1 hour','owner')`, ownerID, userID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxActiveDemoSessionsPerOwner; i++ {
+		if _, err := database.Pool.Exec(ctx, `INSERT INTO sessions(id,user_id,csrf_token,expires_at,access_mode) VALUES($1,$2,$3,now()+interval '1 hour','demo')`, uuid.New(), userID, fmt.Sprintf("demo-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	candidate := Session{ID: uuid.New(), CSRFToken: "candidate", ExpiresAt: time.Now().Add(time.Hour), AccessMode: AccessModeDemo}
+	if _, err := repository.CreateDemoSession(ctx, allowedSteamID, candidate); !errors.Is(err, ErrDemoUnavailable) {
+		t.Fatalf("at cap error = %v, want ErrDemoUnavailable", err)
+	}
+	var active, owners int
+	if err := database.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE access_mode='demo' AND expires_at>now()), count(*) FILTER (WHERE access_mode='owner') FROM sessions WHERE user_id=$1`, userID).Scan(&active, &owners); err != nil {
+		t.Fatal(err)
+	}
+	if active != maxActiveDemoSessionsPerOwner || owners != 1 {
+		t.Fatalf("after rejection active demo=%d owners=%d", active, owners)
+	}
+
+	if _, err := database.Pool.Exec(ctx, `UPDATE sessions SET expires_at=now()-interval '1 second' WHERE id=(SELECT id FROM sessions WHERE user_id=$1 AND access_mode='demo' LIMIT 1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := repository.CreateDemoSession(ctx, allowedSteamID, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.ID != candidate.ID || created.UserID != userID {
+		t.Fatalf("created session = %#v", created)
+	}
+	var expired int
+	if err := database.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE access_mode='demo' AND expires_at>now()), count(*) FILTER (WHERE access_mode='demo' AND expires_at<=now()), count(*) FILTER (WHERE access_mode='owner') FROM sessions WHERE user_id=$1`, userID).Scan(&active, &expired, &owners); err != nil {
+		t.Fatal(err)
+	}
+	if active != maxActiveDemoSessionsPerOwner || expired != 0 || owners != 1 {
+		t.Fatalf("after replacement active demo=%d expired demo=%d owners=%d", active, expired, owners)
+	}
+}
+
 func openAuthTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	baseURL := os.Getenv("TEST_DATABASE_URL")

@@ -51,6 +51,36 @@ func TestBeginTargetsSteamLoginEndpoint(t *testing.T) {
 	}
 }
 
+func TestCreateDemoSessionRequiresOptInAndExistingOwner(t *testing.T) {
+	repo := newMemoryRepository()
+	service, err := New(Config{AppBaseURL: "http://localhost:8080", AllowedSteamID: allowedSteamID, SessionSecret: "a-test-secret-that-is-long-enough"}, repo, &fakeProvider{valid: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.CreateDemoSession(context.Background()); err == nil {
+		t.Fatal("disabled demo mode created a session")
+	}
+	service, err = New(Config{AppBaseURL: "http://localhost:8080", AllowedSteamID: allowedSteamID, SessionSecret: "a-test-secret-that-is-long-enough", DemoMode: true}, repo, &fakeProvider{valid: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.CreateDemoSession(context.Background()); !errors.Is(err, ErrDemoUnavailable) {
+		t.Fatalf("missing owner error = %v", err)
+	}
+	repo.accounts[allowedSteamID] = uuid.New()
+	session, err := service.CreateDemoSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.AccessMode != AccessModeDemo || session.UserID != repo.accounts[allowedSteamID] || session.SteamID != allowedSteamID || session.Token == "" || session.CSRFToken == "" {
+		t.Fatalf("demo session = %#v", session)
+	}
+	authenticated, err := service.Authenticate(context.Background(), session.Token)
+	if err != nil || authenticated.AccessMode != AccessModeDemo {
+		t.Fatalf("Authenticate() = %#v, %v", authenticated, err)
+	}
+}
+
 func TestCompleteDistinguishesExpiredStateFromStorageFailure(t *testing.T) {
 	service, _, _ := testService(t)
 	callback := beginCallback(t, service)
@@ -405,6 +435,16 @@ func (r *memoryRepository) GetSession(_ context.Context, id uuid.UUID) (Session,
 func (r *memoryRepository) DeleteSession(_ context.Context, id uuid.UUID) error {
 	delete(r.sessions, id)
 	return nil
+}
+func (r *memoryRepository) CreateDemoSession(_ context.Context, steamID string, session Session) (Session, error) {
+	id := r.accounts[steamID]
+	if id == uuid.Nil {
+		return Session{}, ErrDemoUnavailable
+	}
+	session.UserID = id
+	session.SteamID = steamID
+	r.sessions[session.ID] = session
+	return session, nil
 }
 
 func testService(t *testing.T) (*Service, *fakeProvider, *memoryRepository) {

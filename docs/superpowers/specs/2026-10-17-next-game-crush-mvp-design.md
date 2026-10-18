@@ -36,7 +36,7 @@ cloud without replacing the domain model.
 
 - Steam OpenID login for one allowlisted SteamID.
 - Public Steam library, total playtime, recently played games, and wishlist.
-- Achievement summaries for the 30 highest-signal games.
+- Achievement summaries for every game played within the last calendar year.
 - A bounded upcoming-release catalog covering the next 90 days.
 - Automatic inclusion of unreleased wishlist games even when they are absent
   from the seed catalog.
@@ -187,8 +187,9 @@ After login, the backend enqueues one idempotent synchronization workflow:
 2. Fetch recent activity.
 3. Fetch the wishlist.
 4. Upsert wishlist games into the bounded catalog.
-5. Select up to 30 achievement targets using playtime, recency, and data
-   availability; fetch each independently.
+5. Select every game played within the last calendar year, ordered by recency,
+   playtime, and stable AppID; fetch achievements with at most four concurrent
+   requests.
 6. Refresh known catalog metadata and dates.
 7. Generate or refresh structured game features.
 8. Generate missing embeddings.

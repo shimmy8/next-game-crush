@@ -42,7 +42,8 @@ verify: wait-test-db
 	docker compose config --quiet
 	docker compose build app
 	$(MAKE) playwright-browser
-	pnpm --dir web exec playwright test tests/e2e/smoke.spec.ts
+	pnpm --dir web exec playwright test tests/e2e/smoke.spec.ts tests/e2e/presentation.spec.ts tests/e2e/catalog-discovery.spec.ts tests/e2e/completion-signals.spec.ts
+	E2E_OPENAI_DISABLED=1 pnpm --dir web exec playwright test tests/e2e/completion-signals.spec.ts
 
 test:
 	go test ./...

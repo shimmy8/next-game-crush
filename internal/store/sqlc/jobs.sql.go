@@ -17,7 +17,7 @@ WITH candidate AS (
     WHERE attempts < max_attempts
       AND available_at <= now()
       AND (status IN ('queued', 'retryable') OR (status = 'running' AND lease_until <= now()))
-    ORDER BY available_at, created_at
+    ORDER BY priority DESC, available_at, created_at, id
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 ), claimed AS (
@@ -29,9 +29,9 @@ WITH candidate AS (
         last_error = NULL,
         updated_at = now()
     FROM candidate c WHERE j.id = c.id
-    RETURNING j.id, j.kind, j.idempotency_key, j.payload, j.status, j.attempts, j.max_attempts, j.available_at, j.worker_id, j.fencing_token, j.lease_until, j.last_error, j.created_at, j.updated_at, j.parent_job_id, j.required, j.stage, j.result, j.user_id
+    RETURNING j.id, j.kind, j.idempotency_key, j.payload, j.status, j.attempts, j.max_attempts, j.available_at, j.worker_id, j.fencing_token, j.lease_until, j.last_error, j.created_at, j.updated_at, j.parent_job_id, j.required, j.stage, j.result, j.user_id, j.priority
 )
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id FROM claimed
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id, priority FROM claimed
 `
 
 type ClaimJobParams struct {
@@ -60,6 +60,7 @@ type ClaimJobRow struct {
 	Stage          string             `json:"stage"`
 	Result         []byte             `json:"result"`
 	UserID         pgtype.UUID        `json:"user_id"`
+	Priority       int16              `json:"priority"`
 }
 
 func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (ClaimJobRow, error) {
@@ -85,6 +86,7 @@ func (q *Queries) ClaimJob(ctx context.Context, arg ClaimJobParams) (ClaimJobRow
 		&i.Stage,
 		&i.Result,
 		&i.UserID,
+		&i.Priority,
 	)
 	return i, err
 }
@@ -120,10 +122,39 @@ func (q *Queries) DeadLetterExhaustedLeases(ctx context.Context) error {
 	return err
 }
 
+const deferJobUntil = `-- name: DeferJobUntil :execrows
+UPDATE sync_jobs SET status = 'queued', attempts = GREATEST(attempts - 1, 0),
+    available_at = $1, worker_id = NULL, fencing_token = NULL,
+    lease_until = NULL, updated_at = now()
+WHERE id = $2 AND status = 'running' AND worker_id = $3
+  AND fencing_token = $4 AND lease_until > now()
+  AND $1::timestamptz > now()
+`
+
+type DeferJobUntilParams struct {
+	AvailableAt  pgtype.Timestamptz `json:"available_at"`
+	ID           pgtype.UUID        `json:"id"`
+	WorkerID     pgtype.Text        `json:"worker_id"`
+	FencingToken pgtype.UUID        `json:"fencing_token"`
+}
+
+func (q *Queries) DeferJobUntil(ctx context.Context, arg DeferJobUntilParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferJobUntil,
+		arg.AvailableAt,
+		arg.ID,
+		arg.WorkerID,
+		arg.FencingToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const enqueueJob = `-- name: EnqueueJob :one
-INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id)
-VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8, $9, $10)
-ON CONFLICT (idempotency_key) DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+INSERT INTO sync_jobs (id, kind, idempotency_key, payload, max_attempts, available_at, parent_job_id, required, stage, user_id, priority)
+VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), $7, $8, $9, $10, $11)
+ON CONFLICT (idempotency_key) DO UPDATE SET priority = GREATEST(sync_jobs.priority, EXCLUDED.priority)
 RETURNING id
 `
 
@@ -138,6 +169,7 @@ type EnqueueJobParams struct {
 	Required       bool               `json:"required"`
 	Stage          string             `json:"stage"`
 	UserID         pgtype.UUID        `json:"user_id"`
+	Priority       int16              `json:"priority"`
 }
 
 func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (pgtype.UUID, error) {
@@ -152,6 +184,7 @@ func (q *Queries) EnqueueJob(ctx context.Context, arg EnqueueJobParams) (pgtype.
 		arg.Required,
 		arg.Stage,
 		arg.UserID,
+		arg.Priority,
 	)
 	var id pgtype.UUID
 	err := row.Scan(&id)
@@ -201,6 +234,22 @@ WHERE parent.status='waiting' AND EXISTS (
 
 func (q *Queries) FailParentsWithDeadRequiredChildren(ctx context.Context) error {
 	_, err := q.db.Exec(ctx, failParentsWithDeadRequiredChildren)
+	return err
+}
+
+const finishDeferredAttempt = `-- name: FinishDeferredAttempt :exec
+UPDATE job_attempts SET status = 'waiting', finished_at = now()
+WHERE job_id = $1 AND worker_id = $2 AND fencing_token = $3 AND status = 'running'
+`
+
+type FinishDeferredAttemptParams struct {
+	JobID        pgtype.UUID `json:"job_id"`
+	WorkerID     string      `json:"worker_id"`
+	FencingToken pgtype.UUID `json:"fencing_token"`
+}
+
+func (q *Queries) FinishDeferredAttempt(ctx context.Context, arg FinishDeferredAttemptParams) error {
+	_, err := q.db.Exec(ctx, finishDeferredAttempt, arg.JobID, arg.WorkerID, arg.FencingToken)
 	return err
 }
 
@@ -257,7 +306,7 @@ func (q *Queries) FinishSuccessfulAttempt(ctx context.Context, arg FinishSuccess
 }
 
 const getJobChildren = `-- name: GetJobChildren :many
-SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id, priority FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id
 `
 
 func (q *Queries) GetJobChildren(ctx context.Context, parentJobID pgtype.UUID) ([]SyncJob, error) {
@@ -289,6 +338,7 @@ func (q *Queries) GetJobChildren(ctx context.Context, parentJobID pgtype.UUID) (
 			&i.Stage,
 			&i.Result,
 			&i.UserID,
+			&i.Priority,
 		); err != nil {
 			return nil, err
 		}

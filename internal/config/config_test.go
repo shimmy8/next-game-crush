@@ -19,8 +19,28 @@ func setRequiredEnvironment(t *testing.T) {
 		"OPENAI_MODEL":           "",
 		"OPENAI_EMBEDDING_MODEL": "",
 		"WORKER_CONCURRENCY":     "",
+		"DEMO_MODE_ENABLED":      "",
 	} {
 		t.Setenv(name, value)
+	}
+}
+
+func TestLoadDemoModeIsExplicitlyOptIn(t *testing.T) {
+	setRequiredEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DemoMode {
+		t.Fatal("demo mode must default to disabled")
+	}
+	t.Setenv("DEMO_MODE_ENABLED", "1")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.DemoMode {
+		t.Fatal("demo mode was not enabled")
 	}
 }
 

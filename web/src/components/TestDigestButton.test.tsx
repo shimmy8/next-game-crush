@@ -5,6 +5,13 @@ import TestDigestButton from './TestDigestButton'
 afterEach(() => vi.restoreAllMocks())
 
 describe('TestDigestButton', () => {
+  it('keeps the action visible without sending in demo mode', () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    render(<TestDigestButton csrfToken="csrf-token" readOnly />)
+    fireEvent.click(screen.getByRole('button', { name: 'Отправить дайджест' }))
+    expect(screen.getByRole('status')).toHaveTextContent('только для просмотра')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
   it('sends with CSRF and reports queued status', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ deliveryId: 'delivery', status: 'pending' }), { status: 202, headers: { 'Content-Type': 'application/json' } }))
     render(<TestDigestButton csrfToken="csrf-token" />)

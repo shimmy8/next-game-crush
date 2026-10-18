@@ -166,7 +166,7 @@ func TestNilLoggerAndNilSinkDoNotPanic(t *testing.T) {
 }
 
 func TestPublicEventsCannotCarryRawErrorsPayloadsOrAttributes(t *testing.T) {
-	for _, value := range []any{SyncRequestEvent{}, JobAttemptEvent{}, SyncSourceEvent{}, WorkerEvent{}} {
+	for _, value := range []any{SyncRequestEvent{}, JobAttemptEvent{}, SyncSourceEvent{}, WorkerEvent{}, CatalogDiscoveryEvent{}} {
 		typeOf := reflect.TypeOf(value)
 		for i := 0; i < typeOf.NumField(); i++ {
 			field := typeOf.Field(i)
@@ -175,6 +175,22 @@ func TestPublicEventsCannotCarryRawErrorsPayloadsOrAttributes(t *testing.T) {
 				t.Fatalf("%s exposes unsafe field %s", typeOf.Name(), field.Name)
 			}
 		}
+	}
+}
+
+func TestDiscoveryLogsOmitSensitiveInputs(t *testing.T) {
+	var output bytes.Buffer
+	logger := New(slog.New(slog.NewJSONHandler(&output, nil)))
+	logger.CatalogDiscovery(context.Background(), CatalogDiscoveryEvent{Source: "steam-key-secret", Mode: "raw-payload", Availability: "request_failed", Discovered: 2, Evaluated: 1, Failed: 1, Reason: ReasonUpstreamUnavailable})
+	raw := output.String()
+	for _, secret := range []string{"steam-key-secret", "raw-payload"} {
+		if strings.Contains(raw, secret) {
+			t.Fatalf("sensitive discovery value escaped: %s", raw)
+		}
+	}
+	event := decodeEvents(t, raw)[0]
+	if event["source"] != "unknown" || event["mode"] != "unknown" || event["failed"] != float64(1) {
+		t.Fatalf("event=%#v", event)
 	}
 }
 

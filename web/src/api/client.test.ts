@@ -1,8 +1,138 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { getCurrentSync, normalizeCalendar, preflightSync } from './client'
+import { disablePreferenceAdjustment, getDiagnostics, getPreferenceAdjustments, getProfile, getCurrentSync, getRecommendationOverview, normalizeCalendar, normalizeOverview, preflightSync } from './client'
 import type { SyncStatus } from './types'
+import { overviewFixture, recommendation } from '../test/overviewFixture'
 
 afterEach(() => vi.unstubAllGlobals())
+
+it('normalizes absent catalog diagnostics from older health responses', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(url === '/api/jobs' ? [] : { status: 'ok', components: {} }))))
+  await expect(getDiagnostics()).resolves.toMatchObject({
+    catalogDiscovery: {
+      status: 'disabled', activeDiscoveredGames: 0, backfillCursor: 0,
+      latestRun: { discovered: 0, evaluated: 0, admitted: 0, skipped: 0, failed: 0 },
+      pendingQualifications: 0,
+    },
+  })
+})
+
+describe('preference adjustments', () => {
+  it('disables with same-origin credentials, CSRF and encoded ID', async () => {
+    const accepted = { adjustmentId: 'rule', rebuildJobId: 'job', previousRankingVersion: 7, alreadyInactive: false }
+    const fetch = vi.fn(async () => new Response(JSON.stringify(accepted), { status: 202 }))
+    vi.stubGlobal('fetch', fetch)
+    const signal = new AbortController().signal
+    await expect(disablePreferenceAdjustment('a/b', 'csrf', signal)).resolves.toEqual(accepted)
+    expect(fetch).toHaveBeenCalledWith('/api/preference-adjustments/a%2Fb', { credentials: 'same-origin', method: 'DELETE', headers: { 'X-CSRF-Token': 'csrf' }, signal })
+  })
+  it('reads explicit inactive diagnostics and normalizes old profile arrays', async () => {
+    const fetch = vi.fn(async (url: string) => new Response(JSON.stringify(url.startsWith('/api/profile') ? { version: 3, adjustments: null } : null)))
+    vi.stubGlobal('fetch', fetch)
+    await expect(getPreferenceAdjustments(true)).resolves.toEqual([])
+    expect(fetch).toHaveBeenCalledWith('/api/preference-adjustments?includeInactive=true', expect.objectContaining({ credentials: 'same-origin' }))
+    await expect(getProfile()).resolves.toMatchObject({ version: 3, adjustments: [] })
+  })
+  it('rejects failures without exposing response bodies or adjustment IDs', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('private-feedback-canary', { status: 500 })))
+    await expect(disablePreferenceAdjustment('private-id', 'csrf')).rejects.toThrow('Unable to update preference adjustment')
+    await expect(getPreferenceAdjustments(true)).rejects.toThrow('Unable to load preference adjustments')
+  })
+})
+
+describe('recommendation overview', () => {
+  it('requests the overview with credentials and the caller abort signal', async () => {
+    const payload = overviewFixture(8, 8)
+    const fetch = vi.fn(async () => new Response(JSON.stringify(payload)))
+    vi.stubGlobal('fetch', fetch)
+    const signal = new AbortController().signal
+    await expect(getRecommendationOverview(signal)).resolves.toEqual(payload)
+    expect(fetch).toHaveBeenCalledWith('/api/recommendations/overview', { credentials: 'same-origin', signal })
+  })
+
+  it('normalizes null metadata and slices honestly without deriving collections from calendar', () => {
+    const value = normalizeOverview(JSON.parse('{"discoveries":{"items":null},"wishlist":null,"calendar":{"tba":[]},"catalogStatus":null}'))
+    expect(value).toEqual({
+      discoveries: { featured: null, items: [], total: 0 },
+      wishlist: { items: [], total: 0, status: 'unknown', availability: 'unknown', lastSuccessfulFetchAt: null, degradedReason: null },
+      calendar: { exactDates: [], month: [], quarter: [], year: [], comingSoon: [], tba: [] },
+      catalogStatus: { status: 'disabled', activeDiscoveredGames: 0, lastSuccessfulScanAt: null, backfillCompletedAt: null },
+    })
+    expect(normalizeOverview({ calendar: overviewFixture(8, 8).calendar }).discoveries).toEqual({ featured: null, items: [], total: 0 })
+    expect(normalizeOverview({})).toEqual(value)
+  })
+
+  it('preserves source freshness, full totals and normalizes every recommendation location identically', () => {
+    const payload = overviewFixture(8, 8)
+    const raw = { ...recommendation('nullable'), factors: null, weights: null, evidence: null }
+    const value = normalizeOverview(JSON.parse(JSON.stringify({
+      ...payload,
+      discoveries: { ...payload.discoveries, featured: raw, items: [raw] },
+      wishlist: { ...payload.wishlist, items: [raw], status: 'stale', availability: 'unavailable', degradedReason: 'private_or_unavailable' },
+      calendar: { tba: [raw] },
+    })))
+    expect(value.discoveries.total).toBe(8)
+    expect(value.wishlist).toMatchObject({ total: 8, status: 'stale', availability: 'unavailable', lastSuccessfulFetchAt: payload.wishlist.lastSuccessfulFetchAt, degradedReason: 'private_or_unavailable' })
+    for (const item of [value.discoveries.featured, ...value.discoveries.items, ...value.wishlist.items, ...value.calendar.tba]) {
+      expect(item).toMatchObject({ factors: {}, weights: {}, evidence: [] })
+    }
+    expect(normalizeOverview(JSON.parse('{"wishlist":{"status":null,"availability":null,"lastSuccessfulFetchAt":null,"degradedReason":null},"catalogStatus":{"status":null}}')).wishlist.status).toBe('unknown')
+  })
+
+  it('preserves completion factor and weight members in the typed recommendation snapshot', () => {
+    const raw = { ...recommendation('completion'), factors: { completionAffinity: .75 }, weights: { completionAffinity: 5 } }
+    const normalized = normalizeOverview({ discoveries: { featured: raw, items: [], total: 1 } }).discoveries.featured
+    expect(normalized?.factors.completionAffinity).toBe(.75)
+    expect(normalized?.weights.completionAffinity).toBe(5)
+  })
+
+  it('normalizes explanation sources and keeps only allowlisted safe evidence', () => {
+    const raw = {
+      ...recommendation('grounded'),
+      explanationSource: 'ai',
+      evidence: [
+        { id: 'feature', kind: 'feature_overlap', text: 'Совпадают темы: horror' },
+        { id: 'completion', kind: 'completion_anchor', text: 'Есть сходство с пройденной вами игрой SOMA' },
+        { id: 'mode', kind: 'negative_mode_preference', text: 'Учтено ваше предпочтение одиночной игры' },
+        { id: 'unknown', kind: 'provider_fact', text: 'Секрет провайдера' },
+        { id: 'json', kind: 'similar_game', text: '{"steamId":"private"}' },
+        { id: 'technical', kind: 'similar_game', text: 'Deterministic score: 90' },
+        { id: 'completion-factor', kind: 'completion_anchor', text: 'Поле completionAffinity равно единице' },
+        { id: 'completion-weight', kind: 'completion_anchor', text: 'Поле completionAffinityWeight равно пяти' },
+        { id: 'secret', kind: 'similar_game', text: '0123456789abcdef0123456789abcdef' },
+        { id: 'embedded', kind: 'similar_game', text: 'Причина {"sourceGameIds":["private"]}' },
+        { id: '', kind: 'similar_game', text: 'Пустой идентификатор' },
+      ],
+    }
+    const normalized = normalizeOverview({ discoveries: { featured: raw as never, items: [], total: 1 } }).discoveries.featured
+    expect(normalized).toMatchObject({
+      explanationSource: 'ai',
+      evidence: [
+        { id: 'feature', kind: 'feature_overlap', text: 'Совпадают темы: horror' },
+        { id: 'completion', kind: 'completion_anchor', text: 'Есть сходство с пройденной вами игрой SOMA' },
+        { id: 'mode', kind: 'negative_mode_preference', text: 'Учтено ваше предпочтение одиночной игры' },
+      ],
+    })
+  })
+
+  it.each([undefined, 'model', true])('defaults absent or unknown explanation source %s to none', (explanationSource) => {
+    const raw = { ...recommendation('legacy'), explanationSource, generatedExplanation: true, explanation: '{"prompt":"unsafe"}' }
+    const normalized = normalizeOverview({ discoveries: { featured: raw as never, items: [], total: 1 } }).discoveries.featured
+    expect(normalized).toMatchObject({ explanationSource: 'none', evidence: [] })
+  })
+
+  it.each([null, {}, 'not-an-array', [null]])('normalizes malformed evidence %j to an empty list', (evidence) => {
+    const raw = { ...recommendation('malformed'), explanationSource: 'deterministic', evidence }
+    expect(normalizeOverview({ discoveries: { featured: raw as never, items: [], total: 1 } }).discoveries.featured?.evidence).toEqual([])
+  })
+
+	it('keeps only nullable direct feedback actions in the recommendation contract', () => {
+		const liked = normalizeOverview({ discoveries: { featured: { ...recommendation('liked'), latestFeedbackAction: 'like', latestFeedbackReasons: ['setting', 'genre'] }, items: [], total: 1 } })
+		const reminded = normalizeOverview(JSON.parse(JSON.stringify({ discoveries: { featured: { ...recommendation('reminded'), latestFeedbackAction: 'remind_me' }, items: [], total: 1 } })))
+		expect(liked.discoveries.featured?.latestFeedbackAction).toBe('like')
+		expect(liked.discoveries.featured?.latestFeedbackReasons).toEqual(['setting', 'genre'])
+		expect(reminded.discoveries.featured?.latestFeedbackAction).toBeNull()
+	})
+})
 
 describe('normalizeCalendar', () => {
   it('normalizes Go nil slices without inventing releases', () => {

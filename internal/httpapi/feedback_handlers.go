@@ -22,10 +22,11 @@ type FeedbackService interface {
 }
 
 type feedbackRequest struct {
-	Action         string `json:"action"`
-	Reason         string `json:"reason"`
-	FreeText       string `json:"freeText"`
-	IdempotencyKey string `json:"idempotencyKey"`
+	Action         string          `json:"action"`
+	Reason         json.RawMessage `json:"reason"`
+	Reasons        json.RawMessage `json:"reasons"`
+	FreeText       string          `json:"freeText"`
+	IdempotencyKey string          `json:"idempotencyKey"`
 }
 
 func recordFeedback(service FeedbackService, reminder bool) http.HandlerFunc {
@@ -48,12 +49,31 @@ func recordFeedback(service FeedbackService, reminder bool) http.HandlerFunc {
 			http.Error(w, "invalid feedback request", http.StatusBadRequest)
 			return
 		}
+		if input.Reason != nil && input.Reasons != nil {
+			http.Error(w, "invalid feedback request", http.StatusBadRequest)
+			return
+		}
+		var reason string
+		if input.Reason != nil && strings.TrimSpace(string(input.Reason)) != "null" {
+			if json.Unmarshal(input.Reason, &reason) != nil || strings.TrimSpace(reason) == "" {
+				http.Error(w, "invalid feedback request", http.StatusBadRequest)
+				return
+			}
+		}
+		var reasons []string
+		if input.Reasons != nil && strings.TrimSpace(string(input.Reasons)) != "null" {
+			if json.Unmarshal(input.Reasons, &reasons) != nil {
+				http.Error(w, "invalid feedback request", http.StatusBadRequest)
+				return
+			}
+		}
 		if reminder {
 			input.Action = feedback.ActionRemind
-			input.Reason = ""
+			reason = ""
+			reasons = nil
 			input.FreeText = ""
 		}
-		accepted, err := service.Record(r.Context(), feedback.Command{UserID: session.UserID, RecommendationID: recommendationID, Action: input.Action, Reason: input.Reason, FreeText: input.FreeText, IdempotencyKey: input.IdempotencyKey})
+		accepted, err := service.Record(r.Context(), feedback.Command{UserID: session.UserID, RecommendationID: recommendationID, Action: input.Action, Reason: reason, Reasons: reasons, FreeText: input.FreeText, IdempotencyKey: input.IdempotencyKey})
 		switch {
 		case errors.Is(err, feedback.ErrInvalidCommand):
 			http.Error(w, "invalid feedback", http.StatusBadRequest)

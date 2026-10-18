@@ -7,7 +7,7 @@ import (
 )
 
 func DefaultWeights() Weights {
-	return Weights{SemanticSimilarity: 25, Wishlist: 30, TagAffinity: 15, PlaytimeAffinity: 10, AchievementAffinity: 5, RecentActivityAffinity: 5, PositiveFeedback: 20, Novelty: 5, NegativeFeedback: -30, DateUncertainty: -5, NegativeSimilarityMultiplier: .5}
+	return Weights{SemanticSimilarity: 25, Wishlist: 0, TagAffinity: 15, PlaytimeAffinity: 10, AchievementAffinity: 5, RecentActivityAffinity: 5, CompletionAffinity: 5, PositiveFeedback: 20, Novelty: 5, NegativeFeedback: -30, DateUncertainty: -5, NegativeSimilarityMultiplier: .5, NegativeModePreferenceWeight: -5}
 }
 
 func Score(f Factors, w Weights) Result {
@@ -15,7 +15,8 @@ func Score(f Factors, w Weights) Result {
 	if affinity < 0 {
 		affinity = 0
 	}
-	raw := affinity*w.SemanticSimilarity + clamp(f.Wishlist)*w.Wishlist + clamp(f.TagAffinity)*w.TagAffinity + clamp(f.PlaytimeAffinity)*w.PlaytimeAffinity + clamp(f.AchievementAffinity)*w.AchievementAffinity + clamp(f.RecentActivityAffinity)*w.RecentActivityAffinity + clamp(f.PositiveFeedback)*w.PositiveFeedback + clamp(f.Novelty)*w.Novelty + clamp(f.NegativeFeedback)*w.NegativeFeedback + clamp(f.DateUncertainty)*w.DateUncertainty
+	raw := affinity*w.SemanticSimilarity + clamp(f.Wishlist)*w.Wishlist + clamp(f.TagAffinity)*w.TagAffinity + clamp(f.PlaytimeAffinity)*w.PlaytimeAffinity + clamp(f.AchievementAffinity)*w.AchievementAffinity + clamp(f.RecentActivityAffinity)*w.RecentActivityAffinity + clamp(f.CompletionAffinity)*w.CompletionAffinity + clamp(f.PositiveFeedback)*w.PositiveFeedback + clamp(f.Novelty)*w.Novelty + clamp(f.NegativeFeedback)*w.NegativeFeedback + clamp(f.DateUncertainty)*w.DateUncertainty
+	raw += clamp(f.NegativeModePreference) * w.NegativeModePreferenceWeight
 	if math.IsNaN(raw) || math.IsInf(raw, 0) {
 		raw = 0
 	}
@@ -28,9 +29,8 @@ func Score(f Factors, w Weights) Result {
 	return Result{Score: math.Round(raw*1000) / 1000, SemanticAffinity: affinity}
 }
 func Eligible(candidate Candidate) bool {
-	return candidate.GameID != uuidNil && !candidate.Owned && !candidate.Released && !candidate.ExplicitlyHidden && !ShouldExcludeForFeedback(candidate.Dislikes)
+	return candidate.GameID != uuidNil && !candidate.Owned && !candidate.Released && !candidate.ExplicitlyHidden && !candidate.ExcludedByLatestDirectAction
 }
-func ShouldExcludeForFeedback(dislikes int) bool { return dislikes >= 2 }
 func Sort(input []Recommendation) []Recommendation {
 	result := append([]Recommendation(nil), input...)
 	sort.SliceStable(result, func(i, j int) bool {
@@ -51,6 +51,7 @@ func Sort(input []Recommendation) []Recommendation {
 func BuildCalendar(items []Recommendation) Calendar {
 	var result Calendar
 	for _, item := range Sort(items) {
+		item.Wishlisted = item.Wishlisted || clamp(item.Factors.Wishlist) > 0
 		switch item.Release.Precision {
 		case "day":
 			if item.Release.ExactDate != "" {

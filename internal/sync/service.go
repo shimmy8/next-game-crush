@@ -75,6 +75,7 @@ type Service struct {
 	aiJobs               AIJobPlanner
 	rankingJobs          bool
 	logger               *observability.Logger
+	discovery            interface{ Nudge(context.Context) error }
 	achievementSnapshots AchievementSnapshotRecorder
 }
 
@@ -97,6 +98,9 @@ func (s *Service) SetAchievementSnapshotRecorder(recorder AchievementSnapshotRec
 	s.achievementSnapshots = recorder
 }
 func (s *Service) EnableRankingJobs() { s.rankingJobs = true }
+func (s *Service) SetDiscoveryNudger(nudger interface{ Nudge(context.Context) error }) {
+	s.discovery = nudger
+}
 
 func NewService(database *store.Store, queue *jobs.Queue, client steam.Client, catalogService *catalog.Service, options ...ServiceOption) (*Service, error) {
 	if database == nil || queue == nil || client == nil || catalogService == nil {
@@ -145,7 +149,7 @@ func (s *Service) Start(ctx context.Context, userID uuid.UUID) (uuid.UUID, error
 	payload, _ := json.Marshal(Payload{Version: PayloadVersion, UserID: userID})
 	id := uuid.New()
 	key := fmt.Sprintf("steam.sync:%s:%s", userID, id)
-	if _, err := tx.Exec(ctx, `INSERT INTO sync_jobs (id,kind,idempotency_key,payload,max_attempts,stage,required) VALUES ($1,'steam.sync',$2,$3,5,'steam',true)`, id, key, payload); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO sync_jobs (id,kind,idempotency_key,payload,max_attempts,stage,required,user_id,priority) VALUES ($1,'steam.sync',$2,$3,5,'steam',true,$4,100)`, id, key, payload, userID); err != nil {
 		return uuid.Nil, fmt.Errorf("enqueue sync workflow: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -272,6 +276,9 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 	if err := worker.Register("catalog.refresh", s.handleCatalogRefresh); err != nil {
 		return err
 	}
+	if err := worker.Register("catalog.refresh_game", s.handleCatalogRefreshGame); err != nil {
+		return err
+	}
 	return worker.Register("achievements.sync", s.handleAchievementsSync)
 }
 
@@ -315,6 +322,8 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 			for i := range specs {
 				specs[i].Optional = true
 				specs[i].Required = false
+				specs[i].Priority = 100
+				specs[i].UserID = payload.UserID
 			}
 			if len(specs) > 0 {
 				ready, err := s.queue.AwaitChildren(ctx, lease, specs)
@@ -331,7 +340,7 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 		}
 		encoded, _ := json.Marshal(payload)
 		if !hasProfile {
-			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "profile.rebuild", Stage: "profile", Required: true, IdempotencyKey: lease.IdempotencyKey + ":profile:v1", Payload: encoded, MaxAttempts: 3}})
+			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "profile.rebuild", Stage: "profile", Required: true, IdempotencyKey: lease.IdempotencyKey + ":profile:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID}})
 			if err != nil {
 				return err
 			}
@@ -340,13 +349,16 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 			}
 		}
 		if !hasRecommendations {
-			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: lease.IdempotencyKey + ":recommendations:v1", Payload: encoded, MaxAttempts: 3}})
+			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: lease.IdempotencyKey + ":recommendations:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID}})
 			if err != nil {
 				return err
 			}
 			if !ready {
 				return jobs.ErrDeferred
 			}
+		}
+		if s.discovery != nil {
+			return s.discovery.Nudge(ctx)
 		}
 		return nil
 	}
@@ -355,8 +367,8 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 	}
 	encoded, _ := json.Marshal(payload)
 	childSpecs := []jobs.Spec{
-		{Kind: "catalog.refresh", Stage: "catalog", Required: true, IdempotencyKey: lease.IdempotencyKey + ":catalog:v1", Payload: encoded, MaxAttempts: 3},
-		{Kind: "achievements.sync", Stage: "achievements", Required: true, IdempotencyKey: lease.IdempotencyKey + ":achievements:v1", Payload: encoded, MaxAttempts: 3},
+		{Kind: "catalog.refresh", Stage: "catalog", Required: true, IdempotencyKey: lease.IdempotencyKey + ":catalog:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID},
+		{Kind: "achievements.sync", Stage: "achievements", Required: true, IdempotencyKey: lease.IdempotencyKey + ":achievements:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID},
 	}
 	ready, err := s.queue.AwaitChildren(ctx, lease, childSpecs)
 	if err != nil {
@@ -369,10 +381,45 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 }
 
 func (s *Service) handleCatalogRefresh(ctx context.Context, lease jobs.Lease) error {
-	if _, err := decodePayload(lease.Payload); err != nil {
+	payload, err := decodePayload(lease.Payload)
+	if err != nil {
 		return err
 	}
-	return s.catalog.RefreshKnown(ctx)
+	targets, err := s.catalog.RefreshTargets(ctx)
+	if err != nil {
+		return err
+	}
+	specs := make([]jobs.Spec, 0, len(targets))
+	for _, target := range targets {
+		raw, _ := json.Marshal(catalogRefreshGamePayload{Version: 1, AppID: target.AppID})
+		specs = append(specs, jobs.Spec{Kind: "catalog.refresh_game", Stage: "catalog", Required: true,
+			IdempotencyKey: fmt.Sprintf("%s:game:v1:%d", lease.IdempotencyKey, target.AppID), Payload: raw,
+			MaxAttempts: 3, Priority: target.Priority, UserID: payload.UserID})
+	}
+	if len(specs) == 0 {
+		return nil
+	}
+	ready, err := s.queue.AwaitChildren(ctx, lease, specs)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return jobs.ErrDeferred
+	}
+	return nil
+}
+
+type catalogRefreshGamePayload struct {
+	Version int   `json:"version"`
+	AppID   int64 `json:"app_id"`
+}
+
+func (s *Service) handleCatalogRefreshGame(ctx context.Context, lease jobs.Lease) error {
+	var payload catalogRefreshGamePayload
+	if err := json.Unmarshal(lease.Payload, &payload); err != nil || payload.Version != 1 || payload.AppID <= 0 {
+		return errors.New("unsupported catalog refresh payload schema")
+	}
+	return s.catalog.RefreshGame(ctx, payload.AppID)
 }
 
 func (s *Service) handleAchievementsSync(ctx context.Context, lease jobs.Lease) error {
@@ -437,15 +484,15 @@ func (s *Service) importSteam(ctx context.Context, userID uuid.UUID) error {
 
 	finishWishlist := s.beginSource(ctx, "wishlist")
 	wishlist, wishlistAvailability, wishlistErr := s.client.Wishlist(ctx, steamID)
-	if err := s.recordState(ctx, userID, "wishlist", "", wishlistAvailability, wishlistErr); err != nil {
-		finishWishlist(availability(wishlistAvailability, wishlistErr), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(wishlist)})
-		return err
-	}
 	if wishlistAvailability == steam.Available && wishlistErr == nil {
 		if err := s.saveWishlist(ctx, userID, wishlist); err != nil {
-			finishWishlist(string(wishlistAvailability), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(wishlist)})
-			return err
+			stateErr := s.recordState(ctx, userID, "wishlist", "", steam.RequestFailed, err)
+			finishWishlist(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(wishlist)})
+			return errors.Join(err, stateErr)
 		}
+	} else if err := s.recordState(ctx, userID, "wishlist", "", wishlistAvailability, wishlistErr); err != nil {
+		finishWishlist(availability(wishlistAvailability, wishlistErr), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, sourceCounts{total: len(wishlist)})
+		return err
 	}
 	finishWishlist(availability(wishlistAvailability, wishlistErr), diagnoseSteamFailure(wishlistAvailability, wishlistErr), itemCounts(len(wishlist), wishlistAvailability, wishlistErr))
 	return nil
@@ -517,20 +564,14 @@ func (s *Service) saveWishlist(ctx context.Context, userID uuid.UUID, items []st
 			ON CONFLICT (user_id,game_id) DO UPDATE SET priority=EXCLUDED.priority,last_successful_fetch_at=EXCLUDED.last_successful_fetch_at`, userID, gameID, item.Priority, now); err != nil {
 			return err
 		}
-		released, err := knownReleased(ctx, tx, gameID)
-		if err != nil {
-			return err
-		}
-		if !released {
-			if _, err := tx.Exec(ctx, `INSERT INTO catalog_entries(game_id,origin,added_at) VALUES($1,'wishlist',$2) ON CONFLICT (game_id) DO UPDATE SET origin=CASE WHEN catalog_entries.origin='seed' THEN 'seed' ELSE 'wishlist' END`, gameID, now); err != nil {
-				return err
-			}
-		}
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM wishlist_entries w USING games g WHERE w.game_id=g.id AND w.user_id=$1 AND NOT (g.steam_app_id=ANY($2::bigint[]))`, userID, appIDs); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM catalog_entries ce USING games g WHERE ce.game_id=g.id AND ce.origin='wishlist' AND NOT (g.steam_app_id=ANY($1::bigint[]))`, appIDs); err != nil {
+	if err := s.store.Queries.WithTx(tx).UpsertUserSourceState(ctx, dbgen.UpsertUserSourceStateParams{
+		UserID: uuidPG(userID), Source: "wishlist", ResourceKey: "", Availability: string(steam.Available),
+		LastAttemptAt: timestamptz(now), LastSuccessfulFetchAt: timestamptz(now),
+	}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -538,21 +579,6 @@ func (s *Service) saveWishlist(ctx context.Context, userID uuid.UUID, items []st
 
 type dbtx interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
-}
-
-func knownReleased(ctx context.Context, tx dbtx, gameID uuid.UUID) (bool, error) {
-	var snapshot []byte
-	if err := tx.QueryRow(ctx, `SELECT source_snapshot FROM games WHERE id=$1`, gameID).Scan(&snapshot); err != nil {
-		return false, err
-	}
-	if len(snapshot) == 0 {
-		return false, nil
-	}
-	var details steam.GameDetails
-	if err := json.Unmarshal(snapshot, &details); err != nil || details.AppID == 0 {
-		return false, nil
-	}
-	return !details.ReleaseDate.ComingSoon, nil
 }
 
 func upsertDiscoveredGame(ctx context.Context, tx dbtx, appID int64, name, source string, now time.Time) (uuid.UUID, error) {
@@ -606,12 +632,15 @@ func (s *Service) syncAchievements(ctx context.Context, userID uuid.UUID) error 
 	for _, row := range rows {
 		games = append(games, UserGame{AppID: row.SteamAppID, Name: row.Name, PlaytimeMinutes: row.PlaytimeMinutes, RecentMinutes: row.RecentlyPlayedMinutes, LastPlayedAt: row.LastPlayedAt.Time})
 	}
-	targets := SelectAchievementTargets(games, AchievementTargetLimit)
+	targets := SelectAchievementTargets(games, s.now().UTC().AddDate(-1, 0, 0))
 	counts.total = len(targets)
 	availabilityOutcome := steam.Available
 	diagnostic := steamDiagnostic{}
-	for _, appID := range targets {
-		summary, state, sourceErr := s.client.Achievements(ctx, account.SteamID, appID)
+	results := fetchAchievementResults(ctx, targets, achievementFetchConcurrency, func(ctx context.Context, appID int64) (steam.AchievementSummary, steam.Availability, error) {
+		return s.client.Achievements(ctx, account.SteamID, appID)
+	})
+	for index, appID := range targets {
+		summary, state, sourceErr := results[index].summary, results[index].state, results[index].err
 		if err := s.recordState(ctx, userID, "achievements", strconv.FormatInt(appID, 10), state, sourceErr); err != nil {
 			counts.failed++
 			finish(string(steam.RequestFailed), steamDiagnostic{reason: observability.ReasonPersistenceFailed}, counts)
@@ -813,7 +842,10 @@ func (s *Service) GetStatus(ctx context.Context, userID, jobID uuid.UUID) (Statu
 		return Status{}, err
 	}
 	catalogRows, catalogErr := s.store.Pool.Query(ctx, `SELECT g.steam_app_id,cfs.availability,cfs.last_successful_fetch_at,cfs.error
-		FROM catalog_fetch_states cfs JOIN games g ON g.id=cfs.game_id JOIN catalog_entries ce ON ce.game_id=g.id ORDER BY g.steam_app_id`)
+		FROM catalog_fetch_states cfs JOIN games g ON g.id=cfs.game_id
+		WHERE EXISTS(SELECT 1 FROM catalog_entries ce WHERE ce.game_id=g.id)
+		OR EXISTS(SELECT 1 FROM wishlist_entries w WHERE w.game_id=g.id AND w.user_id=$1)
+		ORDER BY g.steam_app_id`, userID)
 	if catalogErr != nil {
 		return Status{}, fmt.Errorf("load catalog source states: %w", catalogErr)
 	}

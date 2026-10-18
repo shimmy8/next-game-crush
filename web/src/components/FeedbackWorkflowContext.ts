@@ -1,0 +1,45 @@
+import { createContext, useContext } from 'react'
+import type { FeedbackAction } from '../api/types'
+import type { PublicFeedbackWorkflowState } from './feedbackWorkflowMachine'
+
+export type FeedbackSubmitIntent = {
+  gameId: string
+  recommendationId: string
+  rankingVersion: number
+  gameName: string
+  action: FeedbackAction
+  reasons?: string[]
+  freeText?: string
+}
+
+export type FeedbackWorkflowContextValue = {
+  stateFor(gameId: string): PublicFeedbackWorkflowState
+  submit(input: FeedbackSubmitIntent): Promise<void>
+  retry(gameId: string): void
+  isBusy(gameId: string): boolean
+  isTombstoned(gameId: string): boolean
+}
+
+const idle: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, diff: null, error: '', canRetry: false, busy: false, tombstoned: false }
+const legacyConsumerFallback: FeedbackWorkflowContextValue = { stateFor: () => idle, submit: async () => undefined, retry: () => undefined, isBusy: () => false, isTombstoned: () => false }
+export const FeedbackWorkflowContext = createContext<FeedbackWorkflowContextValue | undefined>(undefined)
+
+export function useFeedbackWorkflows(): FeedbackWorkflowContextValue {
+  const value = useContext(FeedbackWorkflowContext)
+  if (!value) throw new Error('FeedbackWorkflowProvider is required')
+  return value
+}
+
+export function useGameFeedback(gameId: string): PublicFeedbackWorkflowState & {
+  submit(input: Omit<FeedbackSubmitIntent, 'gameId'>): Promise<void>
+  retry(): void
+} {
+  // Task 6 migrates every product consumer under the page provider. Keep this
+  // helper compatible until then while direct context access fails closed.
+  const workflows = useContext(FeedbackWorkflowContext) ?? legacyConsumerFallback
+  return {
+    ...workflows.stateFor(gameId),
+    submit: (input: Omit<FeedbackSubmitIntent, 'gameId'>) => workflows.submit({ ...input, gameId }),
+    retry: () => workflows.retry(gameId),
+  }
+}

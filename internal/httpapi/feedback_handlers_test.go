@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -60,6 +61,55 @@ func TestFeedbackHandlerReturnsAcceptedWorkflowMetadata(t *testing.T) {
 	}
 	if got != service.accepted || service.command.UserID != session.UserID || service.command.RecommendationID != recommendationID || service.command.Reason != "difficulty" {
 		t.Fatalf("got=%#v command=%#v", got, service.command)
+	}
+}
+
+func TestFeedbackHandlerAcceptsMultipleReasonsAndRejectsMixedLegacyShape(t *testing.T) {
+	authService, sessions := handlerService(t, "http://localhost:8080")
+	session := sessions.addSession()
+	recommendationID := uuid.New()
+	service := &fakeFeedbackService{accepted: feedback.Accepted{EventID: uuid.New(), RebuildJobID: uuid.New(), PreviousRankingVersion: 4}}
+	router := NewRouter(Dependencies{Auth: authService, Feedback: service})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/recommendations/"+recommendationID.String()+"/feedback", bytes.NewBufferString(`{"action":"like","reasons":["setting","genre"],"idempotencyKey":"multi"}`))
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	req.Header.Set("X-CSRF-Token", session.CSRFToken)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	if response.Code != http.StatusAccepted || !reflect.DeepEqual(service.command.Reasons, []string{"setting", "genre"}) {
+		t.Fatalf("status=%d reasons=%v body=%s", response.Code, service.command.Reasons, response.Body.String())
+	}
+
+	mixed := httptest.NewRequest(http.MethodPost, "/api/recommendations/"+recommendationID.String()+"/feedback", bytes.NewBufferString(`{"action":"like","reason":"genre","reasons":["setting"],"idempotencyKey":"mixed"}`))
+	mixed.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	mixed.Header.Set("X-CSRF-Token", session.CSRFToken)
+	denied := httptest.NewRecorder()
+	router.ServeHTTP(denied, mixed)
+	if denied.Code != http.StatusBadRequest {
+		t.Fatalf("mixed shape status=%d body=%s", denied.Code, denied.Body.String())
+	}
+	for index, body := range []string{
+		`{"action":"like","reason":null,"reasons":["genre"],"idempotencyKey":"mixed-null-reason"}`,
+		`{"action":"like","reason":"genre","reasons":null,"idempotencyKey":"mixed-null-reasons"}`,
+		`{"action":"like","reason":null,"reasons":null,"idempotencyKey":"mixed-both-null"}`,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/api/recommendations/"+recommendationID.String()+"/feedback", bytes.NewBufferString(body))
+		request.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+		request.Header.Set("X-CSRF-Token", session.CSRFToken)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("mixed null permutation %d status=%d body=%s", index, response.Code, response.Body.String())
+		}
+	}
+
+	empty := httptest.NewRequest(http.MethodPost, "/api/recommendations/"+recommendationID.String()+"/feedback", bytes.NewBufferString(`{"action":"like","reason":" ","idempotencyKey":"empty"}`))
+	empty.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	empty.Header.Set("X-CSRF-Token", session.CSRFToken)
+	emptyResponse := httptest.NewRecorder()
+	router.ServeHTTP(emptyResponse, empty)
+	if emptyResponse.Code != http.StatusBadRequest {
+		t.Fatalf("empty legacy reason status=%d body=%s", emptyResponse.Code, emptyResponse.Body.String())
 	}
 }
 

@@ -72,6 +72,43 @@ func (q *Queries) GetProfileSummaryByHash(ctx context.Context, arg GetProfileSum
 	return summary, err
 }
 
+const lockGameEnrichmentEvidence = `-- name: LockGameEnrichmentEvidence :one
+SELECT name,source_snapshot FROM games WHERE id=$1 FOR SHARE
+`
+
+type LockGameEnrichmentEvidenceRow struct {
+	Name           string `json:"name"`
+	SourceSnapshot []byte `json:"source_snapshot"`
+}
+
+func (q *Queries) LockGameEnrichmentEvidence(ctx context.Context, id pgtype.UUID) (LockGameEnrichmentEvidenceRow, error) {
+	row := q.db.QueryRow(ctx, lockGameEnrichmentEvidence, id)
+	var i LockGameEnrichmentEvidenceRow
+	err := row.Scan(&i.Name, &i.SourceSnapshot)
+	return i, err
+}
+
+const lockGameEnrichmentFeatures = `-- name: LockGameEnrichmentFeatures :one
+SELECT features,input_content_hash FROM game_features WHERE game_id=$1 AND model=$2 FOR UPDATE
+`
+
+type LockGameEnrichmentFeaturesParams struct {
+	GameID pgtype.UUID `json:"game_id"`
+	Model  string      `json:"model"`
+}
+
+type LockGameEnrichmentFeaturesRow struct {
+	Features         []byte `json:"features"`
+	InputContentHash string `json:"input_content_hash"`
+}
+
+func (q *Queries) LockGameEnrichmentFeatures(ctx context.Context, arg LockGameEnrichmentFeaturesParams) (LockGameEnrichmentFeaturesRow, error) {
+	row := q.db.QueryRow(ctx, lockGameEnrichmentFeatures, arg.GameID, arg.Model)
+	var i LockGameEnrichmentFeaturesRow
+	err := row.Scan(&i.Features, &i.InputContentHash)
+	return i, err
+}
+
 const updateProfileSummary = `-- name: UpdateProfileSummary :execrows
 UPDATE preference_profiles
 SET summary = $2, model = $3, input_content_hash = $4

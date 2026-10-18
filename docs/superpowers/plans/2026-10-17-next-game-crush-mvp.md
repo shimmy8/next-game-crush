@@ -299,14 +299,14 @@ git commit -m "feat: add typed Steam API adapters"
 - Consumes: Task 4 `steam.Client` and Task 2 repositories/queue.
 - Produces: `sync.Service.Start(ctx, userID uuid.UUID) (jobID uuid.UUID, error)`.
 - Produces: `sync.Service.Run(ctx, userID uuid.UUID) error`.
-- Produces: `sync.SelectAchievementTargets(games []sync.UserGame, limit int) []int64` with `limit=30`.
+- Produces: `sync.SelectAchievementTargets(games []sync.UserGame, cutoff time.Time) []int64`.
 - Produces: `catalog.ParseReleaseDate(raw string, now time.Time) catalog.ReleaseWindow`.
 - Produces: `POST /api/sync` and `GET /api/sync/{id}`.
 - Produces: registered job handlers for `steam.sync`, `catalog.refresh`, and `achievements.sync`, with versioned payload schemas and parent-workflow completion only after required child stages finish.
 
 - [x] **Step 1: Write failing date and achievement-selection tests**
 
-Assert exact dates, localized month/year, quarter, year, `Coming Soon`, and malformed text map to the correct precision without a fabricated day. Assert target selection is capped at 30 and orders games by recency, playtime, then stable AppID.
+Assert exact dates, localized month/year, quarter, year, `Coming Soon`, and malformed text map to the correct precision without a fabricated day. Assert target selection includes every game played on or after the one-year cutoff and orders games by recency, playtime, then stable AppID.
 
 - [x] **Step 2: Write failing synchronization tests**
 

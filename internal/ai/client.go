@@ -11,9 +11,9 @@ type Client interface {
 	Embed(context.Context, []string) ([][]float32, error)
 }
 
-// DeterministicExplanation is the no-network fallback used when OpenAI is
-// disabled or unavailable. Callers can render it without pretending it is a
-// model-generated explanation.
+// DeterministicExplanation is the legacy generic no-network fallback used by
+// AI callers. Recommendation copy is owned by recommendations evidence and
+// must not derive user-facing claims from this helper.
 func DeterministicExplanation(factors []string) Explanation {
 	publicFactors := append([]string(nil), factors...)
 	if len(publicFactors) > 3 {
