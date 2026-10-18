@@ -10,21 +10,30 @@ permissions: {}
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Verify deployment contracts
+      - name: Check deployment script syntax
         shell: bash
         run: |
           set -Eeuo pipefail
           bash -n deploy/deploy.sh deploy/tests/*.sh
-          for test_script in deploy/tests/*_test.sh; do
-            bash "$test_script"
-          done
+
+      - name: Verify production Compose contract
+        run: bash deploy/tests/compose_test.sh
+
+      - name: Verify guarded deployment contract
+        run: bash deploy/tests/deploy_test.sh
+
+      - name: Verify deployment documentation contract
+        run: bash deploy/tests/docs_test.sh
+
+      - name: Verify workflow contract
+        run: bash deploy/tests/workflow_test.sh
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
@@ -53,7 +62,7 @@ jobs:
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -87,7 +96,7 @@ jobs:
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read

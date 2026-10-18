@@ -230,8 +230,12 @@ assert_text_contains "$verify_job" '\[\[ -x /usr/bin/google-chrome \]\]' 'system
 assert_text_contains "$verify_job" 'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome' 'system Chrome fallback path is incorrect'
 assert_text_contains "$verify_job" 'GOWORK=off make verify' 'verify must run make verify with GOWORK disabled'
 assert_text_contains "$verify_job" 'bash -n deploy/deploy\.sh deploy/tests/\*\.sh' 'verify must syntax-check deployment scripts'
-assert_text_contains "$verify_job" 'for test_script in deploy/tests/\*_test\.sh' 'verify must discover deployment contract tests'
-assert_text_contains "$verify_job" 'bash "\$test_script"' 'verify must run every deployment contract test'
+for test_script in compose deploy docs workflow; do
+  assert_text_contains "$verify_job" "bash deploy/tests/${test_script}_test\\.sh" \
+    "verify must run ${test_script}_test.sh in its own diagnosable step"
+done
+[[ "$(grep -Ec '^    runs-on: ubuntu-24\.04$' "$workflow")" -eq 3 ]] ||
+  fail 'every job must use the pinned Ubuntu 24.04 runner image'
 
 assert_text_contains "$publish_job" '^          push: true$' 'container image publication must be enabled'
 assert_text_contains "$publish_job" '^          cache-from: type=gha$' 'BuildKit cache restore is missing'
