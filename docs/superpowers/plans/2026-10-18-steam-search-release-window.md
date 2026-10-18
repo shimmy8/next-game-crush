@@ -1,0 +1,281 @@
+# Steam Search Release-Window Catalog Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Replace full-App-List-first discovery with a restart-safe Steam Search catalog for the inclusive UTC `today - 30 days ... today + 30 days` window, admit released games only through the agreed review gate, and expose review summaries without changing deterministic recommendation scoring.
+
+**Architecture:** Keep one Go binary and one PostgreSQL queue, but separate durable `interactive` and `catalog` lanes and run two workers in the same process. An embedded cron scheduler enqueues versioned logical runs; feed pages publish fenced observations and authoritative membership, per-AppID reservations gate `appdetails`, TTL and budgets, and the existing content identity gates OpenAI work. A shared current-eligibility predicate protects every read/digest path while additive review data flows through Go and TypeScript contracts.
+
+**Tech Stack:** Go 1.27.2 (`GOWORK=off`), PostgreSQL 16 with pgvector, pgx/v5, goose migrations, sqlc v1.31.1, `robfig/cron/v3`, `goquery`, React/TypeScript, pnpm 11, Vitest, Playwright.
+
+**Spec:** `docs/superpowers/specs/2026-10-18-steam-search-release-window-design.md`; compatible guarantees remain in `docs/superpowers/specs/2026-10-18-steam-catalog-discovery-design.md`, `docs/superpowers/specs/2026-10-18-discovery-wishlist-presentation-design.md`, and `docs/superpowers/specs/2026-10-17-next-game-crush-mvp-design.md`.
+
+## Global Constraints
+
+- Exact eligibility uses UTC calendar dates and is inclusive: released `today-30 <= date <= today` with `coming_soon=false`; upcoming `today <= date <= today+30` with `coming_soon=true`. The scheduler timezone changes only the start instant.
+- Defaults are exactly: `CATALOG_REFRESH_CRON="0 3 * * *"`, `CATALOG_REFRESH_TIMEZONE="Europe/Moscow"`, lookback `30`, horizon `30`, Store budget `1000/hour`, catalog AI budget `100/hour`, catalog concurrency `4`, search page size `100`, maximum `100` pages/feed/run, maximum `20000` new AppIDs/run, reconciliation `"0 4 * * 0"`.
+- Popular Upcoming, Popular New, Recent, and Coming Soon use fixed `l=english`, `cc=us`, game results, no cookies, and ignored account preferences where supported. Raw HTML/upstream bodies are never persisted or logged.
+- Popular feeds become authoritative only at natural end. `recent`/`comingsoon` may stop at a window boundary only after monotonic ordering is validated across all committed pages. A cap, parser failure, transport failure, or early stop makes the feed partial and cannot revoke membership.
+- Released `mixed_or_below` is always inactive. Explicitly `unrated` released games require an exact date no more than seven UTC days old and current authoritative Popular New membership. Unknown/malformed reviews never become unrated and never erase last-known-good review data.
+- Month/quarter intervals may intersect the applicable window without inventing a day. Year/Coming Soon/unknown require current Popular Upcoming or wishlist provenance. Wishlist/popularity/reviews never add ranking weight.
+- PostgreSQL is the only persistent service. Scheduling, budgets, run revisions, observation ordinals, reservations, retries, debounce state, and adaptive throttle state survive restart and competing app instances.
+- Queue attempts retry at most three times after the initial attempt. Valid `Retry-After` is capped at 24 hours; fallback delays are one minute, five minutes, and 30 minutes with bounded jitter. Watchdog generations use 1, 2, 4, 8, 16, then 24 hours.
+- Store TTLs are 24 hours within exact `±3` days, 72 hours for other exact/month/quarter window candidates, seven days for year/Coming Soon/unknown Popular Upcoming or wishlist candidates, and 30 days for unchanged stable rejection tombstones. Material fingerprints wake tombstones immediately.
+- Preserve seed fallback, prior discovery/history, last successful Store/review/AI state, deletion fencing, atomic ranking publication, authentication/CSRF/signed-action protections, and SMTP `ambiguous` behavior. Discovery remains disabled by default for rollout.
+- Use migration `db/migrations/00017_steam_search_release_window.sql`; never rewrite applied migrations and never edit `internal/store/sqlc/` by hand. Change `db/queries/`/`sqlc.yaml`, run `make sqlc`, and commit generated bindings.
+- Test-only auth and Steam/OpenAI URL overrides remain fail-closed behind `TEST_HARNESS_MODE=1`. Do not read `.env`, expose identifiers/secrets/payloads, or modify `docs/steam-release-recommender-idea.md`.
+- Before shared changes run `codegraph impact <symbol> -p .`; after source changes run `codegraph sync .`, then `codegraph affected <changed-files...> -p .` to supplement, not replace, the commands below.
+- The worktree already contains unrelated edits in AI, feedback workflow, recommendation UI, dashboard, styles, and E2E files. Re-read and preserve those edits; each checkpoint stages only the files named by its task.
+
+## Review Focus
+
+- A stale retry completing after a newer run must not restore old review/membership or increment omission counters; pin with `TestOlderSearchRunCannotOverwritePublishedState` in Task 7.
+- A malformed or capped popular feed must not grant Popular-only TBA/unrated eligibility or revoke the last complete membership; pin with `TestPartialPopularFeedIsNeverAuthoritative` in Task 7.
+- Concurrent cron/manual/user-sync observations of one AppID must spend one Store reservation and unchanged review-count updates must spend no Store/AI work; pin with `TestCandidateReservationDeduplicatesEveryIngress` in Task 8.
+- A published game that crosses the release-window or unrated day-eight boundary while discovery is disabled must disappear from overview, calendar, detail, test digest, and scheduled digest; pin with `TestCurrentEligibilityProtectsEveryDeliveryPath` in Task 10.
+- A catalog backlog and four catalog workers must never claim or starve interactive work, and both workers must terminate coherently on fatal failure; pin with `TestCatalogBacklogCannotConsumeInteractiveCapacity` in Task 3 and `TestAppStopsWhenEitherWorkerFails` in Task 13.
+
+---
+
+## Evidence, decisions, and execution gates
+
+Read `AGENTS.md`, `README.md`, the approved spec, and this plan before implementation. Planning observed an up-to-date CodeGraph index with the current discovery entry points in `internal/catalog`, Store transport in `internal/steam`, queue claims in `internal/jobs`, and recommendation reads in `internal/recommendations`/`internal/notifications`. The path is one coherent plan because schema and lane primitives are prerequisites for scheduler/feed workflows, which in turn produce the eligibility/read model consumed by API/UI and final rollout; splitting those would create intermediate plans that cannot ship safely on their own.
+
+Start the disposable database once for integration tasks and verify its identity without reading application secrets:
+
+```bash
+make wait-test-db
+docker compose exec -T test-db pg_isready -U next_game_crush_test -d next_game_crush_test
+export TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127.0.0.1:55432/next_game_crush_test?sslmode=disable'
+```
+
+Every integration helper must reject databases other than `next_game_crush_test` or the explicit `next_game_crush_e2e` harness and use a unique schema. A skipped named database test is not a pass. Fixed policy clock in tests is `2026-10-18T12:00:00Z`.
+
+## Stable boundaries and file ownership
+
+| Files | Responsibility |
+| --- | --- |
+| `internal/catalog/schedule.go`, `internal/config/config.go` | Parse/validate cron, timezone, windows, budgets, limits, and phased compatibility settings. |
+| `internal/jobs/queue.go`, `worker.go`, `db/queries/jobs.sql` | Validated lane on enqueue/lease and lane-bound worker claim. |
+| `internal/steam/search.go`, `search_types.go`, `testdata/search_*` | Bounded non-personal Store Search request, envelope/HTML parsing, review normalization, and cursor safety. |
+| `internal/catalog/search_types.go`, `search_repository.go`, `search_scheduler.go`, `search_scan.go` | Logical runs, revisions, feed pages, authority publication, occurrence retries, and worklist priority. |
+| `internal/catalog/eligibility.go`, `qualification.go`, `metadata_refresh.go` | Pure UTC date/review policy, Store reservation/TTL/budget, canonical qualification, tombstones, and AI gating. |
+| `db/migrations/00017_steam_search_release_window.sql`, `db/queries/catalog_search.sql` | Additive durable search/review/budget/read-model schema and generated accessors. |
+| `internal/recommendations/*`, `internal/notifications/repository.go` | Shared current-eligibility gate, released lookback retrieval, review projection, and unchanged score semantics. |
+| `internal/catalog/rebuild.go` | Eligibility-change dirty revision, ten-minute debounce, hourly cap, and due clock wakeups. |
+| `internal/httpapi/*`, `web/src/api/types.ts`, recommendation/calendar components | Additive review contract and deterministic localized display. |
+| `internal/app/app.go`, `cmd/next-game-crush/*`, Compose/docs/E2E | Two workers, scheduler lifecycle, enqueue-only manual command, diagnostics, rollout, and end-to-end proof. |
+
+The implementation introduces these shared types; later tasks consume the names exactly:
+
+```go
+// internal/jobs/queue.go
+type Lane string
+const (LaneInteractive Lane = "interactive"; LaneCatalog Lane = "catalog")
+type Spec struct { /* existing fields */ Lane Lane }
+type Lease struct { /* existing fields */ Lane Lane }
+func (q *Queue) Claim(ctx context.Context, lane Lane, workerID string, lease time.Duration) (*Lease, error)
+
+// internal/steam/search_types.go
+type SearchFeed string
+const (FeedPopularUpcoming SearchFeed = "popular_upcoming"; FeedPopularNew SearchFeed = "popular_new"; FeedRecent SearchFeed = "recent"; FeedComingSoon SearchFeed = "coming_soon")
+type ReviewBand string
+const (ReviewPositive ReviewBand = "positive"; ReviewMixedOrBelow ReviewBand = "mixed_or_below"; ReviewUnrated ReviewBand = "unrated"; ReviewUnknown ReviewBand = "unknown")
+type ReviewSummary struct { Band ReviewBand; Label string; PositivePercent *int; Total int64 }
+type SearchRequest struct { Feed SearchFeed; Start, Count int }
+type SearchObservation struct { AppID int64; Name, ReleaseText string; Position int; Review ReviewSummary; Fingerprint string }
+type SearchPage struct { Items []SearchObservation; Start, Count, Total int; HasMore bool }
+type SearchCatalog interface { Search(context.Context, SearchRequest) (SearchPage, error) }
+
+// internal/catalog/search_types.go
+type RunKind string // scheduled|manual|initial|reconciliation
+type RunRef struct { ID uuid.UUID; Revision int64; Generation int; Kind RunKind; OccurredAt time.Time }
+type CandidateRevision struct { RunRevision, ObservationOrdinal int64 }
+type CurrentEligibilityReader interface { Eligible(context.Context, uuid.UUID, time.Time) (bool, error) }
+```
+
+### Task 1: Replace hourly discovery configuration with validated schedules and independent limits
+
+**Files:** Modify `go.mod`, `go.sum`, `internal/catalog/discovery_types.go`, `internal/config/config.go`, `internal/config/discovery_test.go`, `.env.example`, `docker-compose.yml`; Create `internal/catalog/schedule.go`, `internal/catalog/schedule_test.go`.
+
+**Interfaces:** Produce `ParseSchedule(expression, timezone string) (*time.Location, cron.Schedule, error)` and exact `DiscoveryConfig` fields `LookbackDays`, `HorizonDays`, `AppDetailsHourlyBudget`, `AIHourlyBudget`, `WorkerConcurrency`, `SearchPageSize`, `SearchMaxPagesPerFeed`, `SearchMaxNewAppsPerRun`, `RefreshCron`, `RefreshTimezone`, `ReconciliationCron`. Keep `Enabled`; accept old hourly variables only during this task's explicit transition test, but new values win.
+
+- [ ] **Step 1: Add failing schedule/config tests.** Add `TestParseScheduleUsesConfiguredTimezone`, `TestDiscoveryConfigNewDefaults`, `TestDiscoveryConfigRejectsInvalidCronTimezoneAndBounds`, and `TestNewDiscoverySettingsOverrideLegacyTransition`. Assert the defaults and all bounds: days `1..366`, budgets `1..100000`, concurrency `1..16`, page size `1..200`, pages `1..1000`, new AppIDs `1..100000`; assert error text names settings but never values.
+- [ ] **Step 2: Run red.** Run `GOWORK=off go test -race ./internal/catalog ./internal/config -run 'TestParseSchedule|TestDiscoveryConfig(New|Rejects)|TestNewDiscoverySettings' -count=1 -v`. Expected: missing fields/parser and old defaults.
+- [ ] **Step 3: Add cron dependency and implement validation.** Run `GOWORK=off go get github.com/robfig/cron/v3@v3.0.1`. Use standard five-field cron parsing; load the IANA location and calculate schedules in that location. Update `.env.example` and Compose with the exact spec defaults while leaving discovery disabled.
+- [ ] **Step 4: Run green and config regressions.** Repeat Step 2, then run `GOWORK=off go test -race ./internal/config ./internal/catalog -count=1` and `docker compose config --quiet`. Expected: zero failures.
+- [ ] **Step 5: Commit.** Stage only the files above and commit `feat: configure scheduled release-window discovery`.
+
+### Task 2: Add additive search, review, lane, budget, and retry persistence
+
+**Files:** Create `db/migrations/00017_steam_search_release_window.sql`, `db/queries/catalog_search.sql`, `internal/store/search_catalog_migration_test.go`; Modify `db/queries/jobs.sql`, `db/queries/catalog_discovery.sql`, `internal/store/migration_upgrade_test.go`; Generate `internal/store/sqlc/*.sql.go`, `internal/store/sqlc/models.go` with `make sqlc`.
+
+**Interfaces:** Migration from version 16 preserves every existing row and adds: `sync_jobs.lane`; logical `catalog_search_runs` with unique `(schedule_name,occurrence_at)`, strict increasing `run_revision`, retry generation/time/status; `catalog_search_feeds`; append-only page/observation rows; authoritative per-feed membership projection with `published_run_revision` and ordinary omission count; per-AppID current ingestion/review state with candidate revision, fingerprint, TTL, tombstone/retry fields; Store/AI budget reservations; shared adaptive host throttle; AppID Store reservation; due eligibility time; and additions to existing catalog rebuild state. Review label max 64 chars, release text 512, fingerprint/hash 128, safe reasons allowlisted exactly from the spec.
+
+- [ ] **Step 1: Write `TestSteamSearchMigrationPreservesVersion16State`.** Upgrade an isolated schema to 16, seed a catalog source, discovery observation, published recommendation, active/dead jobs, reviewless game, and rebuild row, then upgrade. Assert all counts/versions stay unchanged, old jobs backfill `lane='interactive'`, new revision allocation is monotonic, duplicate occurrence/page/worklist/reservation identities fail or upsert idempotently as designed, invalid lane/feed/status/review/percent/count/reason/ordinal is rejected, and the down migration refuses destructive rollback after observations exist.
+- [ ] **Step 2: Run red.** Run `GOWORK=off go test -race ./internal/store -run '^TestSteamSearchMigrationPreservesVersion16State$' -count=1 -v`. Expected: migration 17 relations absent.
+- [ ] **Step 3: Implement migration and named SQL queries.** Add typed queries `CreateOrGetSearchRun`, `AllocateObservationOrdinal`, `CommitSearchPage`, `PublishFeedMembership`, `UpsertCurrentSearchObservation`, `ReserveCatalogBudget`, `AcquireStoreReservation`, `ReleaseStoreReservation`, `ListDueEligibilityChanges`, and lane-aware `ClaimJob`. All compare-and-set updates require the incoming `(run_revision,observation_ordinal)` to be greater.
+- [ ] **Step 4: Generate, check, and test.** Run `make sqlc`; never hand-edit generated output. Repeat Step 2 and run `GOWORK=off go test -race ./internal/store -count=1`. Expected: named test executes and zero failures.
+- [ ] **Step 5: Commit.** Stage the migration, query sources, migration tests, and generated files; commit `feat: persist fenced search catalog state`.
+
+### Task 3: Isolate interactive and catalog queue lanes
+
+**Files:** Modify `internal/jobs/queue.go`, `internal/jobs/worker.go`, `internal/jobs/queue_test.go`, `internal/jobs/worker_test.go`, all `jobs.Spec` construction sites under `internal/`; Test `internal/sync/service_test.go`, `internal/catalog/discovery_scan_test.go`.
+
+**Interfaces:** `jobs.Spec.Lane` is required for roots and inherited by children unless explicitly equal; `EnqueueInTx` rejects unknown lanes and cross-lane child injection. `jobs.NewWorker(queue, lane, workerID, options...)` and the changed `workerQueue.Claim(context.Context,Lane,string,time.Duration)` bind a worker to one lane. Existing user-visible jobs are explicitly `LaneInteractive`; every catalog discovery/search/qualification/AI root is `LaneCatalog`; the catalog dirty-rebuild coordinator deliberately enqueues the existing interactive rebuild as a detached root (`ParentJobID==uuid.Nil`), never as a cross-lane child.
+
+- [ ] **Step 1: Write failing lane tests.** Add `TestLaneClaimCannotCross`, `TestChildSafelyInheritsLane`, `TestCrossLaneChildRequiresCatalogRebuildBridge`, and `TestCatalogBacklogCannotConsumeInteractiveCapacity`. Enqueue 100 catalog jobs and one interactive sync; four catalog claimers never receive sync, the interactive claimer receives it immediately, and invalid lane values/cross-lane ordinary children fail before SQL.
+- [ ] **Step 2: Run red.** Run `GOWORK=off go test -race ./internal/jobs -run 'TestLane|TestChildSafely|TestCrossLane|TestCatalogBacklog' -count=1 -v`. Expected: current claim ignores lane.
+- [ ] **Step 3: Implement lane APIs and migrate every call site.** Update lease scan/diagnostics with no payload logging. Preserve priority order inside a lane and all current fencing/parent/optional-child semantics. Allow a catalog transaction to enqueue an interactive detached root through existing `jobs.EnqueueInTx` only when `ParentJobID==uuid.Nil`; the rebuild caller must set `spec.Kind==recommendations.RebuildJobKind` and a non-nil `UserID`.
+- [ ] **Step 4: Run focused race suites.** Repeat Step 2; run `GOWORK=off go test -race ./internal/jobs ./internal/sync ./internal/catalog ./internal/ai ./internal/profile ./internal/recommendations ./internal/feedback ./internal/preferences ./internal/notifications -count=1`. Expected: zero failures.
+- [ ] **Step 5: Commit.** Stage only queue/query/generated files and explicit lane call sites; commit `feat: isolate interactive and catalog job lanes`.
+
+### Task 4: Implement the bounded Steam Store Search adapter
+
+**Files:** Create `internal/steam/search_types.go`, `internal/steam/search.go`, `internal/steam/search_test.go`, `internal/steam/testdata/search_popular_upcoming_page.json`, `search_popular_new_page.json`, `search_recent_page.json`, `search_comingsoon_page.json`, `search_malformed_review.json`, `search_layout_changed.json`; Modify `internal/steam/client.go`, `internal/steam/http_client.go`, `internal/steam/http_client_test.go`, `go.mod`, `go.sum`.
+
+**Interfaces:** Implement the `steam.SearchCatalog` contract from Stable boundaries on `*steam.HTTPClient`. Map feeds to Store filters `popularcomingsoon`, `popularnew`, `recent`, `comingsoon`; ordinary feeds add their required release sort. Export `NormalizeReview(label string, percent *int, total *int) ReviewSummary` and treat inconsistent/unrecognized data as `ReviewUnknown`.
+
+- [ ] **Step 1: Add fixture-driven failing tests.** Cover all four feed mappings, `l=english`, `cc=us`, `category1=998`, `ignore_preferences=1`, no Cookie header, bounded `start/count`, JSON envelope plus HTML extraction, AppID/name/release/position, every positive/negative summary, explicit zero reviews, missing/malformed review, duplicates, total/has-more, non-progressing pagination, content type, 2 MiB response cap, redirect host rejection, and layout/envelope change as error rather than empty success.
+- [ ] **Step 2: Run red.** Run `GOWORK=off go test -race ./internal/steam -run 'TestSearch|TestNormalizeReview' -count=1 -v`. Expected: adapter/types absent.
+- [ ] **Step 3: Add parser dependency and implement.** Run `GOWORK=off go get github.com/PuerkitoBio/goquery@v1.10.3`. Parse from bounded bytes, discard markup immediately, bound extracted names/labels/text, sort/deduplicate only for validation while preserving feed position, and compute the search fingerprint from AppID, normalized name/release/phase-visible identity excluding review count/percentage.
+- [ ] **Step 4: Run green and transport regression.** Repeat Step 2; run `GOWORK=off go test -race ./internal/steam -count=1`. Expected: all transport retries/redaction/Store tests pass.
+- [ ] **Step 5: Commit.** Stage adapter, fixtures, dependency files, and tests; commit `feat: read bounded non-personal Steam search feeds`.
+
+### Task 5: Encode release-window and review eligibility as pure policy
+
+**Files:** Create `internal/catalog/eligibility.go`, `internal/catalog/eligibility_test.go`; Modify `internal/catalog/date.go`, `internal/catalog/date_test.go`, `internal/catalog/qualification.go`, `internal/catalog/qualification_test.go`, `internal/catalog/discovery_types.go`.
+
+**Interfaces:** Define `EligibilityInput {Now time.Time; Window ReleaseWindow; ComingSoon bool; Review steam.ReviewSummary; PopularUpcoming, PopularNew, Wishlisted bool}` and `EvaluateEligibility(EligibilityInput, DiscoveryConfig) EligibilityDecision`, where decision contains `Active bool`, allowlisted `Reason string`, `Phase string`, and `NextChangeAt *time.Time`. Add `ReleaseWindow.Interval() (start,end time.Time,ok bool)` for day/month/quarter/year without synthesizing an exact day.
+
+- [ ] **Step 1: Write `TestReleaseWindowEligibilityTable`.** Assert exact `today-30`, `today`, `today+30`, and one day beyond each edge; same-day phase chooses one side; month/quarter real intervals intersect; leap/month/year boundaries work in UTC; year/Coming Soon/unknown require current Popular Upcoming or wishlist; malformed stays unknown; imprecise released unrated is rejected.
+- [ ] **Step 2: Write `TestReleasedReviewGateTable`.** Assert all four positive labels admit, Mixed and every negative label hard reject regardless of wishlist/popularity, explicit zero reviews admit only Popular New through day seven and reject on day eight, unknown creates no new admission and preserves caller's prior snapshot. Assert `NextChangeAt` is midnight UTC for window/grace expiry.
+- [ ] **Step 3: Run red.** Run `GOWORK=off go test -race ./internal/catalog -run 'TestReleaseWindowEligibility|TestReleasedReviewGate' -count=1 -v`. Expected: policy APIs absent/current upcoming-only rule fails.
+- [ ] **Step 4: Implement minimal pure policy.** Keep `appdetails.release_date.coming_soon` authoritative for phase and preserve precision/raw text. Do not read ranking weights, price, search position, or AI output.
+- [ ] **Step 5: Run green.** Repeat Step 3; run `GOWORK=off go test -race ./internal/catalog -count=1`. Expected: all date/qualification regressions pass.
+- [ ] **Step 6: Commit.** Stage policy and tests; commit `feat: qualify release-window games and review bands`.
+
+### Task 6: Schedule durable occurrences and provide an enqueue-only manual command
+
+**Files:** Create `internal/catalog/search_types.go`, `internal/catalog/search_repository.go`, `internal/catalog/search_scheduler.go`, `internal/catalog/search_scheduler_test.go`, `cmd/next-game-crush/main_test.go`; Modify `cmd/next-game-crush/main.go`, `db/queries/catalog_search.sql`; generate affected sqlc bindings.
+
+**Interfaces:** `NewSearchRepository(*store.Store) *SearchRepository`; `NewSearchScheduler(repo *SearchRepository, queue *jobs.Queue, cfg DiscoveryConfig, now func() time.Time) (*SearchScheduler,error)`; `EnsureScheduled(context.Context) error`; `EnqueueManual(context.Context,time.Time) (RunRef,error)`; `EnqueueReconciliation(context.Context,time.Time) (RunRef,error)`. Root key is `catalog.search.run:v1:<schedule>:<occurrence-unix>:retry:<generation>`; run revision belongs to the logical row and never changes across generations. Change the command seam to `run(args []string) error` and add `enqueueCatalogRefresh(config.Config) error`; `next-game-crush catalog refresh` constructs normal dependencies, validates config, enqueues manual work, closes the store, and exits without running workers/HTTP/search.
+
+- [ ] **Step 1: Write failing scheduler tests.** Add `TestTwoSchedulersCreateOneOccurrence`, `TestStartupCreatesOneCatchupAndInitialRun`, `TestDeadOccurrenceCreatesOneFencedRetryGeneration`, `TestWeeklyReconciliationUsesSameOccurrenceRules`, and `TestCatalogRefreshCommandOnlyEnqueues`. Test a DST boundary in `Europe/Moscow` and multiple missed days; exactly one latest catch-up appears, no replay series.
+- [ ] **Step 2: Run red.** Run `GOWORK=off go test -race ./internal/catalog ./cmd/next-game-crush -run 'TestTwoSchedulers|TestStartupCreates|TestDeadOccurrence|TestWeeklyReconciliation|TestCatalogRefreshCommand' -count=1 -v`. Expected: scheduler/command absent.
+- [ ] **Step 3: Implement occurrence transactions.** The scheduler computes occurrence instants with the parsed location, stores UTC identity/config snapshot, and only enqueues. Fresh means no active/successful search run and no active search-derived membership; seed/wishlist do not suppress initial backfill. Rearm only a terminal due logical run under row lock; never mutate its dead queue row.
+- [ ] **Step 4: Generate and run green.** Run `make sqlc`, repeat Step 2, then `GOWORK=off go test -race ./internal/catalog ./cmd/next-game-crush -count=1`. Expected: zero failures and command never calls a fake Search/Store client.
+- [ ] **Step 5: Commit.** Stage scheduler/repository/query/generated/command files; commit `feat: schedule durable catalog search runs`.
+
+### Task 7: Persist restart-safe feed pages and publish authoritative fenced membership
+
+**Files:** Create `internal/catalog/search_scan.go`, `internal/catalog/search_scan_test.go`; Modify `internal/catalog/search_types.go`, `internal/catalog/search_repository.go`, `db/queries/catalog_search.sql`, `internal/catalog/discovery.go`; generate affected sqlc bindings.
+
+**Interfaces:** Job kinds `catalog.search.run` and `catalog.search.page`; `SearchRunPayload {Version int; RunID uuid.UUID; RunRevision int64; Generation int}`; `SearchPagePayload {Version int; RunID uuid.UUID; Feed steam.SearchFeed; Start int; PageGeneration int}`. Page transaction assigns observation ordinals, persists normalized rows and next cursor, deduplicates the run worklist, then completes. `PublishFeed(ctx,run,feed)` compare-and-sets membership only for complete authoritative feeds.
+
+- [ ] **Step 1: Write `TestSearchPageReplayAfterCrash`.** Crash after page commit/before job completion; replay reads the committed manifest, performs no second HTTP request, and creates no duplicate observations/worklist rows. A non-progressing cursor and parser failure cannot advance the feed.
+- [ ] **Step 2: Write required fencing/authority tests.** `TestOlderSearchRunCannotOverwritePublishedState` finishes revision 9 after revision 10 and asserts review, membership, eligibility, and omission counts remain revision 10. `TestPartialPopularFeedIsNeverAuthoritative` covers caps/failure and independently eligible rows. Add `TestPopularFeedsNeverBoundaryStop`, `TestOrdinaryFeedsStopOnlyAfterMonotonicValidation`, and `TestOrdinaryMembershipNeedsTwoCompleteOmissions` including out-of-order dates across pages.
+- [ ] **Step 3: Run red.** Run `GOWORK=off go test -race ./internal/catalog -run 'TestSearchPageReplay|TestOlderSearchRun|TestPartialPopular|TestPopularFeeds|TestOrdinaryFeeds|TestOrdinaryMembership' -count=1 -v`. Expected: new workflow absent.
+- [ ] **Step 4: Implement page/run handlers.** Process Popular Upcoming then Popular New before ordinary feeds. Commit every page before downstream candidate jobs. Natural-end complete popular publication atomically replaces membership; incomplete scans preserve prior authority. For `recent`/`comingsoon`, validate every parseable ordering key and disable early stop on any missing/regressing key. A cap sets `partial`, never `complete`.
+- [ ] **Step 5: Generate and run green.** Run `make sqlc`; repeat Step 3 and `GOWORK=off go test -race ./internal/catalog ./internal/steam -count=1`. Expected: zero failures.
+- [ ] **Step 6: Commit.** Stage search workflow/query/generated/tests; commit `feat: publish restart-safe Steam search feeds`.
+
+### Task 8: Deduplicate ingress with TTL reservations, persistent budgets, and adaptive throttling
+
+**Files:** Create `internal/catalog/metadata_refresh.go`, `internal/catalog/metadata_refresh_test.go`, `internal/catalog/budget.go`, `internal/catalog/budget_test.go`, `internal/catalog/throttle.go`, `internal/catalog/throttle_test.go`; Modify `internal/catalog/search_repository.go`, `internal/catalog/search_scan.go`, `db/queries/catalog_search.sql`, `internal/steam/http_client.go`; generate affected sqlc bindings.
+
+**Interfaces:** `ReserveMetadata(ctx context.Context, appID int64, rev CandidateRevision, fingerprint string, now time.Time) (MetadataReservation,error)` returns `Granted`, `Reason`, and `NextEligibleAt`; `ReserveBudget(ctx,kind,identity string,limit int,now time.Time) (bool,time.Time,error)` charges one unique identity per UTC hour. `HostThrottle.Before(context.Context,host string) error`, `Observe(host string,status int,retryAfter *time.Duration,err error)`, and `Limit(host string) int` share persisted slowdown across catalog workers.
+
+- [ ] **Step 1: Write `TestCandidateReservationDeduplicatesEveryIngress`.** Race scheduled/manual/reconciliation/user-sync requests for one AppID: one wins Store reservation, all provenance remains, and only one budget unit is used. Change review count/percentage only: review state updates but Store/AI/rebuild counters stay zero; a material release/fingerprint change wakes immediately.
+- [ ] **Step 2: Add TTL/budget tests.** `TestMetadataTTLByReleasePhaseAndTombstone`, `TestStoreAndAIBudgetsSurviveRestartAndCompetingInstances`, `TestTransportRetryDoesNotSpendAnotherUniqueUnit`, and `TestBudgetExhaustionDefersWithoutDeadLetter` assert the exact TTL/default budgets and future availability.
+- [ ] **Step 3: Add adaptive tests.** `TestSharedThrottleHonorsRetryAfterAndRecoversGradually` covers four workers, 429, timeout, 5xx, valid/invalid/over-24h Retry-After, and success recovery; it must not reduce interactive Steam/OpenAI capacity.
+- [ ] **Step 4: Run red.** Run `GOWORK=off go test -race ./internal/catalog ./internal/steam -run 'TestCandidateReservation|TestMetadataTTL|TestStoreAndAI|TestTransportRetry|TestBudgetExhaustion|TestSharedThrottle' -count=1 -v`. Expected: no reservation/throttle APIs.
+- [ ] **Step 5: Implement gates and defer semantics.** Due retries precede search work; search precedes reconciliation. Reservation ownership is fenced/leased and stale candidate revisions cannot enqueue. Use `jobs.Queue.DeferUntil` for budget/throttle waits without consuming a failure attempt. Prune only old, unreferenced budget/reservation history.
+- [ ] **Step 6: Generate and run green.** Run `make sqlc`; repeat Step 4 and `GOWORK=off go test -race ./internal/catalog ./internal/jobs ./internal/steam -count=1`. Expected: zero failures.
+- [ ] **Step 7: Commit.** Stage gate/query/generated/test files; commit `feat: deduplicate and throttle catalog metadata work`.
+
+### Task 9: Qualify Store metadata, persist tombstones/reviews, and gate catalog AI by semantic identity
+
+**Files:** Modify `internal/catalog/discovery.go`, `discovery_persistence.go`, `qualification.go`, `internal/ai/service.go`, `internal/ai/game_execution.go`, `internal/sync/service.go`; Create `internal/catalog/search_qualification_test.go`; Modify `db/queries/catalog_search.sql`, `db/queries/catalog.sql`; generate affected sqlc bindings.
+
+**Interfaces:** `QualificationPayload` becomes version 2 and carries AppID plus `CandidateRevision`/reservation identity rather than an App List timestamp. `DiscoveryEnrichmentPlanner.PlanGameFeatureJob(context.Context,uuid.UUID,string,int) (jobs.Spec,error)` remains; returned catalog job has `LaneCatalog`. Canonical `SemanticContentHash(steam.GameDetails)` excludes price, review, release date/phase, availability, timestamps, artwork-only changes, and other presentation state.
+
+- [ ] **Step 1: Write `TestSearchQualificationPersistsCanonicalAndReviewState`.** Search cannot publish type/phase; appdetails confirms `type=game`, release, and identity. Assert admitted upcoming/released rows, latest review summary by AppID, release precision/history, source provenance, and no Deck request during bulk qualification.
+- [ ] **Step 2: Write failure/reactivation tests.** `TestMixedTombstoneReactivatesWithoutDuplicateAI`, `TestUnknownReviewPreservesLastKnownGood`, `TestStoreFailurePreservesCanonicalSnapshot`, `TestStaleCandidateResultCannotPublish`, and `TestSemanticIdentityExcludesReviewReleaseAndPrice` assert exact exclusion reasons, 30-day stable tombstone, escalating unavailable/malformed retries, positive recovery, and model/prompt-version cache behavior.
+- [ ] **Step 3: Run red.** Run `GOWORK=off go test -race ./internal/catalog ./internal/ai ./internal/sync -run 'TestSearchQualification|TestMixedTombstone|TestUnknownReview|TestStoreFailure|TestStaleCandidate|TestSemanticIdentity' -count=1 -v`. Expected: old App-List qualification semantics fail.
+- [ ] **Step 4: Implement fenced persistence.** Fetch outside the transaction; under reservation and candidate-revision locks update canonical snapshot, release history, current review, active membership/tombstone, next refresh/change, and AI job atomically. Unknown review updates only diagnostic retry state; never erase a successful review. Store/AI terminal retries remain independent of committed page cursors. User sync enters the same reservation gate rather than directly refetching an unchanged game.
+- [ ] **Step 5: Generate and run green.** Run `make sqlc`; repeat Step 3; run `GOWORK=off go test -race ./internal/catalog ./internal/ai ./internal/sync -count=1`. Expected: last-known-good and existing enrichment suites pass.
+- [ ] **Step 6: Commit.** Stage qualification/AI/sync/query/generated/tests; commit `feat: qualify search candidates without duplicate AI work`.
+
+### Task 10: Apply one current-eligibility gate to ranking and every delivery path
+
+**Files:** Create `db/queries/catalog_eligibility.sql`, `internal/catalog/current_eligibility.go`, `internal/catalog/current_eligibility_test.go`; Modify `internal/recommendations/retrieval.go`, `internal/recommendations/service.go`, `internal/recommendations/repository_integration_test.go`, `internal/recommendations/horizon_integration_test.go`, `internal/httpapi/overview_contract_test.go`, `internal/notifications/repository.go`, `internal/notifications/repository_integration_test.go`; generate affected sqlc bindings.
+
+**Interfaces:** Generated `IsCatalogGameEligible(ctx, IsCatalogGameEligibleParams{GameID,Today}) (bool,error)` and `FilterEligibleGameIDs` are the only delivery gate. `recommendations.Service` receives `catalog.CurrentEligibilityReader` and a clock; `Latest`, `Get`, `Overview`, and calendar derive from filtered rows. `notifications.NewSQLRepository` receives the same eligibility SQL/clock and applies it to recommendation and wishlist digest selections. Candidate retrieval uses lookback and horizon while preserving owned/hidden/dislike/exclude filters and zero popularity/review score weight.
+
+- [ ] **Step 1: Write candidate/ranking tests.** Add `TestCandidatesIncludeQualifiedReleasedLookback`, boundaries for -30/+30 and imprecise phases, and `TestReviewsAndPopularityNeverChangeDeterministicScore`: identical semantic inputs with different review/popularity values yield identical factors, score, ordering, and ranking version/build key.
+- [ ] **Step 2: Write `TestCurrentEligibilityProtectsEveryDeliveryPath`.** Publish rows at day seven/in-window, advance the injected clock to day eight/out-of-window while discovery is disabled, then assert absence from legacy list, overview, calendar, detail (`pgx.ErrNoRows`/HTTP 404), test digest input, and scheduled digest input. Repeat with Mixed; confirm historical recommendation rows remain unchanged.
+- [ ] **Step 3: Run red.** Run `GOWORK=off go test -race ./internal/catalog ./internal/recommendations ./internal/httpapi ./internal/notifications -run 'TestCandidatesIncludeQualified|TestReviewsAndPopularity|TestCurrentEligibility' -count=1 -v`. Expected: released rows excluded by old horizon and stale published rows leak.
+- [ ] **Step 4: Implement shared SQL predicate and wire all reads.** Treat current active shared source/wishlist plus saved phase/review/window; source membership cannot bypass gates. Do not rewrite published recommendations at read time. Return 404 for ineligible detail and omit from digest before content-hash/delivery creation.
+- [ ] **Step 5: Generate and run green.** Run `make sqlc`; repeat Step 3; run `GOWORK=off go test -race ./internal/catalog ./internal/recommendations ./internal/httpapi ./internal/notifications -count=1`. Expected: zero failures.
+- [ ] **Step 6: Commit.** Stage eligibility/read/digest/query/generated/tests; commit `feat: gate every recommendation delivery by current eligibility`.
+
+### Task 11: Coalesce catalog changes and schedule clock-driven rebuilds
+
+**Files:** Modify `internal/catalog/rebuild.go`, `internal/catalog/rebuild_test.go`, `internal/catalog/search_repository.go`, `internal/catalog/search_scheduler.go`, `db/queries/catalog_search.sql`, `internal/recommendations/service.go`; generate affected sqlc bindings.
+
+**Interfaces:** Add `type EligibilityChange struct { GameID uuid.UUID; Kind string; NextChangeAt *time.Time }`; `MarkCandidateSetDirty(ctx context.Context, tx pgx.Tx, change EligibilityChange) error` increments dirty revision only when `Kind` is `membership`, `semantic_content`, or `review_eligibility`. `ScheduleDueRebuilds(ctx context.Context, now time.Time) error` enforces ten-minute debounce and one catalog-triggered rebuild/user/hour; wake key includes user, dirty revision, retry generation. Review label/count/percent/observed-at changes within the same eligibility band do not dirty ranking. Scheduler checks `next_eligibility_change_at` and marks due rows dirty.
+
+- [ ] **Step 1: Write `TestCatalogRebuildCoalescesEligibilityChanges`.** Concurrent changes produce one pending wakeup, no-op/review-count-only changes produce none, later dirty revision is not lost, hourly cap schedules a successor, failed rebuild preserves published version and creates a bounded distinct retry generation.
+- [ ] **Step 2: Write `TestClockDrivenEligibilitySchedulesSuccessor`.** With discovery disabled/upstream unavailable, crossing release-window/unrated expiry enqueues one interactive rebuild and clears/reschedules due state only after fenced success.
+- [ ] **Step 3: Run red.** Run `GOWORK=off go test -race ./internal/catalog ./internal/recommendations -run 'TestCatalogRebuildCoalesces|TestClockDrivenEligibility' -count=1 -v`. Expected: current rebuild marks too broadly and old hourly coordinator owns timing.
+- [ ] **Step 4: Implement dirty/debounce transactions.** Enqueue the existing immutable recommendation rebuild via the Task 3 bridge. Wake/retry identities are durable; no in-memory timer or direct ranking build. A fresher review read model may display without ranking-version change.
+- [ ] **Step 5: Generate and run green.** Run `make sqlc`; repeat Step 3; run `GOWORK=off go test -race ./internal/catalog ./internal/recommendations ./internal/jobs -count=1`. Expected: zero failures.
+- [ ] **Step 6: Commit.** Stage rebuild/query/generated/tests; commit `feat: coalesce catalog eligibility rebuilds`.
+
+### Task 12: Add review summaries to Go/TypeScript contracts and recommendation/calendar UI
+
+**Files:** Create `web/src/components/ReleaseCalendar.test.tsx`; Modify `internal/recommendations/types.go`, `internal/recommendations/retrieval.go`, `internal/httpapi/overview_contract_test.go`, `internal/httpapi/ranking_handlers_test.go`, `web/src/api/types.ts`, `web/src/api/client.ts`, `web/src/api/client.test.ts`, `web/src/test/overviewFixture.ts`, `web/src/components/RecommendationCard.tsx`, `web/src/components/RecommendationCard.test.tsx`, `web/src/components/ReleaseCalendar.tsx`, `web/src/components/ReleaseBuckets.tsx`, `web/src/pages/CalendarPage.test.tsx`, `web/src/styles.css`.
+
+**Interfaces:** Add `*ReviewSummary Reviews 'json:"reviews,omitempty"'` to `recommendations.Recommendation`; JSON/TS shape is `{band:'positive'|'mixed_or_below'|'unrated',label:string,positivePercent:number|null,total:number,observedAt:string}`. The client normalizer accepts only percent `0..100`, nonnegative safe integer total, known band, bounded label, valid timestamp; otherwise omit the whole optional object.
+
+- [ ] **Step 1: Write failing Go contract tests.** Rated, unrated, missing, and stale-last-known-good rows serialize exactly; mixed released rows are absent due to Task 10 rather than serialized for display. Confirm no raw HTML/tooltip fragment field.
+- [ ] **Step 2: Write failing frontend tests.** Full card and calendar detail show `91% положительных · 1 284 отзыва`; valid unrated shows `Пока нет отзывов`; upcoming/missing omits the line. Compact month grid may expose the summary through accessible detail without crowding every cell. Assert no copy says reviews affected personal match.
+- [ ] **Step 3: Run red.** Run `GOWORK=off go test -race ./internal/recommendations ./internal/httpapi -run 'Review|OverviewJSONContract' -count=1 -v` and `pnpm --dir web run test -- RecommendationCard ReleaseCalendar CalendarPage client`. Expected: missing field/copy.
+- [ ] **Step 4: Implement additive projection and display.** Join current successful review by Steam AppID after eligibility filtering, preserve ranking rows/factors, format Russian count with `Intl.NumberFormat('ru-RU')`, and use one `reviewLabel(item.reviews)` helper for card/calendar surfaces.
+- [ ] **Step 5: Run green frontend/backend gates.** Repeat Step 3; run `pnpm --dir web run test`, `pnpm --dir web run typecheck`, `pnpm --dir web run lint`, and `pnpm --dir web run build`. Expected: zero failures.
+- [ ] **Step 6: Commit.** Carefully stage only this task's hunks because several frontend files were dirty before execution; commit `feat: show Steam review summaries on recommendations`.
+
+### Task 13: Wire two workers, scheduler lifecycle, diagnostics, and safe operational configuration
+
+**Files:** Modify `internal/app/app.go`, `internal/app/discovery_test.go`, `internal/app/store_retry_test.go`, `internal/catalog/discovery_status.go`, `internal/observability/events.go`, `internal/observability/events_test.go`, `internal/httpapi/data_handlers.go`, `internal/httpapi/data_handlers_test.go`, `web/src/api/types.ts`, `web/src/pages/DiagnosticsPage.tsx`, `web/src/pages/DiagnosticsPage.test.tsx`, `README.md`, `docs/local-demo.md`, `docs/deployment.md`, `.env.example`, `docker-compose.yml`.
+
+**Interfaces:** `App` owns `interactiveWorker`, `catalogWorker`, and `scheduler`; `(*SearchScheduler).Run(context.Context) error` waits for cron occurrences and only enqueues; `App.Run` starts both workers, scheduler, and HTTP and cancels all on the first fatal error. Catalog handler registration goes only to catalog worker except interactive rebuild handlers. Diagnostics expose safe per-feed/run/lane/budget/cache/rejection counts, adaptive concurrency, due time, reconciliation freshness, and public `ready|backfilling|stale|unavailable|disabled` mapping; no AppID/name/payload/raw body.
+
+- [ ] **Step 1: Write wiring tests.** Add `TestAppRegistersHandlersInCorrectLanes`, `TestAppStopsWhenEitherWorkerFails`, `TestDisabledSearchSchedulesNoNewCatalogWork`, `TestStartupCatchupDoesNotBlockHTTP`, and `TestDiagnosticsExposeAggregateSearchStateOnly`. Assert catalog concurrency default 4 and interactive concurrency still uses `WORKER_CONCURRENCY`.
+- [ ] **Step 2: Run red.** Run `GOWORK=off go test -race ./internal/app ./internal/httpapi ./internal/observability -run 'TestAppRegisters|TestAppStops|TestDisabledSearch|TestStartupCatchup|TestDiagnosticsExpose' -count=1 -v`. Expected: single worker/old diagnostics.
+- [ ] **Step 3: Implement coordinated lifecycle and safe diagnostics.** Scheduler goroutine only enqueues due occurrences and exits on context. Any worker/server fatal error cancels and joins all components. Keep server readiness independent of Steam/OpenAI availability. Document normal VPS operation as `docker compose up` with no host cron or CI scheduler.
+- [ ] **Step 4: Run focused integration and documentation checks.** Repeat Step 2; run `GOWORK=off go test -race ./internal/app ./internal/catalog ./internal/httpapi ./internal/observability -count=1`, `pnpm --dir web run test -- DiagnosticsPage`, `docker compose config --quiet`, and `git diff --check`. Expected: zero failures.
+- [ ] **Step 5: Commit.** Stage only lifecycle/diagnostic/docs/config files; commit `feat: run scheduled catalog work in an isolated worker lane`.
+
+### Task 14: Exercise the complete rollout, retire the old hourly path, and pass the release gate
+
+**Files:** Modify `cmd/e2e-fakes/main.go`, `web/tests/e2e/catalog-discovery.spec.ts`, `Makefile`, `README.md`, `docs/local-demo.md`; remove obsolete old-hourly coordinator code/config references from `internal/catalog/discovery_coordinator.go`, `internal/catalog/discovery_scan.go`, `internal/catalog/discovery_types.go`, `internal/config/config.go`, `.env.example`, `docker-compose.yml` only after replacement tests pass. Preserve migration 00009 tables/history and seed behavior.
+
+**Interfaces:** The E2E fake serves deterministic four-feed Search pages, appdetails, review transitions, Retry-After, parser breakage, and counters. Test harness endpoints remain compiled only in `cmd/e2e-fakes` and require `TEST_HARNESS_MODE=1`. `make verify` continues to run the catalog browser suite.
+
+- [ ] **Step 1: Extend the E2E fake and write failing browser scenarios.** Prove popular candidates appear before tails finish; positive released and unrated Popular New day-seven appear; Mixed/day-eight disappear from dashboard/calendar/detail/digest; ratings render; duplicate scans do not increment appdetails/AI counters; partial popular/parser failure preserves last-known-good; interactive sync completes during catalog backlog; restart resumes cursor/run without duplicate work.
+- [ ] **Step 2: Run focused E2E red/green.** Run `make prepare-e2e-db`, ensure the harness app is started through the existing Playwright configuration, then run `pnpm --dir web exec playwright test tests/e2e/catalog-discovery.spec.ts`. Expected before final wiring: new scenarios fail; after wiring: all pass. If pinned Chromium is unavailable, use only the documented explicit `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` fallback and record it.
+- [ ] **Step 3: Retire obsolete hourly behavior.** Remove `CATALOG_DISCOVERY_INTERVAL_HOURS`, `CATALOG_DISCOVERY_HOURLY_BUDGET`, `CATALOG_DISCOVERY_UNKNOWN_FRESHNESS_DAYS`, old tick/backfill scheduling, and direct GetAppList-first startup. Keep `GetAppList` as the low-priority weekly reconciliation handler using the new gates/budget/lane. Do not delete old discovery observations or source rows.
+- [ ] **Step 4: Refresh graph and select regressions.** Run `codegraph sync .`, then `codegraph affected db/migrations/00017_steam_search_release_window.sql db/queries/jobs.sql db/queries/catalog_search.sql internal/jobs/queue.go internal/steam/search.go internal/catalog/search_scan.go internal/catalog/eligibility.go internal/recommendations/retrieval.go internal/notifications/repository.go internal/app/app.go web/src/api/types.ts web/src/components/RecommendationCard.tsx -p .`. Run every focused package/test reported in addition to the mandatory commands below.
+- [ ] **Step 5: Run pre-gate checks.** Run `GOWORK=off go test -race ./internal/jobs ./internal/steam ./internal/catalog ./internal/recommendations ./internal/notifications ./internal/httpapi ./internal/app -count=1`; `pnpm --dir web run test`; `pnpm --dir web run typecheck`; `pnpm --dir web run lint`; `pnpm --dir web run build`; `docker compose config --quiet`; `git diff --check`. Expected: zero failures.
+- [ ] **Step 6: Run one fresh final release gate.** Run `make verify` exactly once after all implementation/reviews stabilize. Expected: sqlc diff empty, all Go race tests, frontend checks/build, Docker build/config, and listed Playwright suites pass with zero failures. Repeat only if a later code change invalidates this gate or the run was interrupted.
+- [ ] **Step 7: Commit the completed rollout.** Stage only E2E/fake/retirement/docs/Makefile changes and commit `test: verify Steam search catalog rollout`.
+
+## Plan self-review result
+
+- **Spec coverage:** Tasks 1–14 cover source parsing, exact/imprecise eligibility, review gates, priority ordering, embedded scheduling/manual command, lanes, durable pages/revisions/membership, persistence/idempotency, TTL/budgets/backoff, AI/ranking boundary, rebuild coalescing, every delivery path, API/UI, failure/privacy/observability, rollout, and the final verification gate.
+- **Step granularity:** Every implementation task has a named failing test, an explicit red command, one bounded implementation action, a green command, and a scoped commit. No task asks the implementer to “handle” an unspecified case.
+- **Type consistency:** Lane, feed, review, run, candidate revision, reservation, and eligibility names are defined once in Stable boundaries and reused unchanged. Existing `PlanGameFeatureJob` remains the AI bridge.
+- **Review Focus:** All five risks are pinned to concrete named tests in Tasks 3, 7, 8, 10, and 13.
+- **Proportion:** The plan decides interfaces, invariants, tests, and commands without transcribing implementation bodies. One ordered plan is necessary because the subsystems are persistence- and contract-dependent.
