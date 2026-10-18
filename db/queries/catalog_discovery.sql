@@ -1,4 +1,5 @@
 -- name: GetCatalogDiscoveryState :one
+-- Legacy producers must lock/check catalog_workflow_state before enqueueing.
 SELECT * FROM catalog_discovery_state WHERE source='steam' AND mode=$1;
 
 -- name: LockCatalogDiscoveryState :one

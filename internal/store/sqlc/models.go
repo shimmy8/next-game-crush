@@ -50,6 +50,13 @@ type AchievementSummary struct {
 	SnapshotGeneration    int64              `json:"snapshot_generation"`
 }
 
+type CatalogBudgetReservation struct {
+	Kind         string             `json:"kind"`
+	HourAt       pgtype.Timestamptz `json:"hour_at"`
+	Reservations []byte             `json:"reservations"`
+	Used         int32              `json:"used"`
+}
+
 type CatalogDiscoveryBudget struct {
 	HourAt       pgtype.Timestamptz `json:"hour_at"`
 	Reservations []byte             `json:"reservations"`
@@ -116,14 +123,177 @@ type CatalogFetchState struct {
 	Error                 pgtype.Text        `json:"error"`
 }
 
+type CatalogHostThrottle struct {
+	Host                string             `json:"host"`
+	ConcurrencyLimit    int32              `json:"concurrency_limit"`
+	ConsecutiveFailures int32              `json:"consecutive_failures"`
+	SuccessCount        int32              `json:"success_count"`
+	NextEligibleAt      pgtype.Timestamptz `json:"next_eligible_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
 type CatalogRebuildState struct {
-	UserID           pgtype.UUID        `json:"user_id"`
-	DirtyRevision    int64              `json:"dirty_revision"`
-	EnqueuedRevision int64              `json:"enqueued_revision"`
-	DirtySince       pgtype.Timestamptz `json:"dirty_since"`
-	LastEnqueuedAt   pgtype.Timestamptz `json:"last_enqueued_at"`
-	LastScheduledAt  pgtype.Timestamptz `json:"last_scheduled_at"`
-	PendingJobID     pgtype.UUID        `json:"pending_job_id"`
+	UserID                pgtype.UUID        `json:"user_id"`
+	DirtyRevision         int64              `json:"dirty_revision"`
+	EnqueuedRevision      int64              `json:"enqueued_revision"`
+	DirtySince            pgtype.Timestamptz `json:"dirty_since"`
+	LastEnqueuedAt        pgtype.Timestamptz `json:"last_enqueued_at"`
+	LastScheduledAt       pgtype.Timestamptz `json:"last_scheduled_at"`
+	PendingJobID          pgtype.UUID        `json:"pending_job_id"`
+	DueAt                 pgtype.Timestamptz `json:"due_at"`
+	RetryGeneration       int32              `json:"retry_generation"`
+	FirstDirtyAt          pgtype.Timestamptz `json:"first_dirty_at"`
+	LastCompletedRevision int64              `json:"last_completed_revision"`
+}
+
+type CatalogSearchCurrent struct {
+	SteamAppID                 int64              `json:"steam_app_id"`
+	RunRevision                int64              `json:"run_revision"`
+	ObservationOrdinal         int64              `json:"observation_ordinal"`
+	FirstSeenAt                pgtype.Timestamptz `json:"first_seen_at"`
+	LastSeenAt                 pgtype.Timestamptz `json:"last_seen_at"`
+	Priority                   int16              `json:"priority"`
+	ReleaseText                string             `json:"release_text"`
+	Precision                  string             `json:"precision"`
+	ReleaseDate                pgtype.Date        `json:"release_date"`
+	ReleaseYear                pgtype.Int4        `json:"release_year"`
+	ReleaseMonth               pgtype.Int4        `json:"release_month"`
+	ReleaseQuarter             pgtype.Int4        `json:"release_quarter"`
+	ComingSoon                 pgtype.Bool        `json:"coming_soon"`
+	Fingerprint                string             `json:"fingerprint"`
+	ReviewBand                 string             `json:"review_band"`
+	ReviewLabel                string             `json:"review_label"`
+	PositivePercent            pgtype.Int4        `json:"positive_percent"`
+	ReviewTotal                int64              `json:"review_total"`
+	ReviewObservedAt           pgtype.Timestamptz `json:"review_observed_at"`
+	LastSuccessfulAppdetailsAt pgtype.Timestamptz `json:"last_successful_appdetails_at"`
+	NextRefreshAt              pgtype.Timestamptz `json:"next_refresh_at"`
+	SemanticContentHash        string             `json:"semantic_content_hash"`
+	Active                     bool               `json:"active"`
+	TombstoneReason            string             `json:"tombstone_reason"`
+	RetryGeneration            int32              `json:"retry_generation"`
+	RetryAttempts              int32              `json:"retry_attempts"`
+	NextRetryAt                pgtype.Timestamptz `json:"next_retry_at"`
+	NextEligibilityAt          pgtype.Timestamptz `json:"next_eligibility_at"`
+	SafeError                  string             `json:"safe_error"`
+}
+
+type CatalogSearchFeed struct {
+	RunID            pgtype.UUID        `json:"run_id"`
+	Feed             string             `json:"feed"`
+	Status           string             `json:"status"`
+	CursorOffset     int32              `json:"cursor_offset"`
+	PageGeneration   int32              `json:"page_generation"`
+	FirstPageAt      pgtype.Timestamptz `json:"first_page_at"`
+	LastPageAt       pgtype.Timestamptz `json:"last_page_at"`
+	CompletedAt      pgtype.Timestamptz `json:"completed_at"`
+	Pages            int32              `json:"pages"`
+	ObservedCount    int32              `json:"observed_count"`
+	NaturalEnd       bool               `json:"natural_end"`
+	Monotonic        bool               `json:"monotonic"`
+	BoundaryStop     bool               `json:"boundary_stop"`
+	LastOrderingDate pgtype.Date        `json:"last_ordering_date"`
+	SafetyCapReason  string             `json:"safety_cap_reason"`
+	SafeError        string             `json:"safe_error"`
+}
+
+type CatalogSearchFeedPublication struct {
+	Feed                 string             `json:"feed"`
+	PublishedRunRevision int64              `json:"published_run_revision"`
+	PublishedAt          pgtype.Timestamptz `json:"published_at"`
+}
+
+type CatalogSearchMembership struct {
+	Feed                 string             `json:"feed"`
+	SteamAppID           int64              `json:"steam_app_id"`
+	PublishedRunRevision int64              `json:"published_run_revision"`
+	Active               bool               `json:"active"`
+	OmissionCount        int32              `json:"omission_count"`
+	FirstSeenAt          pgtype.Timestamptz `json:"first_seen_at"`
+	LastSeenAt           pgtype.Timestamptz `json:"last_seen_at"`
+	LatestCompleteAt     pgtype.Timestamptz `json:"latest_complete_at"`
+}
+
+type CatalogSearchObservation struct {
+	RunID              pgtype.UUID        `json:"run_id"`
+	Feed               string             `json:"feed"`
+	StartOffset        int32              `json:"start_offset"`
+	PageGeneration     int32              `json:"page_generation"`
+	SteamAppID         int64              `json:"steam_app_id"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	Position           int32              `json:"position"`
+	ReleaseText        string             `json:"release_text"`
+	Precision          string             `json:"precision"`
+	Fingerprint        string             `json:"fingerprint"`
+	ReviewBand         string             `json:"review_band"`
+	ReviewLabel        string             `json:"review_label"`
+	PositivePercent    pgtype.Int4        `json:"positive_percent"`
+	ReviewTotal        int64              `json:"review_total"`
+	ObservedAt         pgtype.Timestamptz `json:"observed_at"`
+}
+
+type CatalogSearchPage struct {
+	RunID              pgtype.UUID        `json:"run_id"`
+	Feed               string             `json:"feed"`
+	StartOffset        int32              `json:"start_offset"`
+	PageGeneration     int32              `json:"page_generation"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	NextOffset         int32              `json:"next_offset"`
+	ResultCount        int32              `json:"result_count"`
+	HasMore            bool               `json:"has_more"`
+	CommittedAt        pgtype.Timestamptz `json:"committed_at"`
+}
+
+type CatalogSearchRun struct {
+	ID                 pgtype.UUID        `json:"id"`
+	RunRevision        int64              `json:"run_revision"`
+	ScheduleName       string             `json:"schedule_name"`
+	OccurrenceAt       pgtype.Timestamptz `json:"occurrence_at"`
+	Kind               string             `json:"kind"`
+	ConfigSnapshot     []byte             `json:"config_snapshot"`
+	Status             string             `json:"status"`
+	RetryGeneration    int32              `json:"retry_generation"`
+	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	NewAppCount        int32              `json:"new_app_count"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	StartedAt          pgtype.Timestamptz `json:"started_at"`
+	CompletedAt        pgtype.Timestamptz `json:"completed_at"`
+	LastSuccessfulAt   pgtype.Timestamptz `json:"last_successful_at"`
+	SafeError          string             `json:"safe_error"`
+}
+
+type CatalogSearchWorklist struct {
+	RunID              pgtype.UUID        `json:"run_id"`
+	SteamAppID         int64              `json:"steam_app_id"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	Priority           int16              `json:"priority"`
+	Status             string             `json:"status"`
+	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+}
+
+type CatalogStoreReservation struct {
+	SteamAppID         int64              `json:"steam_app_id"`
+	ID                 pgtype.UUID        `json:"id"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	Fingerprint        string             `json:"fingerprint"`
+	FencingToken       pgtype.UUID        `json:"fencing_token"`
+	Status             string             `json:"status"`
+	LeaseUntil         pgtype.Timestamptz `json:"lease_until"`
+	RetryGeneration    int32              `json:"retry_generation"`
+	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
+type CatalogWorkflowState struct {
+	Singleton            bool               `json:"singleton"`
+	LegacyEnqueueEnabled bool               `json:"legacy_enqueue_enabled"`
+	LegacyCutoverAt      pgtype.Timestamptz `json:"legacy_cutover_at"`
 }
 
 type DeletedUserTombstone struct {
@@ -427,6 +597,7 @@ type SyncJob struct {
 	Result         []byte             `json:"result"`
 	UserID         pgtype.UUID        `json:"user_id"`
 	Priority       int16              `json:"priority"`
+	Lane           string             `json:"lane"`
 }
 
 type User struct {

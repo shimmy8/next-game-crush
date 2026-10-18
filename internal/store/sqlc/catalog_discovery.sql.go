@@ -64,6 +64,7 @@ const getCatalogDiscoveryState = `-- name: GetCatalogDiscoveryState :one
 SELECT source, mode, cursor_app_id, watermark_at, scan_started_at, scan_completed_at, availability, last_error, updated_at FROM catalog_discovery_state WHERE source='steam' AND mode=$1
 `
 
+// Legacy producers must lock/check catalog_workflow_state before enqueueing.
 func (q *Queries) GetCatalogDiscoveryState(ctx context.Context, mode string) (CatalogDiscoveryState, error) {
 	row := q.db.QueryRow(ctx, getCatalogDiscoveryState, mode)
 	var i CatalogDiscoveryState

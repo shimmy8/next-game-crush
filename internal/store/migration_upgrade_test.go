@@ -15,6 +15,21 @@ import (
 	migrationfiles "next-game-crush/db/migrations"
 )
 
+func TestSteamSearchMigrationAllowsEmptyRollback(t *testing.T) {
+	ctx, database, provider := searchMigrationDatabase(t)
+	if _, err := provider.UpTo(ctx, 17); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Down(ctx); err != nil {
+		t.Fatalf("empty additive schema rollback: %v", err)
+	}
+	var removed bool
+	if err := database.QueryRowContext(ctx, `SELECT to_regclass('catalog_search_runs') IS NULL AND
+		NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='sync_jobs' AND column_name='lane')`).Scan(&removed); err != nil || !removed {
+		t.Fatalf("empty rollback left search schema: removed=%v err=%v", removed, err)
+	}
+}
+
 func TestAuthMigrationUpgradesTask2Database(t *testing.T) {
 	baseURL := os.Getenv("TEST_DATABASE_URL")
 	if baseURL == "" {
