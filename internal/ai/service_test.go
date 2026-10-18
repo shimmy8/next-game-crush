@@ -172,4 +172,8 @@ func (f *fakeClient) ExplainRecommendation(context.Context, RecommendationEviden
 func (f *fakeClient) ClassifyFeedback(context.Context, FeedbackText) (FeedbackClassification, error) {
 	return FeedbackClassification{}, nil
 }
+
+func (f *fakeClient) ClassifyAchievementSemantics(context.Context, AchievementSemanticEvidence) (AchievementSemanticClassification, error) {
+	return AchievementSemanticClassification{}, nil
+}
 func (f *fakeClient) Embed(context.Context, []string) ([][]float32, error) { return f.vectors, nil }

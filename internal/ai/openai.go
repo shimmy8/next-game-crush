@@ -162,7 +162,7 @@ func (client *OpenAI) structured(ctx context.Context, name, instructions, prompt
 	decoder := json.NewDecoder(strings.NewReader(text))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(output); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidOutput, err)
+		return ErrInvalidOutput
 	}
 	if decoder.Decode(&struct{}{}) != io.EOF {
 		return fmt.Errorf("%w: trailing JSON", ErrInvalidOutput)

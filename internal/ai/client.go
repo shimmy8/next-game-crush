@@ -7,6 +7,7 @@ type Client interface {
 	SummarizeProfile(context.Context, ProfileEvidence) (ProfileSummary, error)
 	ExplainRecommendation(context.Context, RecommendationEvidence) (Explanation, error)
 	ClassifyFeedback(context.Context, FeedbackText) (FeedbackClassification, error)
+	ClassifyAchievementSemantics(context.Context, AchievementSemanticEvidence) (AchievementSemanticClassification, error)
 	Embed(context.Context, []string) ([][]float32, error)
 }
 
