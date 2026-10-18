@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import type { CSSProperties } from 'react'
 import type { DeckCompatibility, PlatformSupport, Recommendation } from '../api/types'
 import { bucketRelease } from '../calendar/dateBuckets'
 import FeedbackForm from './FeedbackForm'
@@ -7,12 +8,24 @@ import { useGameFeedback } from './FeedbackWorkflowContext'
 import { CompactGameIdentity } from './CompactGameIdentity'
 import { safeRecommendationEvidenceText, safeRecommendationExplanationText } from '../api/client'
 import { isEvidenceKind } from '../api/types'
+import type { FeedbackPresentationOrigin } from './FeedbackWorkflowContext'
 
 const precisionLabels: Record<string, string> = { month: 'В течение месяца', quarter: 'В течение квартала', year: 'В течение года', coming_soon: 'Скоро', unknown: 'Дата уточняется' }
 const knownRawLabels: Record<string, string> = { 'coming soon': 'Скоро', tba: 'Дата уточняется' }
 const platformLabels: { key: keyof PlatformSupport; label: string }[] = [{ key: 'windows', label: 'Windows' }, { key: 'mac', label: 'macOS' }, { key: 'linux', label: 'Linux' }]
 const deckLabels: Record<DeckCompatibility, string> = { verified: 'Steam Deck: проверено', playable: 'Steam Deck: можно играть', unsupported: 'Steam Deck: не поддерживается', unknown: 'Steam Deck: неизвестно' }
 const neutralExplanation = 'Рекомендация основана на вашем игровом профиле, но конкретных совпадений пока недостаточно.'
+const sandParticles = Array.from({ length: 24 }, (_, index) => {
+  const y = 5 + ((index * 29) % 76)
+  return {
+    x: 3 + ((index * 37) % 94), y,
+    size: 2 + ((index * 7) % 5),
+    drift: -13 + ((index * 17) % 27),
+    fall: 28 + ((index * 11) % 37),
+    delay: Math.round(y * 3.4),
+    duration: 190 + ((index * 19) % 70),
+  }
+})
 
 export function releaseLabel(release: Recommendation['release']) {
   const bucket = bucketRelease(release)
@@ -25,7 +38,7 @@ export function releaseLabel(release: Recommendation['release']) {
   return knownRawLabel || raw || precisionLabels[release.precision] || 'Дата уточняется'
 }
 
-export default function RecommendationCard({ item, featured = false, compact = false, feedbackEnabled = false, readOnly = false, onVerdictAnimationEnd }: { item: Recommendation; featured?: boolean; compact?: boolean; feedbackEnabled?: boolean; readOnly?: boolean; onVerdictAnimationEnd?(): void }) {
+export default function RecommendationCard({ item, featured = false, compact = false, feedbackEnabled = false, presentationOrigin, readOnly = false, onVerdictAnimationEnd }: { item: Recommendation; featured?: boolean; compact?: boolean; feedbackEnabled?: boolean; presentationOrigin?: FeedbackPresentationOrigin; readOnly?: boolean; onVerdictAnimationEnd?(): void }) {
   const [failedCoverUrl, setFailedCoverUrl] = useState<string>()
   const workflow = useGameFeedback(item.gameId)
   const likeAnimationDelayMs = useMemo(
@@ -85,7 +98,7 @@ export default function RecommendationCard({ item, featured = false, compact = f
       {aiEvidence.length > 0 && <details className="evidence"><summary>На чём основано</summary><ul>{aiEvidence.map((entry) => <li key={entry.id}>{entry.text}</li>)}</ul></details>}
       {aiVisible && <p className="source-note">AI-сводка по вашим игровым данным</p>}
       {deterministicVisible && <p className="source-note">По вашим игровым данным</p>}
-      {includeFeedback && feedbackEnabled && <FeedbackForm gameId={item.gameId} recommendationId={item.id} rankingVersion={item.rankingVersion} gameName={item.name} initialAction={item.latestFeedbackAction} initialReasons={item.latestFeedbackReasons} readOnly={readOnly} />}
+      {includeFeedback && feedbackEnabled && <FeedbackForm gameId={item.gameId} recommendationId={item.id} rankingVersion={item.rankingVersion} gameName={item.name} initialAction={item.latestFeedbackAction} initialReasons={item.latestFeedbackReasons} presentationOrigin={presentationOrigin} readOnly={readOnly} />}
     </div>
   </>
   if (compact) return <article className="recommendation-card recommendation-card--compact compact-release-card">
@@ -98,18 +111,25 @@ export default function RecommendationCard({ item, featured = false, compact = f
         <span className={`compatibility-badge compatibility-badge--${item.deckCompatibility}`}>{deckLabels[item.deckCompatibility]}</span>
       </div>
       <span>{Math.round(item.score)} · совпадение</span>
-      {feedbackEnabled && <FeedbackLauncher item={item} gameId={item.gameId} recommendationId={item.id} rankingVersion={item.rankingVersion} gameName={item.name} coverImageUrl={item.coverImageUrl} readOnly={readOnly} />}
+      {feedbackEnabled && <FeedbackLauncher item={item} gameId={item.gameId} recommendationId={item.id} rankingVersion={item.rankingVersion} gameName={item.name} coverImageUrl={item.coverImageUrl} presentationOrigin={presentationOrigin} readOnly={readOnly} />}
     </div>
   </article>
   return (
     <article
       className={`recommendation-card${featured ? ' recommendation-card--featured' : ''}${compact ? ' recommendation-card--compact' : ''}${showLikeEffect ? ' recommendation-card--liked' : ''}${disliked ? ' recommendation-card--disliked' : ''}`}
       style={showLikeEffect ? { animationDelay: `${likeAnimationDelayMs}ms` } : undefined}
-      onAnimationEnd={() => { if (disliked) onVerdictAnimationEnd?.() }}
+      onAnimationEnd={(event) => { if (disliked && (event.target as HTMLElement).classList.contains('verdict-sand__surface')) onVerdictAnimationEnd?.() }}
     >
       <div className="recommendation-card__original" aria-hidden={disliked || undefined} inert={disliked || undefined}>{surface(true)}</div>
-      {disliked && <div className="verdict-fracture" aria-hidden="true">
-        {['left', 'right'].map((side) => <div className={`verdict-fracture__half verdict-fracture__half--${side}`} aria-hidden="true" inert key={side}><div className={`recommendation-card__fracture-card${featured ? ' recommendation-card__fracture-card--featured' : ''}`}>{surface(false)}</div></div>)}
+      {disliked && <div className="verdict-sand" aria-hidden="true">
+        <div className={`verdict-sand__surface${featured ? ' verdict-sand__surface--featured' : ''}`} aria-hidden="true" inert>{surface(false)}</div>
+        <div className="verdict-sand__particles" aria-hidden="true" inert>
+          {sandParticles.map((particle, index) => <i className="verdict-sand__particle" key={index} style={{
+            '--sand-x': `${particle.x}%`, '--sand-y': `${particle.y}%`, '--sand-size': `${particle.size}px`,
+            '--sand-drift': `${particle.drift}px`, '--sand-fall': `${particle.fall}px`,
+            '--sand-delay': `${particle.delay}ms`, '--sand-duration': `${particle.duration}ms`,
+          } as CSSProperties} />)}
+        </div>
       </div>}
     </article>
   )

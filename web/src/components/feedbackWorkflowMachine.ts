@@ -1,5 +1,5 @@
 import type { DashboardReloadResult, FeedbackAccepted, FeedbackAction, FeedbackInput, RankingDiff } from '../api/types'
-import type { FeedbackSubmitIntent } from './FeedbackWorkflowContext'
+import type { FeedbackPresentationOrigin, FeedbackSubmitIntent } from './FeedbackWorkflowContext'
 
 export const feedbackReasonOrder = ['genre', 'setting', 'multiplayer', 'single-player', 'difficulty', 'length', 'early-access', 'already-known', 'not-now', 'other'] as const
 export type FeedbackWorkflowPhase = 'submitting' | 'polling' | 'polling_unavailable' | 'rebuild_dead' | 'reconciling' | 'stale_unconfirmed'
@@ -8,11 +8,11 @@ export type CanonicalFeedbackCommand = Pick<FeedbackInput, 'action' | 'reasons' 
 export type FeedbackWorkflowRecord = {
   gameId: string; sourceRecommendationId: string; sourceRankingVersion: number; gameName: string
   command: CanonicalFeedbackCommand; idempotencyKey: string; phase: FeedbackWorkflowPhase
-  accepted: FeedbackAccepted | null; diff: RankingDiff | null; error: FeedbackWorkflowError | null; tombstoned: boolean
+  accepted: FeedbackAccepted | null; presentationOrigin: FeedbackPresentationOrigin | null; diff: RankingDiff | null; error: FeedbackWorkflowError | null; tombstoned: boolean
 }
 export type FeedbackWorkflowState = Record<string, FeedbackWorkflowRecord>
 export type PublicFeedbackWorkflowState = {
-  phase: FeedbackWorkflowPhase | 'idle'; accepted: boolean; diff: RankingDiff | null; error: string
+  phase: FeedbackWorkflowPhase | 'idle'; accepted: boolean; acceptedOrigin: FeedbackPresentationOrigin | null; diff: RankingDiff | null; error: string
   canRetry: boolean; busy: boolean; tombstoned: boolean; action: FeedbackAction | null; likeEffectActive: boolean; likeEffectStartedAt: number | null; likeEffectAnimationDelayMs: number
 }
 export type FeedbackWorkflowEvent =
@@ -108,7 +108,8 @@ export function createFeedbackWorkflowRegistry(): FeedbackWorkflowRegistry {
   return {
     acquire(intent, command, idempotencyKey) {
       if (records.has(intent.gameId)) return null
-      const record = freezeFeedbackRecord({ gameId: intent.gameId, sourceRecommendationId: intent.recommendationId, sourceRankingVersion: intent.rankingVersion, gameName: intent.gameName, command, idempotencyKey, phase: 'submitting', accepted: null, diff: null, error: null, tombstoned: false })
+      const presentationOrigin = intent.presentationOrigin ? Object.freeze({ ...intent.presentationOrigin, recommendationId: intent.recommendationId }) : null
+      const record = freezeFeedbackRecord({ gameId: intent.gameId, sourceRecommendationId: intent.recommendationId, sourceRankingVersion: intent.rankingVersion, gameName: intent.gameName, command, idempotencyKey, phase: 'submitting', accepted: null, presentationOrigin, diff: null, error: null, tombstoned: false })
       records.set(intent.gameId, record)
       return record
     },

@@ -3,8 +3,9 @@ import type { Recommendation } from '../api/types'
 import { useGameFeedback } from './FeedbackWorkflowContext'
 import FeedbackDialog from './FeedbackDialog'
 import { useCalendarFeedback } from './CalendarFeedbackContext'
+import type { FeedbackPresentationOrigin } from './FeedbackWorkflowContext'
 
-export type FeedbackLauncherProps = { gameId?: string; recommendationId: string; rankingVersion: number; gameName: string; coverImageUrl?: string; item?: Recommendation; readOnly?: boolean }
+export type FeedbackLauncherProps = { gameId?: string; recommendationId: string; rankingVersion: number; gameName: string; coverImageUrl?: string; item?: Recommendation; presentationOrigin?: FeedbackPresentationOrigin; readOnly?: boolean }
 export default function FeedbackLauncher(props: FeedbackLauncherProps) {
   const gameId = props.gameId ?? props.item?.gameId ?? props.recommendationId
   const coordinator = useCalendarFeedback(); const workflow = useGameFeedback(gameId)

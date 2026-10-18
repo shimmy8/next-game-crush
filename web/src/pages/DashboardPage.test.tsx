@@ -20,7 +20,7 @@ function show(overview: RecommendationOverview) {
 }
 
 function finishVerdictAnimation(element: HTMLElement) {
-  fireEvent.animationEnd(element.querySelector('.verdict-fracture__half') ?? element)
+  fireEvent.animationEnd(element.querySelector('.verdict-sand__surface') ?? element, { animationName: 'verdict-sand-surface' })
 }
 
 it('shows demo banner and intercepts visible mutation controls', () => {
@@ -220,6 +220,28 @@ describe('DashboardPage collections', () => {
 		expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
 		expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1)
 		acceptDislike(new Response(JSON.stringify({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 })))
+	})
+
+	it('does not animate a dashboard card when its shared game is disliked from the calendar', async () => {
+		const overview = overviewFixture(2, 0)
+		vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.method === 'POST' && String(input).includes('/feedback')) return new Response(JSON.stringify({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 }))
+			if (String(input).includes('/diff?')) return new Promise<Response>(() => undefined)
+			return new Response(null, { status: 204 })
+		}))
+		show(overview)
+		const hero = screen.getByRole('region', { name: 'Новая находка для вас' })
+		const calendar = document.querySelector<HTMLElement>('.calendar-section')!
+		const calendarCard = within(calendar).getAllByRole('article').find((article) => article.textContent?.includes('Discovery 1'))!
+		fireEvent.click(within(calendarCard).getByRole('button', { name: 'Оценить' }))
+		const dialog = screen.getByRole('dialog', { name: 'Оценить Discovery 1' })
+		fireEvent.click(within(dialog).getByRole('button', { name: 'Не моё' }))
+		fireEvent.click(within(dialog).getByRole('button', { name: 'Сохранить отзыв' }))
+
+		await waitFor(() => expect(within(calendar).queryByText('Discovery 1')).not.toBeInTheDocument())
+		expect(within(hero).getByRole('heading', { name: 'Discovery 2' })).toBeInTheDocument()
+		expect(within(hero).getByRole('article')).not.toHaveClass('recommendation-card--disliked')
+		expect(hero.querySelector('.verdict-sand')).not.toBeInTheDocument()
 	})
   it('renders the server discovery hero, six discoveries and six secondary wishlist cards with full totals', () => {
     const overview = overviewFixture(8, 8)

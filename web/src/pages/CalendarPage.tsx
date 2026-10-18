@@ -65,7 +65,7 @@ export default function CalendarPage({ calendar, month = new Date(), rankingDiff
         <><ReleaseCalendar month={visibleMonth} items={filtered.exactDates} feedbackEnabled={feedbackEnabled} /><ReleaseBuckets calendar={filtered} feedbackEnabled={feedbackEnabled} /></>
       ) : (
         <><div className="release-list" data-testid="release-list" aria-label={`Релизы с точной датой: ${title}`}>
-          {exactForMonth.length ? exactForMonth.map((item) => <RecommendationCard item={item} compact key={item.id} feedbackEnabled={feedbackEnabled} readOnly={readOnly} />) : <p className="empty-note">В этом месяце точных дат по фильтрам нет.</p>}
+          {exactForMonth.length ? exactForMonth.map((item) => <RecommendationCard item={item} compact key={item.id} feedbackEnabled={feedbackEnabled} presentationOrigin={{ surface: 'calendar', recommendationId: item.id }} readOnly={readOnly} />) : <p className="empty-note">В этом месяце точных дат по фильтрам нет.</p>}
         </div><ReleaseBuckets calendar={filtered} feedbackEnabled={feedbackEnabled} /></>
       )}
     </section></CalendarFeedbackProvider>

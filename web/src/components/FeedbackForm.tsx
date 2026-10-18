@@ -3,8 +3,9 @@ import type { DirectFeedbackAction } from '../api/types'
 import { taxonomyLabel } from '../ui/labels'
 import { useGameFeedback } from './FeedbackWorkflowContext'
 import { feedbackReasonOrder } from './feedbackWorkflowMachine'
+import type { FeedbackPresentationOrigin } from './FeedbackWorkflowContext'
 
-export type FeedbackFormProps = { gameId?: string; recommendationId: string; rankingVersion: number; gameName?: string; initialAction?: DirectFeedbackAction | null; initialReasons?: string[] | null; readOnly?: boolean }
+export type FeedbackFormProps = { gameId?: string; recommendationId: string; rankingVersion: number; gameName?: string; initialAction?: DirectFeedbackAction | null; initialReasons?: string[] | null; presentationOrigin?: FeedbackPresentationOrigin; readOnly?: boolean }
 const reasonLabels: Record<string, string> = { genre: 'Жанр', setting: 'Сеттинг', multiplayer: 'Мультиплеер', 'single-player': 'Одиночная игра', difficulty: 'Сложность', length: 'Длина', 'early-access': 'Ранний доступ', 'already-known': 'Уже знаю', 'not-now': 'Не сейчас', other: 'Другое' }
 
 export default function FeedbackForm(props: FeedbackFormProps) {
@@ -20,7 +21,7 @@ export default function FeedbackForm(props: FeedbackFormProps) {
     if (props.readOnly) { setReadOnlyNotice('Хорошая попытка — реакции пока только для владельца.'); return }
     if (count > 500) { setValidation('Комментарий должен быть не длиннее 500 символов'); return }
     setValidation(''); setSubmittedAction(nextAction)
-    void workflow.submit({ recommendationId: props.recommendationId, rankingVersion: props.rankingVersion, gameName: props.gameName ?? props.recommendationId, action: nextAction, ...(nextAction === 'remind_me' ? {} : { reasons: selectedReasons.length ? selectedReasons : undefined, freeText: freeText.trim() || undefined }) })
+    void workflow.submit({ recommendationId: props.recommendationId, rankingVersion: props.rankingVersion, gameName: props.gameName ?? props.recommendationId, action: nextAction, presentationOrigin: props.presentationOrigin, ...(nextAction === 'remind_me' ? {} : { reasons: selectedReasons.length ? selectedReasons : undefined, freeText: freeText.trim() || undefined }) })
   }
   const choose = (next: 'like' | 'dislike') => props.readOnly ? setReadOnlyNotice('Хорошая попытка — реакции пока только для владельца.') : setAction(next)
   if (workflow.accepted) return <div className="feedback-status" aria-live="polite"><strong>{submittedAction === 'remind_me' ? 'Напоминание сохранено' : 'Отзыв сохранён'}</strong>

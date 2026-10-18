@@ -68,20 +68,17 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .cover-panel__image { display: block; width: 100%; height: 100%; min-height: inherit; object-fit: cover; }
 .cover-panel__mark { font-size: clamp(5rem, 10vw, 9rem); line-height: 1; color: #313747; font-weight: 850; letter-spacing: -.08em; align-self: center; margin: auto; }
 .recommendation-card--liked { animation: verdict-like-glow 720ms ease-out both; }
-.recommendation-card--disliked { pointer-events: none; animation: verdict-dislike-exit 560ms cubic-bezier(.55, .02, .72, .34) both; }
+.recommendation-card--disliked { pointer-events: none; background: transparent; border-color: transparent; }
 .recommendation-card--disliked .recommendation-card__original { visibility: hidden; }
-.verdict-fracture { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
-.verdict-fracture::after { content: ""; position: absolute; z-index: 2; inset: -8% 48%; width: 4px; background: linear-gradient(to bottom, transparent, #f3dfdf 18%, #733b48 48%, #f3dfdf 76%, transparent); clip-path: polygon(45% 0, 100% 18%, 30% 35%, 85% 54%, 15% 72%, 70% 100%, 0 100%, 42% 73%, 0 54%, 55% 34%, 0 18%); filter: drop-shadow(0 0 5px rgb(255 130 111 / 55%)); }
-.verdict-fracture__half { position: absolute; inset: 0; overflow: hidden; }
-.verdict-fracture__half--left { clip-path: polygon(0 0, 52% 0, 48% 18%, 53% 35%, 47% 54%, 52% 73%, 48% 100%, 0 100%); animation: verdict-fragment-left 560ms cubic-bezier(.55, .02, .72, .34) both; }
-.verdict-fracture__half--right { clip-path: polygon(52% 0, 100% 0, 100% 100%, 48% 100%, 52% 73%, 47% 54%, 53% 35%, 48% 18%); animation: verdict-fragment-right 560ms cubic-bezier(.55, .02, .72, .34) both; }
-.recommendation-card__fracture-card { position: absolute; inset: 0; display: grid; grid-template-columns: 42% 1fr; min-height: 100%; background: var(--panel); }
-.recommendation-card__fracture-card--featured { grid-template-columns: 1fr; }
-.recommendation-card__fracture-card--featured .cover-panel { min-height: 0; aspect-ratio: 460 / 215; border-right: 0; border-bottom: 1px solid var(--line); }
+.verdict-sand { position: absolute; inset: 0; z-index: 5; overflow: hidden; border-radius: inherit; pointer-events: none; }
+.verdict-sand__surface { position: absolute; inset: 0; display: grid; grid-template-columns: 42% 1fr; min-height: 100%; overflow: hidden; border-radius: inherit; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); -webkit-mask-image: linear-gradient(to bottom, transparent 0 40%, rgb(0 0 0 / 18%) 43%, rgb(0 0 0 / 72%) 45%, rgb(0 0 0 / 28%) 47%, rgb(0 0 0 / 92%) 49%, #000 53% 100%), radial-gradient(circle at 31% 37%, transparent 0 .65px, #000 1.15px), radial-gradient(circle at 68% 63%, transparent 0 .55px, #000 1px); mask-image: linear-gradient(to bottom, transparent 0 40%, rgb(0 0 0 / 18%) 43%, rgb(0 0 0 / 72%) 45%, rgb(0 0 0 / 28%) 47%, rgb(0 0 0 / 92%) 49%, #000 53% 100%), radial-gradient(circle at 31% 37%, transparent 0 .65px, #000 1.15px), radial-gradient(circle at 68% 63%, transparent 0 .55px, #000 1px); -webkit-mask-size: 100% 200%, 13px 11px, 19px 17px; mask-size: 100% 200%, 13px 11px, 19px 17px; -webkit-mask-position: 0 100%, 0 0, 7px 5px; mask-position: 0 100%, 0 0, 7px 5px; -webkit-mask-repeat: no-repeat, repeat, repeat; mask-repeat: no-repeat, repeat, repeat; -webkit-mask-composite: source-in, source-in; mask-composite: intersect, intersect; animation: verdict-sand-surface 600ms cubic-bezier(.5, .05, .72, .38) both; will-change: -webkit-mask-position, mask-position, opacity; }
+.verdict-sand__surface--featured { grid-template-columns: 1fr; box-shadow: inset 0 0 0 1px #49415f; }
+.verdict-sand__surface--featured .cover-panel { min-height: 0; aspect-ratio: 460 / 215; border-right: 0; border-bottom: 1px solid var(--line); }
+.verdict-sand__particles { position: absolute; inset: 0; overflow: hidden; }
+.verdict-sand__particle { position: absolute; left: var(--sand-x); top: var(--sand-y); width: var(--sand-size); height: var(--sand-size); border-radius: 45% 55% 58% 42%; background: color-mix(in srgb, var(--panel) 72%, #d8b59b); box-shadow: 0 0 2px rgb(216 181 155 / 30%); opacity: 0; animation: verdict-sand-particle var(--sand-duration) ease-in var(--sand-delay) both; will-change: transform, opacity; }
 @keyframes verdict-like-glow { 0%, 28% { box-shadow: 0 0 22px rgb(115 208 173 / 28%); } 100% { box-shadow: 0 0 0 rgb(115 208 173 / 0%); } }
-@keyframes verdict-dislike-exit { 0%, 28% { opacity: 1; } 100% { opacity: 0; transform: scale(.97); } }
-@keyframes verdict-fragment-left { 0%, 28% { transform: none; } 100% { transform: translate(-18px, 8px) rotate(-1.5deg); } }
-@keyframes verdict-fragment-right { 0%, 28% { transform: none; } 100% { transform: translate(18px, -8px) rotate(1.5deg); } }
+@keyframes verdict-sand-surface { 0%, 12% { -webkit-mask-position: 0 100%, 0 0, 7px 5px; mask-position: 0 100%, 0 0, 7px 5px; opacity: 1; } 88% { opacity: .96; } 94% { -webkit-mask-position: 0 -100%, 4px 7px, 10px 12px; mask-position: 0 -100%, 4px 7px, 10px 12px; opacity: .96; } 100% { -webkit-mask-position: 0 -100%, 4px 7px, 10px 12px; mask-position: 0 -100%, 4px 7px, 10px 12px; opacity: 0; } }
+@keyframes verdict-sand-particle { 0% { opacity: 0; transform: translate3d(0, -2px, 0) scale(.7); } 18% { opacity: .82; } 100% { opacity: 0; transform: translate3d(var(--sand-drift), var(--sand-fall), 0) scale(.35) rotate(35deg); } }
 .recommendation-card__body { padding: 28px; display: flex; flex-direction: column; }
 .card-meta { display: flex; gap: 8px; flex-wrap: wrap; }
 .date-chip, .wishlist-badge { display: inline-flex; align-items: center; min-height: 25px; padding: 4px 8px; border-radius: 6px; font-size: .7rem; font-weight: 750; }
@@ -255,7 +252,7 @@ footer { display: flex; justify-content: space-between; gap: 20px; border-top: 1
   .sync-progress__details { max-block-size: min(15rem, 38vh); }
   .preflight-status { align-items: flex-start; flex-wrap: wrap; }
   .preflight-status__actions { width: 100%; margin-left: 46px; }
-  .recommendation-card, .recommendation-card--featured, .recommendation-card__fracture-card { grid-template-columns: 1fr; }
+  .recommendation-card, .recommendation-card--featured, .verdict-sand__surface { grid-template-columns: 1fr; }
   .recommendation-card--featured .cover-panel { min-height: 0; }
   .cover-panel { border-right: 0; border-bottom: 1px solid var(--line); }
   .recommendation-card__body { padding: 22px; }

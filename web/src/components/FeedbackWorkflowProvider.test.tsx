@@ -9,8 +9,8 @@ import RecommendationCard from './RecommendationCard'
 
 function Probe() {
   const workflow = useFeedbackWorkflows(); const state = workflow.stateFor('game-1')
-  const send = (gameId: string, action: 'like' | 'dislike' | 'remind_me') => void workflow.submit({ gameId, recommendationId: `rec-${gameId}`, rankingVersion: 1, gameName: gameId, action })
-  return <div><button onClick={() => send('game-1', 'dislike')}>dislike one</button><button onClick={() => send('game-1', 'like')}>like one</button><button onClick={() => send('game-2', 'like')}>like two</button><span data-testid="phase">{state.phase}</span><span data-testid="action">{state.action ?? 'none'}</span><span data-testid="busy">{String(state.busy)}</span><span data-testid="tombstone">{String(workflow.isTombstoned('game-1'))}</span></div>
+  const send = (gameId: string, action: 'like' | 'dislike' | 'remind_me') => void workflow.submit({ gameId, recommendationId: `rec-${gameId}`, rankingVersion: 1, gameName: gameId, action, presentationOrigin: { surface: 'dashboard', lane: 'featured', recommendationId: `rec-${gameId}` } })
+  return <div><button onClick={() => send('game-1', 'dislike')}>dislike one</button><button onClick={() => send('game-1', 'like')}>like one</button><button onClick={() => send('game-2', 'like')}>like two</button><span data-testid="phase">{state.phase}</span><span data-testid="action">{state.action ?? 'none'}</span><span data-testid="origin">{state.acceptedOrigin?.surface ?? 'none'}</span><span data-testid="busy">{String(state.busy)}</span><span data-testid="tombstone">{String(workflow.isTombstoned('game-1'))}</span></div>
 }
 
 const glowItem = { ...overviewFixture(1, 0).discoveries.featured!, gameId: 'game-1' }
@@ -63,8 +63,10 @@ describe('FeedbackWorkflowProvider', () => {
 
     await waitFor(() => expect(screen.getByTestId('phase')).toHaveTextContent('polling'))
 		expect(screen.getByTestId('action')).toHaveTextContent('dislike')
+		expect(screen.getByTestId('origin')).toHaveTextContent('dashboard')
     expect(screen.getByTestId('tombstone')).toHaveTextContent('true')
     expect(submitFeedback).toHaveBeenCalledTimes(1)
+    expect(submitFeedback).toHaveBeenCalledWith('rec-game-1', 'csrf', { action: 'dislike', idempotencyKey: expect.any(String) }, expect.any(AbortSignal))
     expect(readRankingDiff).toHaveBeenCalledWith(1, 'job', expect.any(AbortSignal))
     expect(reload).not.toHaveBeenCalled()
 
@@ -74,6 +76,7 @@ describe('FeedbackWorkflowProvider', () => {
     expect(onRankingUpdated).toHaveBeenCalledExactlyOnceWith(diff)
     expect(reload).toHaveBeenCalledTimes(1)
     expect(screen.getByTestId('tombstone')).toHaveTextContent('true')
+    expect(screen.getByTestId('origin')).toHaveTextContent('dashboard')
   })
 
   it('aborts polling on real unmount and ignores its late result after StrictMode setup', async () => {

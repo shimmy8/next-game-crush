@@ -24,6 +24,7 @@ const intent: FeedbackSubmitIntent = {
   rankingVersion: 1,
   gameName: 'Game',
   action: 'dislike',
+  presentationOrigin: { surface: 'dashboard', lane: 'featured', recommendationId: 'rec-1' },
   reasons: ['other', 'genre'],
   freeText: ' note ',
 }
@@ -107,10 +108,12 @@ describe('feedback workflow registry', () => {
     command.action = 'like'
     command.freeText = 'changed'
     expect(record.command).toEqual({ action: 'dislike', reasons: ['other', 'genre'], freeText: 'note' })
+    expect(record.presentationOrigin).toEqual({ surface: 'dashboard', lane: 'featured', recommendationId: 'rec-1' })
     expect(record.idempotencyKey).toBe('key-1')
     expect(Object.isFrozen(record)).toBe(true)
     expect(Object.isFrozen(record.command)).toBe(true)
     expect(Object.isFrozen(record.command.reasons)).toBe(true)
+    expect(Object.isFrozen(record.presentationOrigin)).toBe(true)
     expect(registry.get(intent.gameId)).toBe(record)
   })
 

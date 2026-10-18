@@ -2,12 +2,17 @@ import { createContext, useContext } from 'react'
 import type { FeedbackAction } from '../api/types'
 import type { PublicFeedbackWorkflowState } from './feedbackWorkflowMachine'
 
+export type FeedbackPresentationOrigin =
+  | { surface: 'dashboard'; lane: 'featured' | 'discoveries' | 'wishlist'; recommendationId: string }
+  | { surface: 'calendar'; recommendationId: string }
+
 export type FeedbackSubmitIntent = {
   gameId: string
   recommendationId: string
   rankingVersion: number
   gameName: string
   action: FeedbackAction
+  presentationOrigin?: FeedbackPresentationOrigin
   reasons?: string[]
   freeText?: string
 }
@@ -20,7 +25,7 @@ export type FeedbackWorkflowContextValue = {
   isTombstoned(gameId: string): boolean
 }
 
-const idle: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, diff: null, error: '', canRetry: false, busy: false, tombstoned: false, action: null, likeEffectActive: false, likeEffectStartedAt: null, likeEffectAnimationDelayMs: 0 }
+const idle: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, acceptedOrigin: null, diff: null, error: '', canRetry: false, busy: false, tombstoned: false, action: null, likeEffectActive: false, likeEffectStartedAt: null, likeEffectAnimationDelayMs: 0 }
 const legacyConsumerFallback: FeedbackWorkflowContextValue = { stateFor: () => idle, submit: async () => undefined, retry: () => undefined, isBusy: () => false, isTombstoned: () => false }
 export const FeedbackWorkflowContext = createContext<FeedbackWorkflowContextValue | undefined>(undefined)
 

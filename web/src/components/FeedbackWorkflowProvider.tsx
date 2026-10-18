@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 import { getRankingDiff, submitFeedback as apiSubmitFeedback } from '../api/client'
 import type { DashboardReloadResult, FeedbackInput, RankingDiff } from '../api/types'
 import { FeedbackWorkflowContext } from './FeedbackWorkflowContext'
-import type { FeedbackSubmitIntent, FeedbackWorkflowContextValue } from './FeedbackWorkflowContext'
+import type { FeedbackPresentationOrigin, FeedbackSubmitIntent, FeedbackWorkflowContextValue } from './FeedbackWorkflowContext'
 import { canonicalFeedbackCommand, createFeedbackWorkflowRegistry, feedbackWorkflowReducer } from './feedbackWorkflowMachine'
 import type { FeedbackWorkflowEvent, FeedbackWorkflowRecord, FeedbackWorkflowState, PublicFeedbackWorkflowState } from './feedbackWorkflowMachine'
 import { findRecommendationByGameId } from './feedbackVisibility'
@@ -17,7 +17,7 @@ export type FeedbackWorkflowProviderProps = {
 }
 
 const likeEffectMs = 720
-const idle: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, diff: null, error: '', canRetry: false, busy: false, tombstoned: false, action: null, likeEffectActive: false, likeEffectStartedAt: null, likeEffectAnimationDelayMs: 0 }
+const idle: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, acceptedOrigin: null, diff: null, error: '', canRetry: false, busy: false, tombstoned: false, action: null, likeEffectActive: false, likeEffectStartedAt: null, likeEffectAnimationDelayMs: 0 }
 
 export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingUpdated, children, submitFeedback = apiSubmitFeedback, readRankingDiff = getRankingDiff, wait = waitForRanking }: FeedbackWorkflowProviderProps) {
   const [records, setRecords] = useState<FeedbackWorkflowState>({})
@@ -25,6 +25,7 @@ export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingU
   const registry = useRef(createFeedbackWorkflowRegistry())
   const controllers = useRef(new Map<string, AbortController>())
   const tombstones = useRef(new Set<string>())
+  const tombstoneOrigins = useRef(new Map<string, FeedbackPresentationOrigin>())
   const likeEffectDeadlines = useRef(new Map<string, number>())
   const likeEffectTimers = useRef(new Map<string, number>())
   const [revision, setRevision] = useState(0)
@@ -51,7 +52,7 @@ export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingU
       || (record.command.action === 'like' && confirmedAction === 'like'))
     dispatch({ type: 'reconcile', gameId, result: confirmed ? result : result.kind === 'fresh' ? { kind: 'stale', data: result.data, reason: 'request_failed' } : result, confirmedAction })
     if (confirmed) {
-      if (record.command.action === 'like') tombstones.current.delete(gameId)
+      if (record.command.action === 'like') { tombstones.current.delete(gameId); tombstoneOrigins.current.delete(gameId) }
       release(gameId); setRevision((value) => value + 1)
     }
   }, [dispatch, release])
@@ -81,7 +82,11 @@ export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingU
       const accepted = await submitFeedback(intent.recommendationId, csrfToken, input, controller.signal)
       if (controller.signal.aborted || !mounted.current) return
       const acceptedRecord = { ...record, accepted, phase: 'polling' as const, tombstoned: command.action === 'dislike' }
-      if (command.action === 'dislike') tombstones.current.add(intent.gameId)
+      if (command.action === 'dislike') {
+        tombstones.current.add(intent.gameId)
+        if (acceptedRecord.presentationOrigin) tombstoneOrigins.current.set(intent.gameId, acceptedRecord.presentationOrigin)
+        else tombstoneOrigins.current.delete(intent.gameId)
+      }
       if (command.action === 'like') {
         const previousTimer = likeEffectTimers.current.get(intent.gameId)
         if (previousTimer !== undefined) window.clearTimeout(previousTimer)
@@ -126,8 +131,9 @@ export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingU
     const likeEffectActive = likeEffectDeadline > now
     const likeEffectStartedAt = likeEffectActive ? likeEffectDeadline - likeEffectMs : null
     const likeEffectAnimationDelayMs = likeEffectStartedAt === null ? 0 : -Math.max(0, now - likeEffectStartedAt)
-    if (!record) return tombstones.current.has(gameId) ? { ...idle, tombstoned: true, action: 'dislike', likeEffectActive, likeEffectStartedAt, likeEffectAnimationDelayMs } : { ...idle, likeEffectActive, likeEffectStartedAt, likeEffectAnimationDelayMs }
-    return { phase: record.phase, accepted: Boolean(record.accepted), diff: record.diff, error: record.error ? feedbackErrorCopy(record.error) : '', canRetry: record.phase === 'polling_unavailable' || record.phase === 'rebuild_dead' || record.phase === 'stale_unconfirmed', busy: true, tombstoned: tombstones.current.has(gameId) || record.tombstoned, action: record.accepted ? record.command.action : null, likeEffectActive, likeEffectStartedAt, likeEffectAnimationDelayMs }
+    const acceptedOrigin = record?.accepted ? record.presentationOrigin : tombstoneOrigins.current.get(gameId) ?? null
+    if (!record) return tombstones.current.has(gameId) ? { ...idle, acceptedOrigin, tombstoned: true, action: 'dislike', likeEffectActive, likeEffectStartedAt, likeEffectAnimationDelayMs } : { ...idle, likeEffectActive, likeEffectStartedAt, likeEffectAnimationDelayMs }
+    return { phase: record.phase, accepted: Boolean(record.accepted), acceptedOrigin, diff: record.diff, error: record.error ? feedbackErrorCopy(record.error) : '', canRetry: record.phase === 'polling_unavailable' || record.phase === 'rebuild_dead' || record.phase === 'stale_unconfirmed', busy: true, tombstoned: tombstones.current.has(gameId) || record.tombstoned, action: record.accepted ? record.command.action : null, likeEffectActive, likeEffectStartedAt, likeEffectAnimationDelayMs }
   }, [records, revision])
   const value = useMemo<FeedbackWorkflowContextValue>(() => ({ stateFor, submit, retry, isBusy: (gameId) => Boolean(records[gameId]), isTombstoned: (gameId) => tombstones.current.has(gameId) }), [records, retry, stateFor, submit])
   const statusIds = Object.keys(records)

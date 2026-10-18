@@ -13,6 +13,7 @@ import CalendarPage from './CalendarPage'
 import DiagnosticsPage from './DiagnosticsPage'
 import FeedbackWorkflowProvider from '../components/FeedbackWorkflowProvider'
 import { useFeedbackWorkflows } from '../components/FeedbackWorkflowContext'
+import type { FeedbackPresentationOrigin } from '../components/FeedbackWorkflowContext'
 import { applyFeedbackTombstones } from '../components/feedbackVisibility'
 
 type DashboardPageProps = {
@@ -33,15 +34,16 @@ const discoveryEmptyCopy: Record<CatalogStatus['status'], string> = {
 
 const verdictExitFallbackMs = 700
 type DashboardLane = 'featured' | 'discoveries' | 'wishlist'
+type DashboardFeedbackOrigin = Extract<FeedbackPresentationOrigin, { surface: 'dashboard' }>
 type DashboardExitSnapshot = { item: Recommendation; lane: DashboardLane; index: number; successor?: { item: Recommendation; index: number } }
 type DashboardPresentationState = { source: RecommendationOverview; tombstoneKey: string; reducedMotion: boolean; exits: Map<string, DashboardExitSnapshot>; completed: Set<string> }
 
-function findDashboardSnapshot(overview: RecommendationOverview, gameId: string): DashboardExitSnapshot | null {
-  if (overview.discoveries.featured?.gameId === gameId) return { item: overview.discoveries.featured, lane: 'featured', index: 0, ...(overview.discoveries.items[0] ? { successor: { item: overview.discoveries.items[0], index: 0 } } : {}) }
-  const discoveryIndex = overview.discoveries.items.findIndex((item) => item.gameId === gameId)
-  if (discoveryIndex >= 0) return { item: overview.discoveries.items[discoveryIndex], lane: 'discoveries', index: discoveryIndex }
-  const wishlistIndex = overview.wishlist.items.findIndex((item) => item.gameId === gameId)
-  return wishlistIndex >= 0 ? { item: overview.wishlist.items[wishlistIndex], lane: 'wishlist', index: wishlistIndex } : null
+function findDashboardSnapshot(overview: RecommendationOverview, gameId: string, origin: DashboardFeedbackOrigin): DashboardExitSnapshot | null {
+  const matches = (item: Recommendation | null | undefined) => item?.gameId === gameId && item.id === origin.recommendationId
+  if (origin.lane === 'featured') return matches(overview.discoveries.featured) ? { item: overview.discoveries.featured!, lane: 'featured', index: 0, ...(overview.discoveries.items[0] ? { successor: { item: overview.discoveries.items[0], index: 0 } } : {}) } : null
+  const items = origin.lane === 'discoveries' ? overview.discoveries.items : overview.wishlist.items
+  const index = items.findIndex(matches)
+  return index >= 0 ? { item: items[index], lane: origin.lane, index } : null
 }
 
 function insertExitSnapshots(items: Recommendation[], exits: DashboardExitSnapshot[], lane: DashboardLane) {
@@ -112,8 +114,10 @@ function DashboardContent({ user, signingOut, onLogout, onDataDeleted = onLogout
 		} else {
 			for (const gameId of tombstones) {
 				if (exits.has(gameId) || completed.has(gameId)) continue
-				const snapshot = findDashboardSnapshot(presentation.source, gameId) ?? findDashboardSnapshot(sourceData.overview, gameId)
-				if (snapshot) exits.set(gameId, snapshot)
+				const origin = workflows.stateFor(gameId).acceptedOrigin
+				if (origin?.surface !== 'dashboard') { completed.add(gameId); continue }
+				const snapshot = findDashboardSnapshot(presentation.source, gameId, origin) ?? findDashboardSnapshot(sourceData.overview, gameId, origin)
+				if (snapshot) exits.set(gameId, snapshot); else completed.add(gameId)
 			}
 		}
 		setPresentation({ source: sourceData.overview, tombstoneKey, reducedMotion, exits, completed })
@@ -185,10 +189,10 @@ function DashboardContent({ user, signingOut, onLogout, onDataDeleted = onLogout
         <div className="dashboard-main">
           <section aria-labelledby="best-match-title">
             <div className="section-heading"><div><div className="eyebrow">Лучшее совпадение</div><h1 id="best-match-title">Новая находка для вас</h1></div></div>
-            {featured ? <RecommendationCard key={featured.gameId} item={featured} featured feedbackEnabled readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(featured.gameId)} /> : <div className="empty-card"><strong>Пока не нашли новых игр вне вашего списка желаемого</strong><p>{discoveryEmptyCopy[catalogStatus.status]}</p><p>Синхронизируйте профиль — мы сопоставим любимые механики, темы и активность с будущими релизами.</p><button type="button" onClick={requestSync} disabled={syncBusy}>Собрать профиль</button></div>}
+            {featured ? <RecommendationCard key={featured.gameId} item={featured} featured feedbackEnabled presentationOrigin={{ surface: 'dashboard', lane: 'featured', recommendationId: featured.id }} readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(featured.gameId)} /> : <div className="empty-card"><strong>Пока не нашли новых игр вне вашего списка желаемого</strong><p>{discoveryEmptyCopy[catalogStatus.status]}</p><p>Синхронизируйте профиль — мы сопоставим любимые механики, темы и активность с будущими релизами.</p><button type="button" onClick={requestSync} disabled={syncBusy}>Собрать профиль</button></div>}
           </section>
-          <section className="recommendations-section" aria-labelledby="more-title"><div className="section-heading"><div><div className="eyebrow">Вне вашего желаемого</div><h2 id="more-title">Ещё новые игры</h2></div><span>Всего новых игр: {discoveries.total}</span></div>{discoveryItems.length > 0 && <div className="recommendation-grid">{discoveryItems.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(item.gameId)} />)}</div>}</section>
-          <section className="recommendations-section wishlist-section" aria-labelledby="wishlist-title"><div className="section-heading"><div><div className="eyebrow">Следим за релизами</div><h2 id="wishlist-title">Уже в вашем желаемом</h2></div><span>Всего в желаемом: {wishlist.total}</span></div><WishlistFreshness wishlist={wishlist} />{wishlistItems.length > 0 ? <div className="recommendation-grid">{wishlistItems.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(item.gameId)} />)}</div> : wishlist.status === 'ready' ? <p className="wishlist-empty">В желаемом нет подходящих будущих релизов.</p> : null}</section>
+          <section className="recommendations-section" aria-labelledby="more-title"><div className="section-heading"><div><div className="eyebrow">Вне вашего желаемого</div><h2 id="more-title">Ещё новые игры</h2></div><span>Всего новых игр: {discoveries.total}</span></div>{discoveryItems.length > 0 && <div className="recommendation-grid">{discoveryItems.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled presentationOrigin={{ surface: 'dashboard', lane: 'discoveries', recommendationId: item.id }} readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(item.gameId)} />)}</div>}</section>
+          <section className="recommendations-section wishlist-section" aria-labelledby="wishlist-title"><div className="section-heading"><div><div className="eyebrow">Следим за релизами</div><h2 id="wishlist-title">Уже в вашем желаемом</h2></div><span>Всего в желаемом: {wishlist.total}</span></div><WishlistFreshness wishlist={wishlist} />{wishlistItems.length > 0 ? <div className="recommendation-grid">{wishlistItems.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled presentationOrigin={{ surface: 'dashboard', lane: 'wishlist', recommendationId: item.id }} readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(item.gameId)} />)}</div> : wishlist.status === 'ready' ? <p className="wishlist-empty">В желаемом нет подходящих будущих релизов.</p> : null}</section>
         </div>
         <div className="right-rail"><PreferenceProfile profile={data.profile} csrfToken={user.csrfToken} onRankingUpdated={rankingUpdated} readOnly={readOnly} /><CatalogCoverage status={catalogStatus} /><UpcomingWindows calendar={calendar} /><TestDigestButton csrfToken={user.csrfToken} readOnly={readOnly} /><DiagnosticsPage csrfToken={user.csrfToken} onDeleted={onDataDeleted} readOnly={readOnly} /></div>
       </div>}
