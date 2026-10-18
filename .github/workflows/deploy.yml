@@ -1,0 +1,171 @@
+name: Verify and deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Verify deployment contracts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n deploy/deploy.sh deploy/tests/*.sh
+          for test_script in deploy/tests/*_test.sh; do
+            bash "$test_script"
+          done
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: "1.27.2"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: "26"
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.25.0
+
+      - name: Install frontend dependencies
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Verify repository
+        shell: bash
+        run: |
+          if [[ -x /usr/bin/google-chrome ]]; then
+            export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome
+          fi
+          GOWORK=off make verify
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_REF: ghcr.io/shimmy8/next-game-crush:${{ github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5
+
+      - name: Build and publish image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_REF }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    environment:
+      name: production
+      url: https://nextgamecrush.site
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    env:
+      IMAGE_REF: ghcr.io/shimmy8/next-game-crush:${{ github.sha }}
+      VPS_HOST: ${{ vars.VPS_HOST }}
+      VPS_USER: ${{ vars.VPS_USER }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Configure reviewed SSH credentials
+        shell: bash
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$VPS_HOST" ]] || { echo 'VPS_HOST is empty' >&2; exit 1; }
+          [[ -n "$VPS_USER" ]] || { echo 'VPS_USER is empty' >&2; exit 1; }
+          [[ -n "$VPS_SSH_KEY" ]] || { echo 'VPS_SSH_KEY is empty' >&2; exit 1; }
+          [[ -n "$VPS_KNOWN_HOSTS" ]] || { echo 'VPS_KNOWN_HOSTS is empty' >&2; exit 1; }
+          [[ "$VPS_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo 'VPS_HOST has an invalid format' >&2; exit 1; }
+          [[ "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo 'VPS_USER has an invalid format' >&2; exit 1; }
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'GITHUB_SHA has an invalid format' >&2; exit 1; }
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_KEY" >"$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          ssh-keygen -F "$VPS_HOST" -f "$HOME/.ssh/known_hosts" >/dev/null || {
+            echo 'VPS_KNOWN_HOSTS has no entry for VPS_HOST' >&2
+            exit 1
+          }
+
+      - name: Upload and deploy exact image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          readonly target="$VPS_USER@$VPS_HOST"
+          readonly remote_incoming="/opt/next-game-crush/incoming/$GITHUB_SHA"
+          readonly key_file="$HOME/.ssh/id_ed25519"
+          readonly known_hosts_file="$HOME/.ssh/known_hosts"
+
+          ssh -i "$key_file" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$target" "install -d -m 0700 '$remote_incoming'"
+
+          scp -i "$key_file" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            compose.prod.yml deploy/deploy.sh "$target:$remote_incoming/"
+
+          ssh -i "$key_file" -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$target" bash -s -- "$remote_incoming" "$IMAGE_REF" <<'REMOTE'
+          set -Eeuo pipefail
+          readonly incoming="$1"
+          readonly image_ref="$2"
+          readonly deploy_root=/opt/next-game-crush
+
+          install -m 0644 "$incoming/compose.prod.yml" "$deploy_root/compose.prod.yml.new"
+          install -m 0755 "$incoming/deploy.sh" "$deploy_root/deploy.sh.new"
+          mv -f "$deploy_root/compose.prod.yml.new" "$deploy_root/compose.prod.yml"
+          mv -f "$deploy_root/deploy.sh.new" "$deploy_root/deploy.sh"
+          rm -f -- "$incoming/compose.prod.yml" "$incoming/deploy.sh"
+          rmdir -- "$incoming"
+          exec "$deploy_root/deploy.sh" "$image_ref"
+          REMOTE
+
+      - name: Remove SSH credentials
+        if: always()
+        shell: bash
+        run: rm -f -- "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
