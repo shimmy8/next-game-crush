@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly workflow="$repo_root/.github/workflows/deploy.yml"
+readonly makefile="$repo_root/Makefile"
 
 fail() {
   printf 'workflow_test: %s\n' "$1" >&2
@@ -226,8 +227,10 @@ assert_text_contains "$verify_job" 'go-version: .1\.27\.2.' 'verify must use Go 
 assert_text_contains "$verify_job" 'node-version: .26.' 'verify must use Node.js 26'
 assert_text_contains "$verify_job" 'pnpm@11\.25\.0' 'verify must install pnpm 11.25.0'
 assert_text_contains "$verify_job" 'pnpm --dir web install --frozen-lockfile' 'verify must install locked frontend dependencies'
-assert_text_contains "$verify_job" "GOWORK=off TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127\\.0\\.0\\.1:55432/next_game_crush_test\\?sslmode=disable' go test -json -race \\./\\.\\.\\." \
-  'verify must run all backend tests with race detection against the isolated test database'
+assert_text_contains "$verify_job" "GOWORK=off TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127\\.0\\.0\\.1:55432/next_game_crush_test\\?sslmode=disable' go test -p 1 -json -race \\./\\.\\.\\." \
+  'verify must serialize backend packages sharing the isolated test database and retain race detection'
+grep -Eq 'go test -p 1 -race \./\.\.\.' "$makefile" || \
+  fail 'make verify must serialize backend packages sharing the isolated test database'
 assert_text_contains "$verify_job" '::error title=Backend race tests failed::' \
   'backend failures must expose the failing package or test as a check annotation'
 assert_text_contains "$verify_job" 'pnpm --dir web run test' 'verify must run frontend unit tests'

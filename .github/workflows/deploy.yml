@@ -76,7 +76,7 @@ jobs:
           report="$(mktemp)"
           trap 'rm -f "$report"' EXIT
           set +e
-          GOWORK=off TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127.0.0.1:55432/next_game_crush_test?sslmode=disable' go test -json -race ./... | tee "$report"
+          GOWORK=off TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127.0.0.1:55432/next_game_crush_test?sslmode=disable' go test -p 1 -json -race ./... | tee "$report"
           test_status="${PIPESTATUS[0]}"
           set -e
           if [[ "$test_status" -ne 0 ]]; then

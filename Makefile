@@ -34,7 +34,7 @@ verify: wait-test-db
 	@set -eu; sqlc_snapshot=$$(mktemp -d); trap 'rm -rf "$$sqlc_snapshot"' EXIT; \
 		cp -R internal/store/sqlc "$$sqlc_snapshot/"; $(MAKE) sqlc; \
 		diff -ru "$$sqlc_snapshot/sqlc" internal/store/sqlc
-	TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127.0.0.1:55432/next_game_crush_test?sslmode=disable' go test -race ./...
+	TEST_DATABASE_URL='postgres://next_game_crush_test:next_game_crush_test@127.0.0.1:55432/next_game_crush_test?sslmode=disable' go test -p 1 -race ./...
 	pnpm --dir web run test
 	pnpm --dir web run typecheck
 	pnpm --dir web run lint
