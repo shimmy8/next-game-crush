@@ -36,6 +36,9 @@ type Worker struct {
 	pollInterval    time.Duration
 	leaseDuration   time.Duration
 	retryBase       time.Duration
+	retrySchedule   []time.Duration
+	retryAfterCap   time.Duration
+	retryJitter     RetryJitter
 	shutdownTimeout time.Duration
 	heartbeat       time.Duration
 	logger          *observability.Logger
@@ -56,6 +59,21 @@ func WithLeaseDuration(duration time.Duration) WorkerOption {
 
 func WithRetryBase(duration time.Duration) WorkerOption {
 	return func(worker *Worker) { worker.retryBase = duration }
+}
+
+// WithRetrySchedule selects delays by post-failure retry number instead of the
+// interactive worker's exponential backoff. The last delay is the upper bound.
+func WithRetrySchedule(delays ...time.Duration) WorkerOption {
+	schedule := append([]time.Duration(nil), delays...)
+	return func(worker *Worker) { worker.retrySchedule = schedule }
+}
+
+func WithRetryAfterCap(duration time.Duration) WorkerOption {
+	return func(worker *Worker) { worker.retryAfterCap = duration }
+}
+
+func WithRetryJitter(jitter RetryJitter) WorkerOption {
+	return func(worker *Worker) { worker.retryJitter = jitter }
 }
 
 func WithShutdownTimeout(duration time.Duration) WorkerOption {
@@ -86,6 +104,7 @@ func newWorker(queue workerQueue, lane Lane, workerID string, options ...WorkerO
 		lane: lane, queue: queue, workerID: workerID, concurrency: 1, pollInterval: 250 * time.Millisecond,
 		leaseDuration: 30 * time.Second, retryBase: time.Second, handlers: make(map[string]Handler),
 		shutdownTimeout: 10 * time.Second, heartbeat: 15 * time.Second, logger: observability.New(nil),
+		retryJitter: jitter,
 	}
 	for _, option := range options {
 		option(worker)
@@ -127,6 +146,14 @@ func (worker *Worker) Run(ctx context.Context) error {
 	}
 	if worker.pollInterval <= 0 || worker.leaseDuration <= 0 || worker.retryBase <= 0 || worker.shutdownTimeout <= 0 || worker.heartbeat <= 0 {
 		return errors.New("worker durations must be positive")
+	}
+	if worker.retryAfterCap < 0 || worker.retryJitter == nil {
+		return errors.New("worker retry policy is invalid")
+	}
+	for _, delay := range worker.retrySchedule {
+		if delay <= 0 {
+			return errors.New("worker retry schedule durations must be positive")
+		}
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -275,11 +302,7 @@ func (worker *Worker) waitForHandler(result <-chan error) {
 func (worker *Worker) failWithTimeout(ctx context.Context, lease Lease, cause error, started time.Time) error {
 	operationCtx, cancel := detachedTimeout(ctx)
 	defer cancel()
-	retryDelay := jitter(worker.backoff(lease.Attempts))
-	var providerDelay retryDelayProvider
-	if errors.As(cause, &providerDelay) && providerDelay.RetryDelay() > retryDelay {
-		retryDelay = providerDelay.RetryDelay()
-	}
+	retryDelay := worker.retryDelay(lease.Attempts, cause)
 	outcome, err := worker.queue.Fail(operationCtx, lease, cause, time.Now().Add(retryDelay))
 	if err != nil {
 		reason := persistenceReason(err)
@@ -344,6 +367,28 @@ func (worker *Worker) backoff(attempts int) time.Duration {
 		attempts--
 	}
 	return worker.retryBase * time.Duration(1<<attempts)
+}
+
+func (worker *Worker) retryDelay(attempts int, cause error) time.Duration {
+	if len(worker.retrySchedule) > 0 {
+		var hint RetryHint
+		if errors.As(cause, &hint) {
+			if delay, valid := hint.RetryAfter(); valid && delay > 0 {
+				if worker.retryAfterCap > 0 && delay > worker.retryAfterCap {
+					delay = worker.retryAfterCap
+				}
+				return delay
+			}
+		}
+		index := max(0, min(attempts-1, len(worker.retrySchedule)-1))
+		return worker.retryJitter(worker.retrySchedule[index])
+	}
+	delay := worker.retryJitter(worker.backoff(attempts))
+	var provider retryDelayProvider
+	if errors.As(cause, &provider) && provider.RetryDelay() > delay {
+		delay = provider.RetryDelay()
+	}
+	return delay
 }
 
 func jitter(delay time.Duration) time.Duration {

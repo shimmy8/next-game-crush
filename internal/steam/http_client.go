@@ -47,6 +47,18 @@ type HTTPConfig struct {
 	MinRequestInterval  time.Duration
 	MaxConcurrent       int
 	CacheValidators     map[CacheKey]CacheValidator
+	// HostThrottle is opt-in for a dedicated catalog client. Interactive
+	// clients keep their own rate and concurrency limits.
+	HostThrottle HostThrottle
+}
+
+// HostThrottle connects catalog transport to shared adaptive state. Implementors
+// own persistence and gradual recovery; the HTTP client never stores raw URLs
+// or response bodies in throttle observations.
+type HostThrottle interface {
+	Before(context.Context, string) error
+	Observe(host string, status int, retryAfter *time.Duration, err error)
+	Limit(host string) int
 }
 
 // NewHTTPClient is an explicit constructor alias for callers that name the
@@ -89,10 +101,14 @@ type HTTPClient struct {
 	validators         map[CacheKey]CacheValidator
 	now                func() time.Time
 
-	limiterMu sync.Mutex
-	lastCall  time.Time
-	cacheMu   sync.RWMutex
-	cache     map[CacheKey]CacheMetadata
+	limiterMu    sync.Mutex
+	lastCall     time.Time
+	cacheMu      sync.RWMutex
+	cache        map[CacheKey]CacheMetadata
+	hostThrottle HostThrottle
+	hostMu       sync.Mutex
+	hostActive   map[string]int
+	hostChanged  chan struct{}
 }
 
 func NewClient(cfg HTTPConfig) (*HTTPClient, error) {
@@ -171,6 +187,7 @@ func NewClient(cfg HTTPConfig) (*HTTPClient, error) {
 		retryBase: cfg.RetryBase, minRequestInterval: cfg.MinRequestInterval,
 		semaphore: make(chan struct{}, cfg.MaxConcurrent), validators: validators,
 		now: time.Now, cache: cache,
+		hostThrottle: cfg.HostThrottle, hostActive: make(map[string]int), hostChanged: make(chan struct{}),
 	}, nil
 }
 
@@ -691,8 +708,18 @@ type rawResponse struct {
 	statusCode int
 }
 
-func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.URL, requestPath string, values url.Values, useCache bool) (rawResponse, *RequestError) {
+func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.URL, requestPath string, values url.Values, useCache bool) (result rawResponse, resultErr *RequestError) {
 	operation := cacheKey.Operation
+	if c.hostThrottle != nil {
+		release, err := c.acquireHost(ctx, strings.ToLower(base.Hostname()))
+		if err != nil {
+			return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: err}
+		}
+		defer release()
+		if err := c.hostThrottle.Before(ctx, strings.ToLower(base.Hostname())); err != nil {
+			return rawResponse{}, &RequestError{Operation: operation, Temporary: true, cause: err}
+		}
+	}
 	select {
 	case c.semaphore <- struct{}{}:
 		defer func() { <-c.semaphore }()
@@ -726,6 +753,21 @@ func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.U
 		copy.Jar = nil
 		client = &copy
 	}
+	if c.hostThrottle != nil {
+		defer func() {
+			status := result.statusCode
+			var hint *time.Duration
+			var observedError error
+			if resultErr != nil {
+				status, observedError = resultErr.StatusCode, resultErr
+				if resultErr.RetryAfter > 0 {
+					delay := resultErr.RetryAfter
+					hint = &delay
+				}
+			}
+			c.hostThrottle.Observe(strings.ToLower(base.Hostname()), status, hint, observedError)
+		}()
+	}
 	response, err := client.Do(req)
 	if err != nil {
 		return rawResponse{}, &RequestError{Operation: operation, Temporary: requestCtx.Err() != nil || isTemporaryTransport(err), cause: sanitizedTransportError(err)}
@@ -750,6 +792,34 @@ func (c *HTTPClient) getOnce(ctx context.Context, cacheKey CacheKey, base *url.U
 		return rawResponse{}, &RequestError{Operation: operation, cause: ErrResponseTooLarge}
 	}
 	return rawResponse{body: body, header: response.Header.Clone(), statusCode: response.StatusCode}, nil
+}
+
+func (c *HTTPClient) acquireHost(ctx context.Context, host string) (func(), error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		limit := max(1, min(c.hostThrottle.Limit(host), cap(c.semaphore)))
+		c.hostMu.Lock()
+		if c.hostActive[host] < limit {
+			c.hostActive[host]++
+			c.hostMu.Unlock()
+			return func() {
+				c.hostMu.Lock()
+				c.hostActive[host]--
+				close(c.hostChanged)
+				c.hostChanged = make(chan struct{})
+				c.hostMu.Unlock()
+			}, nil
+		}
+		changed := c.hostChanged
+		c.hostMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
 func (c *HTTPClient) recordMetadata(key CacheKey, header http.Header, merge bool) {
