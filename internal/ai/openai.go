@@ -92,7 +92,11 @@ func (client *OpenAI) SummarizeProfile(ctx context.Context, input ProfileEvidenc
 	if err != nil {
 		return output, err
 	}
-	err = client.structured(ctx, "profile_summary_v3", profileInstructions, ProfilePromptVersion, profileSummarySchema(), normalized, &output)
+	allowedKeys := make([]string, len(normalized.Evidence))
+	for i, item := range normalized.Evidence {
+		allowedKeys[i] = item.Key
+	}
+	err = client.structured(ctx, "profile_summary_v5", profileInstructions, ProfilePromptVersion, profileSummarySchema(allowedKeys), normalized, &output)
 	if err != nil {
 		return ProfileSummary{}, err
 	}
@@ -473,7 +477,7 @@ func normalizeAndValidateProfileOutput(output ProfileSummary, allowed map[string
 	output.Summary = strings.TrimSpace(output.Summary)
 	output.Uncertainty = strings.TrimSpace(output.Uncertainty)
 	summaryLength := utf8.RuneCountInString(output.Summary)
-	if !utf8.ValidString(output.Summary) || summaryLength < 320 || summaryLength > 720 || !utf8.ValidString(output.Uncertainty) || utf8.RuneCountInString(output.Uncertainty) > 2000 {
+	if !utf8.ValidString(output.Summary) || summaryLength == 0 || summaryLength > 4000 || !utf8.ValidString(output.Uncertainty) || utf8.RuneCountInString(output.Uncertainty) > 2000 {
 		return ProfileSummary{}, fmt.Errorf("%w: invalid profile text", ErrInvalidOutput)
 	}
 	output.Preferences = normalizeProfileValues(output.Preferences, 30, 144)
@@ -588,8 +592,10 @@ func gameFeaturesSchema(allowedKeys []string) map[string]any {
 	evidenceKeys["minItems"] = 1
 	return objectSchema(map[string]any{"themes": arraySchema(stringSchema(), 20), "mechanics": arraySchema(stringSchema(), 20), "modes": arraySchema(stringSchema(), 20), "tone": arraySchema(stringSchema(), 20), "evidence_keys": evidenceKeys}, "themes", "mechanics", "modes", "tone", "evidence_keys")
 }
-func profileSummarySchema() map[string]any {
-	return objectSchema(map[string]any{"summary": stringSchema(), "preferences": arraySchema(stringSchema(), 30), "avoidances": arraySchema(stringSchema(), 30), "uncertainty": stringSchema(), "evidence_keys": arraySchema(stringSchema(), 100)}, "summary", "preferences", "avoidances", "uncertainty", "evidence_keys")
+func profileSummarySchema(allowedKeys []string) map[string]any {
+	evidenceKeys := arraySchema(map[string]any{"type": "string", "enum": append([]string(nil), allowedKeys...)}, len(allowedKeys))
+	evidenceKeys["minItems"] = 1
+	return objectSchema(map[string]any{"summary": stringSchema(), "preferences": arraySchema(stringSchema(), 30), "avoidances": arraySchema(stringSchema(), 30), "uncertainty": stringSchema(), "evidence_keys": evidenceKeys}, "summary", "preferences", "avoidances", "uncertainty", "evidence_keys")
 }
 func explanationSchema(allowedKeys []string) map[string]any {
 	evidenceKeys := arraySchema(map[string]any{"type": "string", "enum": append([]string(nil), allowedKeys...)}, len(allowedKeys))

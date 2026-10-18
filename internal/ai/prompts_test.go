@@ -39,20 +39,32 @@ func TestExplanationPromptRequiresSafeRussianPresentation(t *testing.T) {
 }
 
 func TestProfilePromptContract(t *testing.T) {
-	if ProfilePromptVersion != "profile-summary-v4-completion" {
+	if ProfilePromptVersion != "profile-summary-v5-synthesis" {
 		t.Fatalf("ProfilePromptVersion = %q", ProfilePromptVersion)
 	}
 	for _, required := range []string{
 		"Russian",
-		"400–600 Unicode characters",
+		"reader-facing synthesis",
+		"not a game-by-game inventory or data-quality audit",
+		"650–900 Unicode characters",
+		"3–5 observations",
+		"at most four distinct game names",
 		"preferences",
 		"avoidances",
 		"120 Unicode characters",
-		"recent_minutes is Steam two-week activity",
-		"completion is historical",
-		"low playtime does not weaken completion",
+		"repeated only when the same supplied feature appears in multiple evidence items",
+		"recent_minutes > 0",
+		"direct_feedback=like",
+		"wishlist-only evidence",
+		"interest in the concept",
+		"never as played experience or a confirmed preference",
+		"lifetime activity is historical",
+		"Low playtime does not weaken completion",
 		"overridden completion is not positive",
-		"unknown dates do not imply recency",
+		"unknown last_played_at does not imply recency",
+		"never invent last-played or release dates",
+		"at most one concise material caveat",
+		"detailed caveats in uncertainty",
 	} {
 		if !strings.Contains(profileInstructions, required) {
 			t.Fatalf("profile instructions do not contain %q: %q", required, profileInstructions)

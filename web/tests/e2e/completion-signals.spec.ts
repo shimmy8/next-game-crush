@@ -13,6 +13,36 @@ function sql(query: string) {
   return execFileSync('psql', [database, '-v', 'ON_ERROR_STOP=1', '-Atc', query], { encoding: 'utf8' }).trim()
 }
 
+function seedSharedSemanticFixtures() {
+  sql(`
+    INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at)
+    VALUES(gen_random_uuid(),10,'Fixture Short Story','e2e_fixture',now()),
+          (gen_random_uuid(),11,'Fixture Endless Realm','e2e_fixture',now())
+    ON CONFLICT(steam_app_id) DO NOTHING;
+    INSERT INTO catalog_discovery_observations(source,steam_app_id,last_modified,status,attempts)
+    VALUES('steam',10,'2026-10-18 10:00:00+00','released',1),
+          ('steam',11,'2026-10-18 10:00:00+00','released',1)
+    ON CONFLICT(source,steam_app_id,last_modified) DO NOTHING;
+    INSERT INTO game_features(game_id,model,input_content_hash,features,source,last_successful_fetch_at)
+    SELECT id,'gpt-6-luna','e2e-shared-semantic-fixture',
+      '{"themes":["exploration"],"mechanics":["story"],"modes":["single-player"],"tone":["hopeful"]}'::jsonb,
+      'e2e_fixture',now()
+    FROM games WHERE steam_app_id IN (10,11,2087540)
+    ON CONFLICT(game_id,model) DO UPDATE SET input_content_hash=EXCLUDED.input_content_hash,
+      features=EXCLUDED.features,source=EXCLUDED.source,last_successful_fetch_at=EXCLUDED.last_successful_fetch_at;
+    INSERT INTO game_embeddings(game_id,model,input_content_hash,embedding,source,last_successful_fetch_at)
+    SELECT id,'text-embedding-3-small','e2e-shared-semantic-fixture',
+      array_prepend(1::real,array_fill(0::real,ARRAY[1535]))::vector(1536),'e2e_fixture',now()
+    FROM games WHERE steam_app_id IN (10,11,2087540)
+    ON CONFLICT(game_id,model) DO UPDATE SET input_content_hash=EXCLUDED.input_content_hash,
+      embedding=EXCLUDED.embedding,source=EXCLUDED.source,last_successful_fetch_at=EXCLUDED.last_successful_fetch_at;
+  `)
+  return sql(`SELECT count(*) FROM games g
+    JOIN game_features f ON f.game_id=g.id AND f.model='gpt-6-luna'
+    JOIN game_embeddings e ON e.game_id=g.id AND e.model='text-embedding-3-small'
+    WHERE g.steam_app_id IN (10,11,2087540)`)
+}
+
 function recommendations(overview: RecommendationOverview) {
   return [overview.discoveries.featured, ...overview.discoveries.items, ...overview.wishlist.items]
     .filter((item): item is Recommendation => item !== null)
@@ -63,17 +93,32 @@ test('lexical ending and historical hundred percent work with OpenAI disabled', 
   test.skip(!openAIDisabled, 'disabled-provider scenario')
   expect((await request.post(`${fake}/__test/reset`)).status()).toBe(204)
   expect((await request.post(`${fake}/__test/openai-achievement-mode?mode=hundred_percent`)).status()).toBe(204)
+  expect(seedSharedSemanticFixtures()).toBe('3')
   await resetAndSync(page, request, 2, false)
 
+  expect(sql(`SELECT count(*) FROM games g
+    JOIN game_features f ON f.game_id=g.id AND f.model='gpt-6-luna'
+      AND f.input_content_hash='e2e-shared-semantic-fixture' AND f.source='e2e_fixture'
+    JOIN game_embeddings e ON e.game_id=g.id AND e.model='text-embedding-3-small'
+      AND e.input_content_hash='e2e-shared-semantic-fixture' AND e.source='e2e_fixture'
+    WHERE g.steam_app_id IN (10,11,2087540)`)).toBe('3')
+  expect(sql(`SELECT
+    (SELECT count(*) FROM catalog_entries entry JOIN games g ON g.id=entry.game_id WHERE g.steam_app_id IN (10,11))::text||'|'||
+    (SELECT count(*) FROM catalog_entry_sources source JOIN games g ON g.id=source.game_id WHERE g.steam_app_id IN (10,11) AND source.active)::text`)).toBe('0|0')
   expect(sql(`SELECT string_agg(classification_source||':'||class,',' ORDER BY classification_source,class) FROM achievement_semantic_classifications classification JOIN games ON games.id=classification.game_id WHERE games.steam_app_id=10`)).toContain('lexical:base_game_ending')
   expect(sql(`SELECT count(*) FROM achievement_semantic_classifications classification JOIN games ON games.id=classification.game_id WHERE games.steam_app_id=10 AND classification_source='unknown' AND class='unknown'`)).not.toBe('0')
   expect(sql(`SELECT weight::text||'|'||basis FROM user_game_completion_projections projection JOIN games ON games.id=projection.game_id WHERE games.steam_app_id=10`)).toBe('1.5|ending')
   expect(sql(`SELECT weight::text||'|'||basis FROM user_game_completion_projections projection JOIN games ON games.id=projection.game_id WHERE games.steam_app_id=11`)).toBe('1.5|hundred_percent')
 
   const overview = await (await page.request.get(`${api}/api/recommendations/overview`)).json() as RecommendationOverview
-  const completionEvidence = recommendations(overview).flatMap((item) => item.evidence).filter((item) => item.kind === 'completion_anchor')
-  expect(completionEvidence.some((item) => item.text.includes('Есть сходство с пройденной вами игрой Fixture'))).toBeTruthy()
-  await expect(page.getByText(/Есть сходство с пройденной вами игрой Fixture/).first()).toBeVisible()
+  const groundedCandidate = recommendations(overview).find((item) => item.steamAppId === 2087540)
+  expect(groundedCandidate).toBeDefined()
+  expect(groundedCandidate!.evidence).toContainEqual({
+    id: 'completion-anchor-1',
+    kind: 'completion_anchor',
+    text: 'Есть сходство с пройденной вами игрой Fixture Endless Realm.',
+  })
+  await expect(page.getByText('Есть сходство с пройденной вами игрой Fixture Endless Realm.').first()).toBeVisible()
   await expect(page.getByRole('button', { name: 'Синхронизировать' })).toBeVisible()
 
   const visible = await page.locator('body').innerText()

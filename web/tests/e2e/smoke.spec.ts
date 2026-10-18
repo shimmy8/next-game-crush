@@ -54,22 +54,23 @@ test('complete fixture-authenticated product loop', async ({ page, request }) =>
   expect(blockedJobs.filter((job) => job.kind === 'steam.sync')).toHaveLength(0)
 
   expect((await request.post(`${fake}/__test/steam-privacy?mode=public`)).status()).toBe(204)
+  const syncResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST' && new URL(response.url()).pathname === '/api/sync')
   await page.getByRole('button', { name: 'Проверить снова' }).click()
+  const syncResponse = await syncResponsePromise
+  expect(syncResponse.status()).toBe(202)
+  const { jobId } = await syncResponse.json() as { jobId: string }
   await expect(page.getByText('Fixture Player')).toBeVisible()
-  await expect(page.getByText(/В вашей истории заметен устойчивый интерес к исследованию/).first()).toBeVisible({ timeout: 90_000 })
+  await expect(page.getByText(/Fixture Short Story — сильный исторический сигнал/).first()).toBeVisible({ timeout: 90_000 })
   const successfulPreflight = syncRequests.lastIndexOf('/api/sync/preflight')
   const browserStart = syncRequests.lastIndexOf('/api/sync')
   expect(successfulPreflight).toBeGreaterThanOrEqual(0)
   expect(browserStart).toBeGreaterThan(successfulPreflight)
 
-  const jobs = await (await page.request.get(`${api}/api/jobs`)).json() as Array<{ id: string; kind: string }>
-  const first = jobs.find((job) => job.kind === 'steam.sync')
-  expect(first).toBeTruthy()
   await expect.poll(async () => {
-    const status = await page.request.get(`${api}/api/sync/${first!.id}`)
+    const status = await page.request.get(`${api}/api/sync/${jobId}`)
     return (await status.json() as { status: string }).status
   }, { timeout: 90_000 }).toBe('succeeded')
-  const firstStatus = await (await page.request.get(`${api}/api/sync/${first!.id}`)).json() as { stages: Array<{ kind: string; stage: string; status: string }> }
+  const firstStatus = await (await page.request.get(`${api}/api/sync/${jobId}`)).json() as { stages: Array<{ kind: string; stage: string; status: string }> }
   expect(firstStatus.stages.some((stage) => /achievement/i.test(`${stage.kind} ${stage.stage}`) && stage.status === 'succeeded')).toBeTruthy()
   const firstCalendar = await (await page.request.get(`${api}/api/calendar`)).json() as Record<string, CalendarItem[] | null>
 

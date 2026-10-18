@@ -165,7 +165,7 @@ func TestEmbedRequestsAndRequiresExactly1536Dimensions(t *testing.T) {
 }
 
 func TestProfileExplanationAndFeedbackStructuredOperations(t *testing.T) {
-	profileText := strings.Repeat("я", 400)
+	profileText := strings.Repeat("я", 650)
 	profileServer := responseServer(fmt.Sprintf(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"summary\":\"%s\",\"preferences\":[\"puzzles\"],\"avoidances\":[],\"uncertainty\":\"small sample\",\"evidence_keys\":[\"signal-1\"]}"}]}]}`, profileText))
 	profileClient := newTestClient(t, profileServer)
 	profile, err := profileClient.BuildProfileSummary(context.Background(), ProfileEvidence{EvidenceKey: "profile", Evidence: []EvidenceItem{{Key: "signal-1", Value: "Portal; high playtime"}}})
@@ -188,6 +188,49 @@ func TestProfileExplanationAndFeedbackStructuredOperations(t *testing.T) {
 	feedbackServer.Close()
 	if err != nil || classification.Actionable {
 		t.Fatalf("classification=%#v error=%v", classification, err)
+	}
+}
+
+func TestProfileSummaryUsesV5StrictSchemaWithOnlySuppliedCitationKeys(t *testing.T) {
+	var request map[string]any
+	profileText := strings.Repeat("я", 650)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = fmt.Fprintf(w, `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"summary\":\"%s\",\"preferences\":[],\"avoidances\":[],\"uncertainty\":\"\",\"evidence_keys\":[\"signal-001\"]}"}]}]}`, profileText)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server)
+	_, err := client.SummarizeProfile(context.Background(), ProfileEvidence{
+		EvidenceKey: "profile",
+		Evidence: []EvidenceItem{
+			{Key: "signal-002", Value: "second-value-canary"},
+			{Key: "signal-001", Value: "first-value-canary"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	format := request["text"].(map[string]any)["format"].(map[string]any)
+	if format["name"] != "profile_summary_v5" || format["strict"] != true {
+		t.Fatalf("format = %#v", format)
+	}
+	schema := format["schema"].(map[string]any)
+	properties := schema["properties"].(map[string]any)
+	evidenceKeys := properties["evidence_keys"].(map[string]any)
+	items := evidenceKeys["items"].(map[string]any)
+	if got := items["enum"]; !reflect.DeepEqual(got, []any{"signal-001", "signal-002"}) {
+		t.Fatalf("citation enum = %#v", got)
+	}
+	if evidenceKeys["minItems"] != float64(1) || evidenceKeys["maxItems"] != float64(2) {
+		t.Fatalf("citation constraints = %#v", evidenceKeys)
+	}
+	encodedSchema, _ := json.Marshal(schema)
+	if strings.Contains(string(encodedSchema), "first-value-canary") || strings.Contains(string(encodedSchema), "second-value-canary") {
+		t.Fatalf("evidence value leaked into schema: %s", encodedSchema)
 	}
 }
 
@@ -238,16 +281,18 @@ func TestProfileSummaryUsesUnicodeLengthBoundaries(t *testing.T) {
 	allowed := map[string]struct{}{"signal-1": {}}
 	for _, test := range []struct {
 		name    string
-		length  int
+		summary string
 		wantErr bool
 	}{
-		{name: "below lower bound", length: 319, wantErr: true},
-		{name: "lower bound", length: 320},
-		{name: "upper bound", length: 720},
-		{name: "above upper bound", length: 721, wantErr: true},
+		{name: "empty", summary: "", wantErr: true},
+		{name: "whitespace", summary: " \n\t ", wantErr: true},
+		{name: "invalid UTF-8", summary: string([]byte{0xff}), wantErr: true},
+		{name: "one rune", summary: "я"},
+		{name: "upper sanity bound", summary: strings.Repeat("я", 4000)},
+		{name: "above sanity bound", summary: strings.Repeat("я", 4001), wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			output := ProfileSummary{Summary: strings.Repeat("я", test.length), Preferences: []string{}, Avoidances: []string{}, EvidenceKeys: []string{"signal-1"}}
+			output := ProfileSummary{Summary: test.summary, Preferences: []string{}, Avoidances: []string{}, EvidenceKeys: []string{"signal-1"}}
 			_, err := normalizeAndValidateProfileOutput(output, allowed)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("error = %v, wantErr = %v", err, test.wantErr)
@@ -258,7 +303,7 @@ func TestProfileSummaryUsesUnicodeLengthBoundaries(t *testing.T) {
 
 func TestProfileSummaryNormalizesOptionalArraysWithoutFailing(t *testing.T) {
 	output, err := normalizeAndValidateProfileOutput(ProfileSummary{
-		Summary: strings.Repeat("я", 400),
+		Summary: strings.Repeat("я", 650),
 		Preferences: []string{
 			"  головоломки  ",
 			"",
@@ -292,10 +337,11 @@ func TestProfileSummaryStillRejectsUnknownEvidence(t *testing.T) {
 	}{
 		{name: "unknown", keys: []string{"made-up"}},
 		{name: "duplicate", keys: []string{"signal-1", "signal-1"}},
+		{name: "empty", keys: []string{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := normalizeAndValidateProfileOutput(ProfileSummary{
-				Summary:      strings.Repeat("я", 400),
+				Summary:      strings.Repeat("я", 650),
 				Preferences:  []string{},
 				Avoidances:   []string{},
 				EvidenceKeys: test.keys,
@@ -304,6 +350,19 @@ func TestProfileSummaryStillRejectsUnknownEvidence(t *testing.T) {
 				t.Fatalf("error = %v", err)
 			}
 		})
+	}
+}
+
+func TestProfileSummarySchemaAllowsOnlySuppliedCitationKeys(t *testing.T) {
+	schema := profileSummarySchema([]string{"signal-002", "signal-001"})
+	properties := schema["properties"].(map[string]any)
+	evidenceKeys := properties["evidence_keys"].(map[string]any)
+	items := evidenceKeys["items"].(map[string]any)
+	if got := items["enum"]; !reflect.DeepEqual(got, []string{"signal-002", "signal-001"}) {
+		t.Fatalf("citation enum = %#v", got)
+	}
+	if evidenceKeys["minItems"] != 1 || evidenceKeys["maxItems"] != 2 {
+		t.Fatalf("citation constraints = %#v", evidenceKeys)
 	}
 }
 

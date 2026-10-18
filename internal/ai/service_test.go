@@ -250,7 +250,7 @@ func TestNonFiniteEmbeddingIsNeverPersisted(t *testing.T) {
 func TestProfileSummaryIsNormalizedBeforePersistence(t *testing.T) {
 	repository := &fakeRepository{profileEvidence: ProfileEvidence{EvidenceKey: "profile", Evidence: []EvidenceItem{{Key: "signal-1", Value: "puzzles"}}}}
 	client := &fakeClient{profileSummary: ProfileSummary{
-		Summary:      "  " + strings.Repeat("я", 400) + "  ",
+		Summary:      "  " + strings.Repeat("я", 650) + "  ",
 		Preferences:  []string{" puzzles ", "", "puzzles", strings.Repeat("я", 145)},
 		Avoidances:   nil,
 		Uncertainty:  "  мало данных  ",
@@ -263,7 +263,7 @@ func TestProfileSummaryIsNormalizedBeforePersistence(t *testing.T) {
 	if !repository.savedProfileSummary {
 		t.Fatal("profile summary was not persisted")
 	}
-	if repository.profileSummary.Summary != strings.Repeat("я", 400) {
+	if repository.profileSummary.Summary != strings.Repeat("я", 650) {
 		t.Fatalf("summary was not trimmed before persistence")
 	}
 	if !reflect.DeepEqual(repository.profileSummary.Preferences, []string{"puzzles"}) {

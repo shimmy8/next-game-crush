@@ -305,7 +305,7 @@ func main() {
 		switch name {
 		case "game_features_v1":
 			out = map[string]any{"themes": []string{"exploration"}, "mechanics": []string{"cooperation"}, "modes": []string{"single-player"}, "tone": []string{"hopeful"}, "evidence_keys": []string{key}}
-		case "profile_summary_v3":
+		case "profile_summary_v5":
 			out = map[string]any{"summary": "Fixture Short Story — сильный исторический сигнал: игра пройдена, хотя времени в ней немного и недавней активности нет. Fixture Endless Realm отражает большой накопленный опыт и отдельную активность за последние две недели. Эти признаки учитываются независимо: прохождение короткой игры не слабее одних только часов в долгой игре. Данных пока немного, поэтому новые реакции помогут точнее определить темы и темп.", "preferences": []string{"Завершённые сюжетные игры и исследование"}, "avoidances": []string{}, "uncertainty": "Историческое прохождение не означает недавний интерес.", "evidence_keys": []string{key}}
 		case "recommendation-explanation-v2":
 			switch explanationMode.Load() {
