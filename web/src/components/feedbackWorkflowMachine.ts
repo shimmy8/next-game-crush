@@ -13,7 +13,7 @@ export type FeedbackWorkflowRecord = {
 export type FeedbackWorkflowState = Record<string, FeedbackWorkflowRecord>
 export type PublicFeedbackWorkflowState = {
   phase: FeedbackWorkflowPhase | 'idle'; accepted: boolean; diff: RankingDiff | null; error: string
-  canRetry: boolean; busy: boolean; tombstoned: boolean
+  canRetry: boolean; busy: boolean; tombstoned: boolean; action: FeedbackAction | null; likeEffectActive: boolean; likeEffectStartedAt: number | null; likeEffectAnimationDelayMs: number
 }
 export type FeedbackWorkflowEvent =
   | { type: 'acquired'; record: FeedbackWorkflowRecord }

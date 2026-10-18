@@ -20,7 +20,7 @@ export type FeedbackWorkflowContextValue = {
   isTombstoned(gameId: string): boolean
 }
 
-const idle: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, diff: null, error: '', canRetry: false, busy: false, tombstoned: false }
+const idle: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, diff: null, error: '', canRetry: false, busy: false, tombstoned: false, action: null, likeEffectActive: false, likeEffectStartedAt: null, likeEffectAnimationDelayMs: 0 }
 const legacyConsumerFallback: FeedbackWorkflowContextValue = { stateFor: () => idle, submit: async () => undefined, retry: () => undefined, isBusy: () => false, isTombstoned: () => false }
 export const FeedbackWorkflowContext = createContext<FeedbackWorkflowContextValue | undefined>(undefined)
 

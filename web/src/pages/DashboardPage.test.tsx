@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DashboardPage from './DashboardPage'
 import type { CurrentUser, RecommendationOverview } from '../api/types'
@@ -19,6 +19,10 @@ function show(overview: RecommendationOverview) {
   render(<DashboardPage user={user} signingOut={false} onLogout={() => undefined} initialState={{ status: 'ready', data: { profile: profileFixture(), overview } }} />)
 }
 
+function finishVerdictAnimation(element: HTMLElement) {
+  fireEvent.animationEnd(element.querySelector('.verdict-fracture__half') ?? element)
+}
+
 it('shows demo banner and intercepts visible mutation controls', () => {
   const demoUser: CurrentUser = { authenticated: true, accessMode: 'demo', csrfToken: 'csrf', expiresAt: '2026-10-18T00:00:00Z' }
   const fetchMock = vi.mocked(fetch)
@@ -30,7 +34,7 @@ it('shows demo banner and intercepts visible mutation controls', () => {
 })
 
 describe('DashboardPage collections', () => {
-	it('removes an accepted dislike from dashboard and calendar while its rebuild is pending', async () => {
+	it('animates an accepted dislike before promoting a fresh featured card with a closed form', async () => {
 		const overview = overviewFixture(2, 0)
 		const targetGameId = overview.discoveries.featured!.gameId
 		const freshOverview = applyFeedbackTombstones(overview, new Set([targetGameId]))
@@ -46,11 +50,154 @@ describe('DashboardPage collections', () => {
 		const hero = screen.getByRole('region', { name: 'Новая находка для вас' })
 		fireEvent.click(within(hero).getByRole('button', { name: 'Не моё' }))
 		fireEvent.click(within(hero).getByRole('button', { name: 'Сохранить отзыв' }))
-		await waitFor(() => expect(screen.queryByRole('heading', { name: 'Discovery 1' })).not.toBeInTheDocument())
-		expect(screen.getByRole('heading', { name: 'Discovery 2' })).toBeInTheDocument()
+		const exiting = await within(hero).findByRole('article')
+		expect(exiting).toHaveClass('recommendation-card--disliked')
+		expect(exiting).toHaveTextContent('Discovery 1')
+		expect(within(hero).queryByRole('heading', { name: 'Discovery 1' })).not.toBeInTheDocument()
+		expect(within(hero).queryByLabelText('Комментарий')).not.toBeInTheDocument()
+		const calendar = document.querySelector<HTMLElement>('.calendar-section')!
+		expect(within(calendar).queryByText('Discovery 1')).not.toBeInTheDocument()
+		expect(screen.getByText('Всего новых игр: 1')).toBeInTheDocument()
+		finishVerdictAnimation(exiting)
+		await waitFor(() => expect(screen.getByRole('heading', { name: 'Discovery 2' })).toBeInTheDocument())
+		expect(within(hero).queryByLabelText('Комментарий')).not.toBeInTheDocument()
+		expect(within(hero).queryByRole('button', { name: 'Сохранить отзыв' })).not.toBeInTheDocument()
 		await waitFor(() => expect(finishDiff).toBeTypeOf('function'))
 		finishDiff(new Response(JSON.stringify({ rebuildStatus: 'succeeded', previousVersion: 1, currentVersion: 2, added: [], removed: ['r'], reordered: [] })))
 		await waitFor(() => expect(screen.getByText(/Рекомендации обновлены · версия 2/)).toBeInTheDocument())
+	})
+
+	it('shows a one-shot positive verdict glow without removing the card', async () => {
+		const overview = overviewFixture(1, 0)
+		vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.method === 'POST' && String(input).includes('/feedback')) return new Response(JSON.stringify({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 }))
+			if (String(input).includes('/diff?')) return new Promise<Response>(() => undefined)
+			return new Response(null, { status: 204 })
+		}))
+		show(overview)
+		const hero = screen.getByRole('region', { name: 'Новая находка для вас' })
+		fireEvent.click(within(hero).getByRole('button', { name: 'Нравится' }))
+		fireEvent.click(within(hero).getByRole('button', { name: 'Сохранить отзыв' }))
+		await waitFor(() => expect(within(hero).getByRole('article')).toHaveClass('recommendation-card--liked'))
+		expect(within(hero).getByRole('heading', { name: 'Discovery 1' })).toBeInTheDocument()
+	})
+
+	it('keeps the rejected featured snapshot through an immediate successful reload', async () => {
+		const overview = overviewFixture(2, 0)
+		const targetGameId = overview.discoveries.featured!.gameId
+		const freshOverview = applyFeedbackTombstones(overview, new Set([targetGameId]))
+		vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.method === 'POST' && String(input).includes('/feedback')) return new Response(JSON.stringify({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 }))
+			if (String(input).includes('/diff?')) return new Response(JSON.stringify({ rebuildStatus: 'succeeded', previousVersion: 1, currentVersion: 2, added: [], removed: ['r'], reordered: [] }))
+			if (String(input) === '/api/profile') return new Response(JSON.stringify(profileFixture()))
+			if (String(input) === '/api/recommendations/overview') return new Response(JSON.stringify(freshOverview))
+			return new Response(null, { status: 204 })
+		}))
+		show(overview)
+		const hero = screen.getByRole('region', { name: 'Новая находка для вас' })
+		fireEvent.click(within(hero).getByRole('button', { name: 'Не моё' }))
+		fireEvent.click(within(hero).getByRole('button', { name: 'Сохранить отзыв' }))
+		const exiting = await waitFor(() => {
+			const card = within(hero).getByRole('article')
+			expect(card).toHaveClass('recommendation-card--disliked')
+			return card
+		})
+		await screen.findByText(/Рекомендации обновлены · версия 2/)
+		expect(exiting).toHaveTextContent('Discovery 1')
+		expect(within(hero).queryByText('Discovery 2')).not.toBeInTheDocument()
+		finishVerdictAnimation(exiting)
+		await waitFor(() => expect(within(hero).getByRole('heading', { name: 'Discovery 2' })).toBeInTheDocument())
+	})
+
+	it('keeps the next featured candidate and its draft in the secondary lane until hero exit finishes', async () => {
+		const overview = overviewFixture(3, 0)
+		vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.method === 'POST' && String(input).includes('/feedback')) return new Response(JSON.stringify({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 }))
+			if (String(input).includes('/diff?')) return new Promise<Response>(() => undefined)
+			return new Response(null, { status: 204 })
+		}))
+		show(overview)
+		const hero = screen.getByRole('region', { name: 'Новая находка для вас' })
+		const more = screen.getByRole('region', { name: 'Ещё новые игры' })
+		const candidate = within(more).getByRole('heading', { name: 'Discovery 2' }).closest('article')!
+		fireEvent.click(within(candidate).getByRole('button', { name: 'Нравится' }))
+		fireEvent.change(within(candidate).getByLabelText('Комментарий'), { target: { value: 'Сохранить этот черновик' } })
+
+		fireEvent.click(within(hero).getByRole('button', { name: 'Не моё' }))
+		fireEvent.click(within(hero).getByRole('button', { name: 'Сохранить отзыв' }))
+		const exiting = await waitFor(() => {
+			const card = within(hero).getByRole('article')
+			expect(card).toHaveClass('recommendation-card--disliked')
+			return card
+		})
+
+		expect(within(more).getByRole('heading', { name: 'Discovery 2' })).toBeInTheDocument()
+		expect(within(more).getByLabelText('Комментарий')).toHaveValue('Сохранить этот черновик')
+		finishVerdictAnimation(exiting)
+		await waitFor(() => expect(within(hero).getByRole('heading', { name: 'Discovery 2' })).toBeInTheDocument())
+		expect(within(more).queryByRole('heading', { name: 'Discovery 2' })).not.toBeInTheDocument()
+		expect(within(hero).queryByLabelText('Комментарий')).not.toBeInTheDocument()
+	})
+
+	it('does not restore a completed tombstoned secondary card as the held featured successor', async () => {
+		const overview = overviewFixture(3, 0)
+		vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.method === 'POST' && String(input).includes('/feedback')) return new Response(JSON.stringify({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 }))
+			if (String(input).includes('/diff?')) return new Promise<Response>(() => undefined)
+			return new Response(null, { status: 204 })
+		}))
+		show(overview)
+		const hero = screen.getByRole('region', { name: 'Новая находка для вас' })
+		const more = screen.getByRole('region', { name: 'Ещё новые игры' })
+		const secondary = within(more).getByRole('heading', { name: 'Discovery 2' }).closest('article')!
+		fireEvent.click(within(secondary).getByRole('button', { name: 'Не моё' }))
+		fireEvent.click(within(secondary).getByRole('button', { name: 'Сохранить отзыв' }))
+		await waitFor(() => expect(secondary).toHaveClass('recommendation-card--disliked'))
+		finishVerdictAnimation(secondary)
+		await waitFor(() => expect(within(more).queryByText('Discovery 2')).not.toBeInTheDocument())
+		expect(within(more).getByRole('heading', { name: 'Discovery 3' })).toBeInTheDocument()
+
+		fireEvent.click(within(hero).getByRole('button', { name: 'Не моё' }))
+		fireEvent.click(within(hero).getByRole('button', { name: 'Сохранить отзыв' }))
+		await waitFor(() => expect(within(hero).getByRole('article')).toHaveClass('recommendation-card--disliked'))
+
+		expect(within(more).queryByText('Discovery 2')).not.toBeInTheDocument()
+		expect(within(more).getByRole('heading', { name: 'Discovery 3' })).toBeInTheDocument()
+	})
+
+	it('skips the dislike exit wait when reduced motion is preferred', async () => {
+		vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }))
+		const overview = overviewFixture(2, 0)
+		vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.method === 'POST' && String(input).includes('/feedback')) return new Response(JSON.stringify({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 }))
+			if (String(input).includes('/diff?')) return new Promise<Response>(() => undefined)
+			return new Response(null, { status: 204 })
+		}))
+		show(overview)
+		const hero = screen.getByRole('region', { name: 'Новая находка для вас' })
+		fireEvent.click(within(hero).getByRole('button', { name: 'Не моё' }))
+		fireEvent.click(within(hero).getByRole('button', { name: 'Сохранить отзыв' }))
+		await waitFor(() => expect(within(hero).getByRole('heading', { name: 'Discovery 2' })).toBeInTheDocument())
+		expect(within(hero).getByRole('article')).not.toHaveClass('recommendation-card--disliked')
+	})
+
+	it('finishes a pending dislike exit when reduced motion is enabled', async () => {
+		let onChange: ((event: { matches: boolean }) => void) | undefined
+		vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false, addEventListener: (_type: string, listener: (event: { matches: boolean }) => void) => { onChange = listener }, removeEventListener: vi.fn() }))
+		const overview = overviewFixture(2, 0)
+		vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (init?.method === 'POST' && String(input).includes('/feedback')) return new Response(JSON.stringify({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 }))
+			if (String(input).includes('/diff?')) return new Promise<Response>(() => undefined)
+			return new Response(null, { status: 204 })
+		}))
+		show(overview)
+		const hero = screen.getByRole('region', { name: 'Новая находка для вас' })
+		fireEvent.click(within(hero).getByRole('button', { name: 'Не моё' }))
+		fireEvent.click(within(hero).getByRole('button', { name: 'Сохранить отзыв' }))
+		await waitFor(() => expect(within(hero).getByRole('article')).toHaveClass('recommendation-card--disliked'))
+		expect(onChange).toBeTypeOf('function')
+		act(() => onChange?.({ matches: true }))
+		expect(within(hero).getByRole('heading', { name: 'Discovery 2' })).toBeInTheDocument()
 	})
 
 	it('serializes reactions for the same game across dashboard and calendar surfaces', async () => {

@@ -16,7 +16,8 @@ export type FeedbackWorkflowProviderProps = {
   wait?: typeof waitForRanking
 }
 
-const idle: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, diff: null, error: '', canRetry: false, busy: false, tombstoned: false }
+const likeEffectMs = 720
+const idle: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, diff: null, error: '', canRetry: false, busy: false, tombstoned: false, action: null, likeEffectActive: false, likeEffectStartedAt: null, likeEffectAnimationDelayMs: 0 }
 
 export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingUpdated, children, submitFeedback = apiSubmitFeedback, readRankingDiff = getRankingDiff, wait = waitForRanking }: FeedbackWorkflowProviderProps) {
   const [records, setRecords] = useState<FeedbackWorkflowState>({})
@@ -24,6 +25,8 @@ export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingU
   const registry = useRef(createFeedbackWorkflowRegistry())
   const controllers = useRef(new Map<string, AbortController>())
   const tombstones = useRef(new Set<string>())
+  const likeEffectDeadlines = useRef(new Map<string, number>())
+  const likeEffectTimers = useRef(new Map<string, number>())
   const [revision, setRevision] = useState(0)
   const mounted = useRef(true)
   const callbacks = useRef({ reload, onRankingUpdated })
@@ -79,6 +82,16 @@ export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingU
       if (controller.signal.aborted || !mounted.current) return
       const acceptedRecord = { ...record, accepted, phase: 'polling' as const, tombstoned: command.action === 'dislike' }
       if (command.action === 'dislike') tombstones.current.add(intent.gameId)
+      if (command.action === 'like') {
+        const previousTimer = likeEffectTimers.current.get(intent.gameId)
+        if (previousTimer !== undefined) window.clearTimeout(previousTimer)
+        likeEffectDeadlines.current.set(intent.gameId, Date.now() + likeEffectMs)
+        likeEffectTimers.current.set(intent.gameId, window.setTimeout(() => {
+          likeEffectTimers.current.delete(intent.gameId)
+          likeEffectDeadlines.current.delete(intent.gameId)
+          if (mounted.current) setRevision((value) => value + 1)
+        }, likeEffectMs))
+      }
       dispatch({ type: 'accepted', gameId: intent.gameId, accepted }); setRevision((value) => value + 1)
       void poll(intent.gameId, acceptedRecord, controller)
     } catch {
@@ -100,14 +113,21 @@ export default function FeedbackWorkflowProvider({ csrfToken, reload, onRankingU
   useEffect(() => {
     mounted.current = true
     const activeControllers = controllers.current
-    return () => { mounted.current = false; activeControllers.forEach((controller) => controller.abort()); recordsRef.current = feedbackWorkflowReducer(recordsRef.current, { type: 'teardown' }) }
+    const activeLikeTimers = likeEffectTimers.current
+    const activeLikeDeadlines = likeEffectDeadlines.current
+    return () => { mounted.current = false; activeControllers.forEach((controller) => controller.abort()); activeLikeTimers.forEach((timer) => window.clearTimeout(timer)); activeLikeTimers.clear(); activeLikeDeadlines.clear(); recordsRef.current = feedbackWorkflowReducer(recordsRef.current, { type: 'teardown' }) }
   }, [])
 
   const stateFor = useCallback((gameId: string): PublicFeedbackWorkflowState => {
     void revision
     const record = records[gameId]
-    if (!record) return tombstones.current.has(gameId) ? { ...idle, tombstoned: true } : idle
-    return { phase: record.phase, accepted: Boolean(record.accepted), diff: record.diff, error: record.error ? feedbackErrorCopy(record.error) : '', canRetry: record.phase === 'polling_unavailable' || record.phase === 'rebuild_dead' || record.phase === 'stale_unconfirmed', busy: true, tombstoned: tombstones.current.has(gameId) || record.tombstoned }
+    const now = Date.now()
+    const likeEffectDeadline = likeEffectDeadlines.current.get(gameId) ?? 0
+    const likeEffectActive = likeEffectDeadline > now
+    const likeEffectStartedAt = likeEffectActive ? likeEffectDeadline - likeEffectMs : null
+    const likeEffectAnimationDelayMs = likeEffectStartedAt === null ? 0 : -Math.max(0, now - likeEffectStartedAt)
+    if (!record) return tombstones.current.has(gameId) ? { ...idle, tombstoned: true, action: 'dislike', likeEffectActive, likeEffectStartedAt, likeEffectAnimationDelayMs } : { ...idle, likeEffectActive, likeEffectStartedAt, likeEffectAnimationDelayMs }
+    return { phase: record.phase, accepted: Boolean(record.accepted), diff: record.diff, error: record.error ? feedbackErrorCopy(record.error) : '', canRetry: record.phase === 'polling_unavailable' || record.phase === 'rebuild_dead' || record.phase === 'stale_unconfirmed', busy: true, tombstoned: tombstones.current.has(gameId) || record.tombstoned, action: record.accepted ? record.command.action : null, likeEffectActive, likeEffectStartedAt, likeEffectAnimationDelayMs }
   }, [records, revision])
   const value = useMemo<FeedbackWorkflowContextValue>(() => ({ stateFor, submit, retry, isBusy: (gameId) => Boolean(records[gameId]), isTombstoned: (gameId) => tombstones.current.has(gameId) }), [records, retry, stateFor, submit])
   const statusIds = Object.keys(records)

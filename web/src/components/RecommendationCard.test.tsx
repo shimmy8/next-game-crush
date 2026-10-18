@@ -2,10 +2,44 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import RecommendationCard, { releaseLabel } from './RecommendationCard'
 import type { Recommendation } from '../api/types'
+import { FeedbackWorkflowContext } from './FeedbackWorkflowContext'
+import type { PublicFeedbackWorkflowState } from './feedbackWorkflowMachine'
 
 const item = { id: 'r', gameId: 'g', steamAppId: 480, name: 'Signal', coverImageUrl: 'https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/480/header.jpg', storeUrl: 'https://store.steampowered.com/app/480/', deckCompatibility: 'unknown', profileVersion: 1, rankingVersion: 1, algorithmVersion: 'v1', score: 80, confidence: .8, factors: {}, weights: {}, release: { precision: 'unknown' }, explanation: 'Почему', evidence: [], explanationSource: 'ai', generatedExplanation: true, latestFeedbackAction: null, latestFeedbackReasons: null, createdAt: '2026-10-17T00:00:00Z' } as Recommendation
 
 describe('RecommendationCard', () => {
+	it('renders two inert visual card halves without duplicate accessible controls during dislike exit', () => {
+		const workflow = {
+			stateFor: () => ({ phase: 'polling' as const, accepted: true, diff: null, error: '', canRetry: false, busy: true, tombstoned: true, action: 'dislike' as const, likeEffectActive: true, likeEffectStartedAt: Date.now() - 320, likeEffectAnimationDelayMs: -320 }),
+			submit: async () => undefined, retry: () => undefined, isBusy: () => true, isTombstoned: () => true,
+		}
+		const { container } = render(<FeedbackWorkflowContext.Provider value={workflow}><RecommendationCard item={item} feedbackEnabled /></FeedbackWorkflowContext.Provider>)
+		const card = container.querySelector('.recommendation-card')!
+		expect(card).toHaveClass('recommendation-card--disliked')
+		expect(card).not.toHaveClass('recommendation-card--liked')
+		expect(card).not.toHaveStyle({ animationDelay: '-320ms' })
+		const halves = container.querySelectorAll('.verdict-fracture__half')
+		expect(halves).toHaveLength(2)
+		for (const half of halves) { expect(half).toHaveAttribute('aria-hidden', 'true'); expect(half).toHaveAttribute('inert') }
+		expect(screen.queryByRole('link', { name: 'Открыть в Steam' })).not.toBeInTheDocument()
+		expect(screen.queryByRole('button')).not.toBeInTheDocument()
+	})
+
+	it('reflects the provider-owned like effect across card replacement', () => {
+		let state: PublicFeedbackWorkflowState = { phase: 'idle', accepted: false, diff: null, error: '', canRetry: false, busy: false, tombstoned: false, action: null, likeEffectActive: false, likeEffectStartedAt: null, likeEffectAnimationDelayMs: 0 }
+		const workflow = { stateFor: () => state, submit: async () => undefined, retry: () => undefined, isBusy: () => state.busy, isTombstoned: () => state.tombstoned }
+		const view = (recommendation: Recommendation) => <FeedbackWorkflowContext.Provider value={workflow}><RecommendationCard item={recommendation} /></FeedbackWorkflowContext.Provider>
+		const { container, rerender } = render(view(item))
+		const card = () => container.querySelector('.recommendation-card')!
+		expect(card()).not.toHaveClass('recommendation-card--liked')
+		state = { ...state, phase: 'polling', accepted: true, busy: true, action: 'like', likeEffectActive: true, likeEffectStartedAt: Date.now(), likeEffectAnimationDelayMs: 0 }
+		rerender(view({ ...item, id: 'replacement' }))
+		expect(card()).toHaveClass('recommendation-card--liked')
+		state = { ...state, phase: 'idle', accepted: false, busy: false, action: null, likeEffectActive: false, likeEffectStartedAt: null }
+		rerender(view({ ...item, id: 'after-expiry' }))
+		expect(card()).not.toHaveClass('recommendation-card--liked')
+	})
+
 	it('shows a persisted reaction after a ranking rebuild changes the recommendation id', () => {
 		render(<RecommendationCard item={{ ...item, id: 'new-ranking-id', latestFeedbackAction: 'like' }} feedbackEnabled />)
 		expect(screen.getByText('Ранее выбрано: Нравится')).toBeInTheDocument()

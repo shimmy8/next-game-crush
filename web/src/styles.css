@@ -59,12 +59,29 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
 .section-heading :is(h1, h2) { margin: 7px 0 0; font-size: clamp(1.45rem, 2.5vw, 2.05rem); letter-spacing: -.035em; }
 .section-heading > span { color: var(--quiet); font-size: .85rem; }
-.recommendation-card { display: grid; grid-template-columns: 42% 1fr; min-height: 330px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
-.recommendation-card--featured { min-height: 430px; grid-template-columns: minmax(270px, 43%) 1fr; border-color: #49415f; }
+.recommendation-card { position: relative; isolation: isolate; display: grid; grid-template-columns: 42% 1fr; min-height: 330px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+.recommendation-card--featured { min-height: 0; grid-template-columns: 1fr; border-color: #49415f; }
+.recommendation-card--featured .cover-panel { min-height: 0; aspect-ratio: 460 / 215; border-right: 0; border-bottom: 1px solid var(--line); }
+.recommendation-card__original { display: contents; }
 .cover-panel { min-height: 240px; background: #202431; display: flex; flex-direction: column; justify-content: space-between; padding: 22px; color: #86899b; font-size: .68rem; letter-spacing: .1em; text-transform: uppercase; border-right: 1px solid var(--line); }
 .cover-panel--image { padding: 0; overflow: hidden; }
 .cover-panel__image { display: block; width: 100%; height: 100%; min-height: inherit; object-fit: cover; }
 .cover-panel__mark { font-size: clamp(5rem, 10vw, 9rem); line-height: 1; color: #313747; font-weight: 850; letter-spacing: -.08em; align-self: center; margin: auto; }
+.recommendation-card--liked { animation: verdict-like-glow 720ms ease-out both; }
+.recommendation-card--disliked { pointer-events: none; animation: verdict-dislike-exit 560ms cubic-bezier(.55, .02, .72, .34) both; }
+.recommendation-card--disliked .recommendation-card__original { visibility: hidden; }
+.verdict-fracture { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
+.verdict-fracture::after { content: ""; position: absolute; z-index: 2; inset: -8% 48%; width: 4px; background: linear-gradient(to bottom, transparent, #f3dfdf 18%, #733b48 48%, #f3dfdf 76%, transparent); clip-path: polygon(45% 0, 100% 18%, 30% 35%, 85% 54%, 15% 72%, 70% 100%, 0 100%, 42% 73%, 0 54%, 55% 34%, 0 18%); filter: drop-shadow(0 0 5px rgb(255 130 111 / 55%)); }
+.verdict-fracture__half { position: absolute; inset: 0; overflow: hidden; }
+.verdict-fracture__half--left { clip-path: polygon(0 0, 52% 0, 48% 18%, 53% 35%, 47% 54%, 52% 73%, 48% 100%, 0 100%); animation: verdict-fragment-left 560ms cubic-bezier(.55, .02, .72, .34) both; }
+.verdict-fracture__half--right { clip-path: polygon(52% 0, 100% 0, 100% 100%, 48% 100%, 52% 73%, 47% 54%, 53% 35%, 48% 18%); animation: verdict-fragment-right 560ms cubic-bezier(.55, .02, .72, .34) both; }
+.recommendation-card__fracture-card { position: absolute; inset: 0; display: grid; grid-template-columns: 42% 1fr; min-height: 100%; background: var(--panel); }
+.recommendation-card__fracture-card--featured { grid-template-columns: 1fr; }
+.recommendation-card__fracture-card--featured .cover-panel { min-height: 0; aspect-ratio: 460 / 215; border-right: 0; border-bottom: 1px solid var(--line); }
+@keyframes verdict-like-glow { 0%, 28% { box-shadow: 0 0 22px rgb(115 208 173 / 28%); } 100% { box-shadow: 0 0 0 rgb(115 208 173 / 0%); } }
+@keyframes verdict-dislike-exit { 0%, 28% { opacity: 1; } 100% { opacity: 0; transform: scale(.97); } }
+@keyframes verdict-fragment-left { 0%, 28% { transform: none; } 100% { transform: translate(-18px, 8px) rotate(-1.5deg); } }
+@keyframes verdict-fragment-right { 0%, 28% { transform: none; } 100% { transform: translate(18px, -8px) rotate(1.5deg); } }
 .recommendation-card__body { padding: 28px; display: flex; flex-direction: column; }
 .card-meta { display: flex; gap: 8px; flex-wrap: wrap; }
 .date-chip, .wishlist-badge { display: inline-flex; align-items: center; min-height: 25px; padding: 4px 8px; border-radius: 6px; font-size: .7rem; font-weight: 750; }
@@ -218,7 +235,7 @@ footer { display: flex; justify-content: space-between; gap: 20px; border-top: 1
   .demo-banner { margin-inline: -26px; padding-inline: 26px; }
   .dashboard-layout { grid-template-columns: 1fr; }
   .right-rail { grid-template-columns: repeat(2, 1fr); position: static; }
-  .recommendation-card--featured { grid-template-columns: 38% 1fr; }
+  .recommendation-card--featured { grid-template-columns: 1fr; }
   .account-menu[open] { right: 26px; }
 }
 @media (max-width: 700px) {
@@ -238,8 +255,8 @@ footer { display: flex; justify-content: space-between; gap: 20px; border-top: 1
   .sync-progress__details { max-block-size: min(15rem, 38vh); }
   .preflight-status { align-items: flex-start; flex-wrap: wrap; }
   .preflight-status__actions { width: 100%; margin-left: 46px; }
-  .recommendation-card, .recommendation-card--featured { grid-template-columns: 1fr; }
-  .recommendation-card--featured .cover-panel { min-height: 280px; }
+  .recommendation-card, .recommendation-card--featured, .recommendation-card__fracture-card { grid-template-columns: 1fr; }
+  .recommendation-card--featured .cover-panel { min-height: 0; }
   .cover-panel { border-right: 0; border-bottom: 1px solid var(--line); }
   .recommendation-card__body { padding: 22px; }
   .recommendation-grid, .right-rail { grid-template-columns: 1fr; }

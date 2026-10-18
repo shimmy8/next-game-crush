@@ -1,21 +1,56 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { StrictMode } from 'react'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { getRankingDiff } from '../api/client'
 import FeedbackWorkflowProvider from './FeedbackWorkflowProvider'
 import { useFeedbackWorkflows } from './FeedbackWorkflowContext'
 import { overviewFixture } from '../test/overviewFixture'
+import RecommendationCard from './RecommendationCard'
 
 function Probe() {
   const workflow = useFeedbackWorkflows(); const state = workflow.stateFor('game-1')
   const send = (gameId: string, action: 'like' | 'dislike' | 'remind_me') => void workflow.submit({ gameId, recommendationId: `rec-${gameId}`, rankingVersion: 1, gameName: gameId, action })
-  return <div><button onClick={() => send('game-1', 'dislike')}>dislike one</button><button onClick={() => send('game-1', 'like')}>like one</button><button onClick={() => send('game-2', 'like')}>like two</button><span data-testid="phase">{state.phase}</span><span data-testid="busy">{String(state.busy)}</span><span data-testid="tombstone">{String(workflow.isTombstoned('game-1'))}</span></div>
+  return <div><button onClick={() => send('game-1', 'dislike')}>dislike one</button><button onClick={() => send('game-1', 'like')}>like one</button><button onClick={() => send('game-2', 'like')}>like two</button><span data-testid="phase">{state.phase}</span><span data-testid="action">{state.action ?? 'none'}</span><span data-testid="busy">{String(state.busy)}</span><span data-testid="tombstone">{String(workflow.isTombstoned('game-1'))}</span></div>
 }
+
+const glowItem = { ...overviewFixture(1, 0).discoveries.featured!, gameId: 'game-1' }
 
 const accepted = { eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 }
 const diff = { rebuildStatus: 'succeeded', previousVersion: 1, currentVersion: 2, added: [], removed: [], reordered: [] }
 
+afterEach(() => vi.useRealTimers())
+
 describe('FeedbackWorkflowProvider', () => {
+  it('preserves one like effect deadline across recommendation remounts without replaying it', async () => {
+    vi.useFakeTimers()
+    const props = { csrfToken: 'csrf', submitFeedback: vi.fn().mockResolvedValue(accepted), readRankingDiff: vi.fn(() => new Promise<typeof diff>(() => undefined)), wait: async () => undefined, reload: async () => ({ kind: 'failed' as const, reason: 'request_failed' as const }) }
+    const view = (recommendationId: string) => <FeedbackWorkflowProvider {...props}><RecommendationCard key={recommendationId} item={{ ...glowItem, id: recommendationId }} feedbackEnabled /></FeedbackWorkflowProvider>
+    const rendered = render(view('rec-old'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Нравится' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Сохранить отзыв' }))
+    await act(async () => undefined)
+    expect(screen.getByRole('article')).toHaveClass('recommendation-card--liked')
+    expect(screen.getByRole('article')).toHaveStyle({ animationDelay: '0ms' })
+
+    act(() => vi.advanceTimersByTime(300))
+    rendered.rerender(view('rec-old'))
+    expect(screen.getByRole('article')).toHaveStyle({ animationDelay: '0ms' })
+    act(() => vi.advanceTimersByTime(200))
+    rendered.rerender(view('rec-new'))
+    expect(screen.getByRole('article')).toHaveClass('recommendation-card--liked')
+    expect(screen.getByRole('article')).toHaveStyle({ animationDelay: '-500ms' })
+    act(() => vi.advanceTimersByTime(219))
+    expect(screen.getByRole('article')).toHaveClass('recommendation-card--liked')
+    act(() => vi.advanceTimersByTime(1))
+    expect(screen.getByRole('article')).not.toHaveClass('recommendation-card--liked')
+
+    rendered.rerender(view('rec-after-consumption'))
+    expect(screen.getByRole('article')).not.toHaveClass('recommendation-card--liked')
+    rendered.unmount()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('accepts feedback, polls, and reloads after StrictMode replays effect setup', async () => {
     let finishPolling!: (value: typeof diff) => void
     const submitFeedback = vi.fn().mockResolvedValue(accepted)
@@ -27,6 +62,7 @@ describe('FeedbackWorkflowProvider', () => {
     fireEvent.click(screen.getByText('dislike one'))
 
     await waitFor(() => expect(screen.getByTestId('phase')).toHaveTextContent('polling'))
+		expect(screen.getByTestId('action')).toHaveTextContent('dislike')
     expect(screen.getByTestId('tombstone')).toHaveTextContent('true')
     expect(submitFeedback).toHaveBeenCalledTimes(1)
     expect(readRankingDiff).toHaveBeenCalledWith(1, 'job', expect.any(AbortSignal))

@@ -1,7 +1,7 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CurrentUser } from '../api/client'
 import { useDashboardData, useSync } from '../api/hooks'
-import type { CalendarResponse, CatalogStatus, DashboardLoadState, RankingDiff, WishlistCollection } from '../api/types'
+import type { CalendarResponse, CatalogStatus, DashboardLoadState, RankingDiff, Recommendation, RecommendationOverview, WishlistCollection } from '../api/types'
 import CatalogCoverage, { SourceTimestamp } from '../components/CatalogCoverage'
 import PreferenceProfile from '../components/PreferenceProfile'
 import RecommendationCard from '../components/RecommendationCard'
@@ -31,6 +31,39 @@ const discoveryEmptyCopy: Record<CatalogStatus['status'], string> = {
   disabled: 'Подбор использует проверенный локальный каталог. Автоматический поиск отключён.',
 }
 
+const verdictExitFallbackMs = 700
+type DashboardLane = 'featured' | 'discoveries' | 'wishlist'
+type DashboardExitSnapshot = { item: Recommendation; lane: DashboardLane; index: number; successor?: { item: Recommendation; index: number } }
+type DashboardPresentationState = { source: RecommendationOverview; tombstoneKey: string; reducedMotion: boolean; exits: Map<string, DashboardExitSnapshot>; completed: Set<string> }
+
+function findDashboardSnapshot(overview: RecommendationOverview, gameId: string): DashboardExitSnapshot | null {
+  if (overview.discoveries.featured?.gameId === gameId) return { item: overview.discoveries.featured, lane: 'featured', index: 0, ...(overview.discoveries.items[0] ? { successor: { item: overview.discoveries.items[0], index: 0 } } : {}) }
+  const discoveryIndex = overview.discoveries.items.findIndex((item) => item.gameId === gameId)
+  if (discoveryIndex >= 0) return { item: overview.discoveries.items[discoveryIndex], lane: 'discoveries', index: discoveryIndex }
+  const wishlistIndex = overview.wishlist.items.findIndex((item) => item.gameId === gameId)
+  return wishlistIndex >= 0 ? { item: overview.wishlist.items[wishlistIndex], lane: 'wishlist', index: wishlistIndex } : null
+}
+
+function insertExitSnapshots(items: Recommendation[], exits: DashboardExitSnapshot[], lane: DashboardLane) {
+  const result = [...items]
+  for (const exit of exits.filter((value) => value.lane === lane).sort((left, right) => left.index - right.index)) {
+    if (!result.some((item) => item.gameId === exit.item.gameId)) result.splice(Math.min(exit.index, result.length), 0, exit.item)
+  }
+  return result
+}
+
+function usePrefersReducedMotion() {
+  const query = useMemo(() => typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-reduced-motion: reduce)') : null, [])
+  const [reduced, setReduced] = useState(() => query?.matches ?? false)
+  useEffect(() => {
+    if (!query) return
+    const changed = (event: MediaQueryListEvent) => setReduced(event.matches)
+    query.addEventListener('change', changed)
+    return () => query.removeEventListener('change', changed)
+  }, [query])
+  return reduced
+}
+
 function WishlistFreshness({ wishlist }: { wishlist: WishlistCollection }) {
   const copy = {
     ready: 'Список желаемого актуален.',
@@ -58,15 +91,65 @@ function DashboardContent({ user, signingOut, onLogout, onDataDeleted = onLogout
   const [readOnlyNotice, setReadOnlyNotice] = useState('')
   const { state, reload, emptyData } = dashboard
   const workflows = useFeedbackWorkflows()
+  const pendingVerdictTimers = useRef(new Map<string, number>())
   const refresh = useCallback(() => { void reload() }, [reload])
   const { sync, starting, requestError, preflight, preflightError, checking, run } = useSync(user.csrfToken, refresh)
   const rankingUpdated = useCallback((diff: RankingDiff) => { setRankingDiff(diff); void reload() }, [reload, setRankingDiff])
   const hasData = state.status === 'ready' || state.status === 'stale' || state.status === 'unknown' || state.status === 'empty'
 	const sourceData = hasData ? state.data : emptyData
   const sourceGameIds = useMemo(() => new Set([sourceData.overview.discoveries.featured, ...sourceData.overview.discoveries.items, ...sourceData.overview.wishlist.items, ...Object.values(sourceData.overview.calendar).flat()].filter((item) => item).map((item) => item!.gameId)), [sourceData.overview])
-  const tombstones = useMemo(() => new Set([...sourceGameIds].filter(workflows.isTombstoned)), [sourceGameIds, workflows])
+	const reducedMotion = usePrefersReducedMotion()
+	const [presentation, setPresentation] = useState<DashboardPresentationState>(() => ({ source: sourceData.overview, tombstoneKey: '', reducedMotion, exits: new Map(), completed: new Set() }))
+	const trackedGameIds = useMemo(() => new Set([...sourceGameIds, ...presentation.exits.keys()]), [presentation.exits, sourceGameIds])
+  const tombstones = useMemo(() => new Set([...trackedGameIds].filter(workflows.isTombstoned)), [trackedGameIds, workflows])
+	const tombstoneKey = [...tombstones].sort().join('|')
+	if (presentation.source !== sourceData.overview || presentation.tombstoneKey !== tombstoneKey || presentation.reducedMotion !== reducedMotion) {
+		const exits = new Map([...presentation.exits].filter(([gameId]) => tombstones.has(gameId)))
+		const completed = new Set([...presentation.completed].filter((gameId) => tombstones.has(gameId)))
+		if (reducedMotion) {
+			exits.clear()
+			for (const gameId of tombstones) completed.add(gameId)
+		} else {
+			for (const gameId of tombstones) {
+				if (exits.has(gameId) || completed.has(gameId)) continue
+				const snapshot = findDashboardSnapshot(presentation.source, gameId) ?? findDashboardSnapshot(sourceData.overview, gameId)
+				if (snapshot) exits.set(gameId, snapshot)
+			}
+		}
+		setPresentation({ source: sourceData.overview, tombstoneKey, reducedMotion, exits, completed })
+	}
+	const finishVerdictExit = useCallback((gameId: string) => {
+		const timer = pendingVerdictTimers.current.get(gameId)
+		if (timer !== undefined) window.clearTimeout(timer)
+		pendingVerdictTimers.current.delete(gameId)
+		setPresentation((current) => {
+			if (!current.exits.has(gameId)) return current
+			const exits = new Map(current.exits); exits.delete(gameId)
+			const completed = new Set(current.completed); completed.add(gameId)
+			return { ...current, exits, completed }
+		})
+	}, [])
+	useEffect(() => {
+		for (const [gameId, timer] of pendingVerdictTimers.current) {
+			if (presentation.exits.has(gameId)) continue
+			window.clearTimeout(timer); pendingVerdictTimers.current.delete(gameId)
+		}
+		for (const gameId of presentation.exits.keys()) {
+			if (pendingVerdictTimers.current.has(gameId)) continue
+			pendingVerdictTimers.current.set(gameId, window.setTimeout(() => finishVerdictExit(gameId), verdictExitFallbackMs))
+		}
+	}, [finishVerdictExit, presentation.exits])
+	useEffect(() => () => { pendingVerdictTimers.current.forEach((timer) => window.clearTimeout(timer)); pendingVerdictTimers.current.clear() }, [])
 	const data = useMemo(() => ({ ...sourceData, overview: applyFeedbackTombstones(sourceData.overview, tombstones) }), [sourceData, tombstones])
   const { discoveries, wishlist, calendar, catalogStatus } = data.overview
+	const exits = [...presentation.exits.values()]
+	const featuredExit = exits.find((exit) => exit.lane === 'featured')
+	const featured = featuredExit?.item ?? discoveries.featured
+	const heldSuccessor = featuredExit?.successor && !tombstones.has(featuredExit.successor.item.gameId)
+		? featuredExit.successor
+		: featuredExit && discoveries.featured ? { item: discoveries.featured, index: 0 } : undefined
+	const discoveryItems = insertExitSnapshots(discoveries.items, heldSuccessor ? [...exits, { ...heldSuccessor, lane: 'discoveries' }] : exits, 'discoveries')
+	const wishlistItems = insertExitSnapshots(wishlist.items, exits, 'wishlist')
   const displayName = preflight?.displayName ?? user.displayName
   const avatarUrl = preflight?.avatarUrl ?? user.avatarUrl
   const syncBusy = checking || starting
@@ -102,10 +185,10 @@ function DashboardContent({ user, signingOut, onLogout, onDataDeleted = onLogout
         <div className="dashboard-main">
           <section aria-labelledby="best-match-title">
             <div className="section-heading"><div><div className="eyebrow">Лучшее совпадение</div><h1 id="best-match-title">Новая находка для вас</h1></div></div>
-            {discoveries.featured ? <RecommendationCard item={discoveries.featured} featured feedbackEnabled readOnly={readOnly} /> : <div className="empty-card"><strong>Пока не нашли новых игр вне вашего списка желаемого</strong><p>{discoveryEmptyCopy[catalogStatus.status]}</p><p>Синхронизируйте профиль — мы сопоставим любимые механики, темы и активность с будущими релизами.</p><button type="button" onClick={requestSync} disabled={syncBusy}>Собрать профиль</button></div>}
+            {featured ? <RecommendationCard key={featured.gameId} item={featured} featured feedbackEnabled readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(featured.gameId)} /> : <div className="empty-card"><strong>Пока не нашли новых игр вне вашего списка желаемого</strong><p>{discoveryEmptyCopy[catalogStatus.status]}</p><p>Синхронизируйте профиль — мы сопоставим любимые механики, темы и активность с будущими релизами.</p><button type="button" onClick={requestSync} disabled={syncBusy}>Собрать профиль</button></div>}
           </section>
-          <section className="recommendations-section" aria-labelledby="more-title"><div className="section-heading"><div><div className="eyebrow">Вне вашего желаемого</div><h2 id="more-title">Ещё новые игры</h2></div><span>Всего новых игр: {discoveries.total}</span></div>{discoveries.items.length > 0 && <div className="recommendation-grid">{discoveries.items.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled readOnly={readOnly} />)}</div>}</section>
-          <section className="recommendations-section wishlist-section" aria-labelledby="wishlist-title"><div className="section-heading"><div><div className="eyebrow">Следим за релизами</div><h2 id="wishlist-title">Уже в вашем желаемом</h2></div><span>Всего в желаемом: {wishlist.total}</span></div><WishlistFreshness wishlist={wishlist} />{wishlist.items.length > 0 ? <div className="recommendation-grid">{wishlist.items.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled readOnly={readOnly} />)}</div> : wishlist.status === 'ready' ? <p className="wishlist-empty">В желаемом нет подходящих будущих релизов.</p> : null}</section>
+          <section className="recommendations-section" aria-labelledby="more-title"><div className="section-heading"><div><div className="eyebrow">Вне вашего желаемого</div><h2 id="more-title">Ещё новые игры</h2></div><span>Всего новых игр: {discoveries.total}</span></div>{discoveryItems.length > 0 && <div className="recommendation-grid">{discoveryItems.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(item.gameId)} />)}</div>}</section>
+          <section className="recommendations-section wishlist-section" aria-labelledby="wishlist-title"><div className="section-heading"><div><div className="eyebrow">Следим за релизами</div><h2 id="wishlist-title">Уже в вашем желаемом</h2></div><span>Всего в желаемом: {wishlist.total}</span></div><WishlistFreshness wishlist={wishlist} />{wishlistItems.length > 0 ? <div className="recommendation-grid">{wishlistItems.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(item.gameId)} />)}</div> : wishlist.status === 'ready' ? <p className="wishlist-empty">В желаемом нет подходящих будущих релизов.</p> : null}</section>
         </div>
         <div className="right-rail"><PreferenceProfile profile={data.profile} csrfToken={user.csrfToken} onRankingUpdated={rankingUpdated} readOnly={readOnly} /><CatalogCoverage status={catalogStatus} /><UpcomingWindows calendar={calendar} /><TestDigestButton csrfToken={user.csrfToken} readOnly={readOnly} /><DiagnosticsPage csrfToken={user.csrfToken} onDeleted={onDataDeleted} readOnly={readOnly} /></div>
       </div>}
