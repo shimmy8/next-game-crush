@@ -148,6 +148,7 @@ func TestWatchdogResumesTerminalSearchPageWithoutRefetchingCommittedPage(t *test
 	repo := NewSearchRepository(db)
 	queue := jobs.NewQueue(db)
 	cfg := DefaultDiscoveryConfig()
+	cfg.Enabled = true
 	now := searchClock()
 	source := &resumableSearchStub{requests: map[int]int{}, failStart: 1, failRemaining: 4, pages: map[int]steam.SearchPage{
 		0: {Start: 0, Count: 1, Total: 2, HasMore: true, Items: []steam.SearchObservation{testObservation(71, "18 Oct, 2026", steam.ReviewPositive, "Positive")}},
@@ -182,6 +183,9 @@ func TestWatchdogResumesTerminalSearchPageWithoutRefetchingCommittedPage(t *test
 		} else if !errors.Is(handlerErr, jobs.ErrDeferred) {
 			t.Fatalf("terminal error=%v", handlerErr)
 		}
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET updated_at=$2 WHERE id=$1`, pageID, now); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := db.Pool.Exec(ctx, `UPDATE catalog_search_feeds SET status='complete',natural_end=true,completed_at=$2
 		WHERE run_id=$1 AND feed<>'popular_upcoming'`, run.ID, now); err != nil {

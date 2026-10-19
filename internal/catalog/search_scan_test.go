@@ -180,6 +180,7 @@ func TestSearchPageReplayAfterCrash(t *testing.T) {
 
 func TestSearchResponseAfterWatchdogFenceIsDiscardedWithoutSuccessors(t *testing.T) {
 	cfg := DefaultDiscoveryConfig()
+	cfg.Enabled = true
 	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	source := &blockingSearchStub{started: make(chan struct{}), release: make(chan struct{}), page: steam.SearchPage{
 		Start: 0, Count: 1, Total: 1, Items: []steam.SearchObservation{testObservation(91, "18 Oct, 2026", steam.ReviewPositive, "Positive")},
