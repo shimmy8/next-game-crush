@@ -3,6 +3,7 @@ package profile
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -335,6 +336,74 @@ func TestProfileWorkerRecordsInsufficientWithoutSummaryJob(t *testing.T) {
 	}
 	if summaries != 0 {
 		t.Fatalf("insufficient profile summary jobs = %d, want 0", summaries)
+	}
+}
+
+func TestLatestPublishedProfileKeepsPublishedWhileBuilding(t *testing.T) {
+	database := openProfileStore(t)
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	oldID, draftID := uuid.New(), uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,summary,algorithm_metadata,publication_state,published_at,summary_source) VALUES
+		($1,$3,1,'Стабильный опубликованный профиль','{"confidence":0.7,"evidenceCount":3}','published',now()-interval '1 day','legacy'),
+		($2,$3,2,NULL,'{"confidence":0.9,"evidenceCount":8}','building',NULL,NULL)`, oldID, draftID, userID); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := NewSQLRepository(database, "embed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := repository.LatestPublishedProfile(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != oldID || got.Version != 1 || got.Summary != "Стабильный опубликованный профиль" || !got.Updating ||
+		got.Confidence != 0.7 || got.EvidenceCount != 3 || got.SummarySource != SummarySourceLegacy || got.PublishedAt == nil {
+		t.Fatalf("visible profile = %#v", got)
+	}
+}
+
+func TestLatestPublishedProfileClearsUpdatingAfterFailure(t *testing.T) {
+	database := openProfileStore(t)
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	oldID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,summary,algorithm_metadata,publication_state,published_at,summary_source) VALUES
+		($1,$2,1,'Стабильный профиль','{}','published',now()-interval '1 day','legacy'),
+		($3,$2,2,NULL,'{}','failed',NULL,NULL)`, oldID, userID, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	repository, _ := NewSQLRepository(database, "embed")
+	got, err := repository.LatestPublishedProfile(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != oldID || got.Updating {
+		t.Fatalf("visible profile = %#v", got)
+	}
+}
+
+func TestLatestPublishedProfileTreatsInsufficientAsAuthoritativeEmpty(t *testing.T) {
+	database := openProfileStore(t)
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,summary,algorithm_metadata,publication_state,published_at,summary_source) VALUES
+		($1,$3,1,'Старый профиль','{}','published',now()-interval '1 day','legacy'),
+		($2,$3,2,NULL,'{}','insufficient',NULL,NULL)`, uuid.New(), uuid.New(), userID); err != nil {
+		t.Fatal(err)
+	}
+	repository, _ := NewSQLRepository(database, "embed")
+	if _, err := repository.LatestPublishedProfile(ctx, userID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("error = %v, want pgx.ErrNoRows", err)
 	}
 }
 

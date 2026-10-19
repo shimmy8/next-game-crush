@@ -53,6 +53,7 @@ type Profile struct {
 	SummarySource    SummarySource    `json:"summarySource,omitempty"`
 	PublicationState PublicationState `json:"publicationState"`
 	PublishedAt      *time.Time       `json:"publishedAt,omitempty"`
+	Updating         bool             `json:"updating"`
 	PositiveStrength float64          `json:"-"`
 	Confidence       float64          `json:"confidence"`
 	EvidenceCount    int              `json:"evidenceCount"`
@@ -88,6 +89,7 @@ type BuildResult struct {
 type Repository interface {
 	BuildDraft(context.Context, BuildRequest, time.Time, string) (Profile, bool, error)
 	LatestProfile(context.Context, uuid.UUID) (Profile, error)
+	LatestPublishedProfile(context.Context, uuid.UUID) (Profile, error)
 }
 
 type Service struct {
@@ -137,7 +139,7 @@ func (s *Service) rebuildWithKey(ctx context.Context, userID uuid.UUID, buildKey
 }
 
 func (s *Service) Latest(ctx context.Context, userID uuid.UUID) (Profile, error) {
-	return s.repository.LatestProfile(ctx, userID)
+	return s.repository.LatestPublishedProfile(ctx, userID)
 }
 
 type JobPayload struct {

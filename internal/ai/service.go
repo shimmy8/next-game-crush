@@ -48,8 +48,9 @@ type Repository interface {
 	HasGameEmbedding(context.Context, uuid.UUID, string, string) (bool, error)
 	SaveGameEmbedding(context.Context, uuid.UUID, string, string, []float32) error
 	LoadProfileEvidence(context.Context, uuid.UUID) (ProfileEvidence, error)
-	HasProfileSummary(context.Context, uuid.UUID, string, string) (bool, error)
-	SaveProfileSummary(context.Context, uuid.UUID, string, string, ProfileSummary) error
+	LoadCachedProfileSummary(context.Context, uuid.UUID, string, string) (ProfileSummary, bool, error)
+	PublishProfileSummary(context.Context, jobs.Lease, uuid.UUID, string, string, ProfileSummary, string) error
+	HandleTerminalProfileSummaryFailure(context.Context, jobs.Lease, uuid.UUID, string) (bool, error)
 }
 
 type CatalogFeatureAdmission interface {
@@ -246,7 +247,21 @@ func (service *Service) handleProfileSummary(ctx context.Context, lease jobs.Lea
 	if err != nil {
 		return err
 	}
-	return service.processProfileSummary(ctx, payload.ProfileID)
+	err = service.processProfileSummary(ctx, lease, payload.ProfileID)
+	if err == nil {
+		return nil
+	}
+	if !terminalProfileSummaryAttempt(lease, err) {
+		return err
+	}
+	published, terminalErr := service.repository.HandleTerminalProfileSummaryFailure(ctx, lease, payload.ProfileID, service.model)
+	if terminalErr != nil {
+		return terminalErr
+	}
+	if published {
+		return nil
+	}
+	return err
 }
 
 func (service *Service) processFeatures(ctx context.Context, gameID uuid.UUID) error {
@@ -392,7 +407,7 @@ func (service *Service) processEmbeddingForExecution(ctx context.Context, gameID
 	return true, true, true, nil
 }
 
-func (service *Service) processProfileSummary(ctx context.Context, profileID uuid.UUID) error {
+func (service *Service) processProfileSummary(ctx context.Context, lease jobs.Lease, profileID uuid.UUID) error {
 	evidence, err := service.repository.LoadProfileEvidence(ctx, profileID)
 	if err != nil {
 		return fmt.Errorf("load profile evidence: %w", err)
@@ -405,16 +420,17 @@ func (service *Service) processProfileSummary(ctx context.Context, profileID uui
 	if err != nil {
 		return err
 	}
-	cached, err := service.repository.HasProfileSummary(ctx, profileID, service.model, hash)
+	cached, found, err := service.repository.LoadCachedProfileSummary(ctx, profileID, service.model, hash)
 	if err != nil {
 		return err
 	}
-	if cached {
-		return nil
+	if found {
+		return service.repository.PublishProfileSummary(ctx, lease, profileID, service.model, hash, cached, "openai")
 	}
 	output, err := service.client.SummarizeProfile(ctx, evidence)
 	if errors.Is(err, ErrCapabilityDisabled) {
-		return nil
+		fallback := ProfileSummary{Summary: DeterministicActivitySummary(evidence.Facts)}
+		return service.repository.PublishProfileSummary(ctx, lease, profileID, service.model, hash, fallback, "deterministic")
 	}
 	if err != nil {
 		return err
@@ -427,7 +443,16 @@ func (service *Service) processProfileSummary(ctx context.Context, profileID uui
 	if err != nil {
 		return err
 	}
-	return service.repository.SaveProfileSummary(ctx, profileID, service.model, hash, output)
+	return service.repository.PublishProfileSummary(ctx, lease, profileID, service.model, hash, output, "openai")
+}
+
+func terminalProfileSummaryAttempt(lease jobs.Lease, err error) bool {
+	if lease.MaxAttempts > 0 && lease.Attempts >= lease.MaxAttempts {
+		return true
+	}
+	type retryable interface{ Retryable() bool }
+	var classified retryable
+	return errors.As(err, &classified) && !classified.Retryable()
 }
 
 func decodeJobPayload(raw json.RawMessage, needGame, needProfile bool) (JobPayload, error) {

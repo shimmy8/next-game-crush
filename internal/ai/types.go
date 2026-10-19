@@ -87,6 +87,7 @@ type GameFeatures struct {
 type ProfileEvidence struct {
 	EvidenceKey string         `json:"evidence_key"`
 	Evidence    []EvidenceItem `json:"evidence"`
+	Facts       ActivityFacts  `json:"activity_facts"`
 }
 
 type ProfileSummary struct {

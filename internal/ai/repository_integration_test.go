@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -105,10 +106,10 @@ func TestLoadProfileEvidenceIncludesLastPlayedAt(t *testing.T) {
 	if err := database.UpsertGame(ctx, store.Game{ID: gameID, SteamAppID: 570, Name: "Dota 2", Source: "test", FetchedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Pool.Exec(ctx, `INSERT INTO user_games(user_id,game_id,playtime_minutes,recently_played_minutes,source,last_successful_fetch_at,last_played_at) VALUES($1,$2,100000,0,'test',now(),$3)`, userID, gameID, lastPlayed); err != nil {
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata) VALUES($1,$2,1,'{}')`, profileID, userID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata) VALUES($1,$2,1,'{}')`, profileID, userID); err != nil {
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO activity_profile_evidence(profile_id,game_id,playtime_minutes,last_played_at) VALUES($1,$2,100000,$3)`, profileID, gameID, lastPlayed); err != nil {
 		t.Fatal(err)
 	}
 
@@ -131,31 +132,16 @@ func TestLoadProfileEvidenceProtectsTwoWeekActivityAndCompletionFromLimit(t *tes
 	if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata) VALUES($1,$2,1,'{}')`, profileID, userID); err != nil {
 		t.Fatal(err)
 	}
-	for index := 0; index < 101; index++ {
-		gameID := uuid.New()
-		if err := database.UpsertGame(ctx, store.Game{ID: gameID, SteamAppID: int64(10_000 + index), Name: fmt.Sprintf("History %03d", index), Source: "test", FetchedAt: time.Now()}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := database.Pool.Exec(ctx, `INSERT INTO user_games(user_id,game_id,playtime_minutes,recently_played_minutes,source,last_successful_fetch_at,last_played_at) VALUES($1,$2,$3,0,'test',now(),$4)`, userID, gameID, 10_000-index, time.Date(2020, time.January, 1, 0, 0, index, 0, time.UTC)); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	completedID := insertAIEvidenceGame(t, database, 20_001, "Completed Story")
-	overriddenID := insertAIEvidenceGame(t, database, 20_002, "Completed But Disliked")
-	recentID := insertAIEvidenceGame(t, database, 20_003, "Two Week Activity")
-	feedbackID := insertAIEvidenceGame(t, database, 20_004, "Standalone Like")
-	wishlistID := insertAIEvidenceGame(t, database, 20_005, "Wishlist Intent")
+	recentID := insertAIEvidenceGame(t, database, 20_002, "Two Week Activity")
+	wishlistID := insertAIEvidenceGame(t, database, 20_003, "Wishlist Must Not Leak")
 	completionAt := time.Date(2018, time.May, 4, 12, 0, 0, 0, time.UTC)
-	if _, err := database.Pool.Exec(ctx, `INSERT INTO user_game_completion_projections(user_id,game_id,ending_count,hundred_percent_basis,weight,completion_at,basis,algorithm_version) VALUES($1,$2,2,true,1.85,$3,'both','completion-v1'),($1,$4,1,false,1.5,NULL,'ending','completion-v1')`, userID, completedID, completionAt, overriddenID); err != nil {
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO activity_profile_evidence(profile_id,game_id,completion_ending_count,completion_hundred_percent_basis,completion_weight,completion_at,completion_basis) VALUES($1,$2,2,true,1.85,$3,'both')`, profileID, completedID, completionAt); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Pool.Exec(ctx, `INSERT INTO user_games(user_id,game_id,playtime_minutes,recently_played_minutes,source,last_successful_fetch_at,last_played_at) VALUES($1,$2,15,240,'test',now(),now())`, userID, recentID); err != nil {
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO activity_profile_evidence(profile_id,game_id,playtime_minutes,recently_played_minutes,last_played_at,achieved,total) VALUES($1,$2,15,240,now(),3,10)`, profileID, recentID); err != nil {
 		t.Fatal(err)
 	}
-	insertAIDirectFeedback(t, database, userID, profileID, overriddenID, "like", time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC))
-	insertAIDirectFeedback(t, database, userID, profileID, overriddenID, "dislike", time.Date(2026, time.January, 2, 0, 0, 0, 0, time.UTC))
-	insertAIDirectFeedback(t, database, userID, profileID, feedbackID, "like", time.Date(2026, time.January, 3, 0, 0, 0, 0, time.UTC))
 	if _, err := database.Pool.Exec(ctx, `INSERT INTO wishlist_entries(user_id,game_id,source,last_successful_fetch_at) VALUES($1,$2,'test',now())`, userID, wishlistID); err != nil {
 		t.Fatal(err)
 	}
@@ -165,8 +151,8 @@ func TestLoadProfileEvidenceProtectsTwoWeekActivityAndCompletionFromLimit(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(evidence.Evidence) != 100 {
-		t.Fatalf("evidence count = %d, want 100", len(evidence.Evidence))
+	if len(evidence.Evidence) != 2 {
+		t.Fatalf("evidence count = %d, want 2", len(evidence.Evidence))
 	}
 	again, err := repository.LoadProfileEvidence(ctx, profileID)
 	if err != nil {
@@ -175,38 +161,144 @@ func TestLoadProfileEvidenceProtectsTwoWeekActivityAndCompletionFromLimit(t *tes
 	if !reflect.DeepEqual(evidence, again) {
 		t.Fatal("profile evidence order is not stable across reads")
 	}
-	indexes := map[string]int{}
-	values := map[string]string{}
-	joined := strings.Builder{}
-	for index, item := range evidence.Evidence {
-		joined.WriteString(item.Value)
-		joined.WriteByte('\n')
-		for _, name := range []string{"Completed Story", "Completed But Disliked", "Two Week Activity", "Standalone Like", "Wishlist Intent", "History"} {
-			if strings.Contains(item.Value, name) {
-				if _, found := indexes[name]; !found {
-					indexes[name], values[name] = index, item.Value
-				}
-			}
+	joined := evidence.Evidence[0].Value + "\n" + evidence.Evidence[1].Value
+	for _, forbidden := range []string{"wishlist", "direct_feedback", "positive_feedback", "completion_overridden", wishlistID.String()} {
+		if strings.Contains(strings.ToLower(joined), strings.ToLower(forbidden)) {
+			t.Fatalf("unsafe profile evidence contains %q: %s", forbidden, joined)
 		}
 	}
-	if !(indexes["Completed Story"] < indexes["Two Week Activity"] && indexes["Completed But Disliked"] < indexes["Two Week Activity"] && indexes["Two Week Activity"] < indexes["Standalone Like"] && indexes["Standalone Like"] < indexes["Wishlist Intent"] && indexes["Wishlist Intent"] < indexes["History"]) {
-		t.Fatalf("tier indexes = %#v", indexes)
+	if !strings.Contains(joined, "completion_basis=both") || !strings.Contains(joined, "recent_minutes=240") {
+		t.Fatalf("incomplete profile evidence: %s", joined)
 	}
-	for _, required := range []string{"completion_basis=both", "ending_count=2", "completion_at=2018-05-04T12:00:00Z", "completion_overridden=false"} {
-		if !strings.Contains(values["Completed Story"], required) {
-			t.Fatalf("completed evidence missing %q: %s", required, values["Completed Story"])
+	if evidence.Facts.PlayedGames != 1 || evidence.Facts.RecentlyPlayedGames != 1 || evidence.Facts.GamesWithAchievements != 1 || evidence.Facts.CompletedGames != 1 {
+		t.Fatalf("activity facts = %#v", evidence.Facts)
+	}
+}
+
+func TestProfilePublicationRejectsLateLeaseAndTerminalResult(t *testing.T) {
+	database := openAIIntegrationStore(t)
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	newDraft := func(version int64) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		metadata := fmt.Sprintf(`{"signalCounts":{"playtime":%d,"recent":1,"achievements":1,"completion":1}}`, version)
+		if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata,publication_state) VALUES($1,$2,$3,$4,'building')`, id, userID, version, metadata); err != nil {
+			t.Fatal(err)
 		}
+		return id
 	}
-	for _, required := range []string{"completion_basis=ending", "ending_count=1", "completion_at=unknown", "completion_overridden=true", "positive_feedback=false"} {
-		if !strings.Contains(values["Completed But Disliked"], required) {
-			t.Fatalf("overridden evidence missing %q: %s", required, values["Completed But Disliked"])
+	claim := func(profileID uuid.UUID, key string) jobs.Lease {
+		t.Helper()
+		payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, ProfileID: profileID})
+		queue := jobs.NewQueue(database)
+		if _, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: ProfileSummaryJobKind, IdempotencyKey: key, Payload: payload, UserID: userID, MaxAttempts: 3}); err != nil {
+			t.Fatal(err)
 		}
+		lease, err := queue.Claim(ctx, jobs.LaneInteractive, "summary-worker", time.Minute)
+		if err != nil || lease == nil {
+			t.Fatalf("claim: lease=%#v err=%v", lease, err)
+		}
+		return *lease
 	}
-	if strings.Contains(joined.String(), "completion_weight") || strings.Contains(joined.String(), completedID.String()) || strings.Contains(joined.String(), overriddenID.String()) {
-		t.Fatalf("unsafe profile evidence: %s", joined.String())
+
+	repository := NewSQLRepository(database)
+	first := newDraft(1)
+	lease := claim(first, "summary:first")
+	output := ProfileSummary{Summary: "Сводка фактической игровой активности."}
+	if err := repository.PublishProfileSummary(ctx, lease, first, "text-v1", "hash-v1", output, "openai"); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Count(joined.String(), "History ") >= 101 {
-		t.Fatal("low-priority history was not clipped after selection")
+	// A retry after publish but before durable job completion is idempotent.
+	if err := repository.PublishProfileSummary(ctx, lease, first, "text-v1", "hash-v1", output, "openai"); err != nil {
+		t.Fatalf("idempotent publish: %v", err)
+	}
+
+	second := newDraft(2)
+	secondLease := claim(second, "summary:second")
+	stale := secondLease
+	stale.FencingToken = uuid.New()
+	if err := repository.PublishProfileSummary(ctx, stale, second, "text-v1", "hash-v2", output, "openai"); !errors.Is(err, jobs.ErrLeaseLost) {
+		t.Fatalf("stale publish error = %v", err)
+	}
+	if _, err := database.Pool.Exec(ctx, `UPDATE sync_jobs SET status='dead',worker_id=NULL,fencing_token=NULL,lease_until=NULL WHERE id=$1`, secondLease.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.HandleTerminalProfileSummaryFailure(ctx, secondLease, second, "text-v1"); !errors.Is(err, jobs.ErrLeaseLost) {
+		t.Fatalf("late terminal error = %v", err)
+	}
+	var state string
+	if err := database.Pool.QueryRow(ctx, `SELECT publication_state FROM preference_profiles WHERE id=$1`, second).Scan(&state); err != nil || state != "building" {
+		t.Fatalf("late result changed state=%q err=%v", state, err)
+	}
+
+	third := newDraft(3)
+	expired := claim(third, "summary:expired")
+	if _, err := database.Pool.Exec(ctx, `UPDATE sync_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1`, expired.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.PublishProfileSummary(ctx, expired, third, "text-v1", "hash-v3", output, "openai"); !errors.Is(err, jobs.ErrLeaseLost) {
+		t.Fatalf("expired publish error = %v", err)
+	}
+	if _, err := repository.HandleTerminalProfileSummaryFailure(ctx, expired, third, "text-v1"); !errors.Is(err, jobs.ErrLeaseLost) {
+		t.Fatalf("expired terminal error = %v", err)
+	}
+}
+
+func TestTerminalSummaryFailurePublishesFallbackOnlyOnFirstRun(t *testing.T) {
+	database := openAIIntegrationStore(t)
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	queue := jobs.NewQueue(database)
+	repository := NewSQLRepository(database)
+	gameID := insertAIEvidenceGame(t, database, 27_001, "Achievement fact")
+	buildAndClaim := func(version int, key string) (uuid.UUID, jobs.Lease) {
+		t.Helper()
+		profileID := uuid.New()
+		if _, err := database.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata,publication_state) VALUES($1,$2,$3,'{"signalCounts":{"playtime":2}}','building')`, profileID, userID, version); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Pool.Exec(ctx, `INSERT INTO activity_profile_evidence(profile_id,game_id,achieved,total) VALUES($1,$2,1,1)`, profileID, gameID); err != nil {
+			t.Fatal(err)
+		}
+		payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, ProfileID: profileID})
+		if _, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: ProfileSummaryJobKind, IdempotencyKey: key, Payload: payload, UserID: userID}); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := queue.Claim(ctx, jobs.LaneInteractive, "terminal-worker", time.Minute)
+		if err != nil || lease == nil {
+			t.Fatalf("claim: %#v %v", lease, err)
+		}
+		return profileID, *lease
+	}
+	first, firstLease := buildAndClaim(1, "terminal:first")
+	published, err := repository.HandleTerminalProfileSummaryFailure(ctx, firstLease, first, "text-v1")
+	if err != nil || !published {
+		t.Fatalf("first fallback published=%v err=%v", published, err)
+	}
+	if err := queue.Complete(ctx, firstLease); err != nil {
+		t.Fatal(err)
+	}
+	second, secondLease := buildAndClaim(2, "terminal:second")
+	published, err = repository.HandleTerminalProfileSummaryFailure(ctx, secondLease, second, "text-v1")
+	if err != nil || published {
+		t.Fatalf("later fallback published=%v err=%v", published, err)
+	}
+	var firstState, secondState, hash, summary string
+	if err := database.Pool.QueryRow(ctx, `SELECT publication_state,input_content_hash,summary FROM preference_profiles WHERE id=$1`, first).Scan(&firstState, &hash, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Pool.QueryRow(ctx, `SELECT publication_state FROM preference_profiles WHERE id=$1`, second).Scan(&secondState); err != nil {
+		t.Fatal(err)
+	}
+	if firstState != "published" || secondState != "failed" || strings.TrimSpace(hash) == "" || hash == "deterministic-terminal-v1" || !strings.Contains(summary, "достижениями — 1") {
+		t.Fatalf("states/hash/summary = %q/%q/%q/%q", firstState, secondState, hash, summary)
 	}
 }
 
@@ -217,8 +309,7 @@ func TestSelectProfileEvidenceDeduplicatesAndUsesStableTieBreaks(t *testing.T) {
 
 	completion := profileEvidenceSignal{id: id("000000000001"), name: "Completion", completionBasis: "ending", completionWeight: 1.5}
 	recentDuplicate := id("000000000002")
-	feedback := profileEvidenceSignal{id: id("000000000003"), name: "Feedback", feedbackAction: "dislike"}
-	wishlist := profileEvidenceSignal{id: id("000000000004"), name: "Wishlist", wishlisted: true}
+	achievement := profileEvidenceSignal{id: id("000000000003"), name: "Achievement", achieved: 10}
 	newerHistory := profileEvidenceSignal{id: id("000000000005"), name: "Zulu", played: 50, lastPlayedAt: at(recent)}
 	normalizedFirst := profileEvidenceSignal{id: id("000000000006"), name: " alpha ", played: 50, lastPlayedAt: at(old)}
 	rawFirst := profileEvidenceSignal{id: id("000000000007"), name: "Beta", played: 50, lastPlayedAt: at(old)}
@@ -234,13 +325,12 @@ func TestSelectProfileEvidenceDeduplicatesAndUsesStableTieBreaks(t *testing.T) {
 		{
 			name: "priority material value and deduplication",
 			input: []profileEvidenceSignal{
-				wishlist,
 				{id: recentDuplicate, name: "Recent duplicate history", played: 99_999},
-				feedback,
+				achievement,
 				{id: recentDuplicate, name: "Recent duplicate", recent: 30},
 				completion,
 			},
-			want: []uuid.UUID{completion.id, recentDuplicate, feedback.id, wishlist.id},
+			want: []uuid.UUID{completion.id, recentDuplicate, achievement.id},
 		},
 		{
 			name:  "date normalized name raw name and UUID ties",

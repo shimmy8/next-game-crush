@@ -8,10 +8,12 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/store"
 	dbgen "next-game-crush/internal/store/sqlc"
 )
@@ -23,14 +25,11 @@ type profileEvidenceSignal struct {
 	name                   string
 	played, recent         int64
 	lastPlayedAt           pgtype.Timestamptz
-	wishlisted             bool
-	feedbackAction         string
 	achieved, achievements int32
 	features               []byte
 	completionBasis        string
 	endingCount            int32
 	completionAt           pgtype.Timestamptz
-	completionOverridden   bool
 	completionWeight       float64
 }
 
@@ -103,32 +102,14 @@ func (repo *SQLRepository) SaveGameEmbedding(ctx context.Context, id uuid.UUID, 
 }
 
 func (repo *SQLRepository) LoadProfileEvidence(ctx context.Context, profileID uuid.UUID) (ProfileEvidence, error) {
-	var userID uuid.UUID
-	if err := repo.store.Pool.QueryRow(ctx, `SELECT user_id FROM preference_profiles WHERE id=$1`, profileID).Scan(&userID); err != nil {
-		return ProfileEvidence{}, err
-	}
-	rows, err := repo.store.Pool.Query(ctx, `WITH feedback AS (
-		SELECT DISTINCT ON (rec.game_id) rec.game_id,f.action
-		FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id
-		WHERE f.user_id=$1 AND f.action IN ('like','dislike','exclude')
-		ORDER BY rec.game_id,f.created_at DESC,f.id DESC
-	), relevant AS (
-		SELECT game_id FROM user_games WHERE user_id=$1 UNION
-		SELECT game_id FROM wishlist_entries WHERE user_id=$1 UNION
-		SELECT game_id FROM feedback UNION
-		SELECT game_id FROM user_game_completion_projections WHERE user_id=$1)
-		SELECT g.id,g.name,COALESCE(ug.playtime_minutes,0),COALESCE(ug.recently_played_minutes,0),ug.last_played_at,
-		(w.game_id IS NOT NULL),COALESCE(f.action,''),COALESCE(a.achieved,0),COALESCE(a.total,0),COALESCE(gf.features,'{}'::jsonb),
-		COALESCE(cp.basis,''),COALESCE(cp.ending_count,0),cp.completion_at,
-		(cp.game_id IS NOT NULL AND COALESCE(f.action,'') IN ('dislike','exclude')),COALESCE(cp.weight,0)
-		FROM relevant r JOIN games g ON g.id=r.game_id
-		LEFT JOIN user_games ug ON ug.user_id=$1 AND ug.game_id=r.game_id
-		LEFT JOIN wishlist_entries w ON w.user_id=$1 AND w.game_id=r.game_id
-		LEFT JOIN feedback f ON f.game_id=r.game_id
-		LEFT JOIN achievement_summaries a ON a.user_id=$1 AND a.game_id=r.game_id
-		LEFT JOIN user_game_completion_projections cp ON cp.user_id=$1 AND cp.game_id=r.game_id
+	rows, err := repo.store.Pool.Query(ctx, `SELECT g.id,g.name,e.playtime_minutes,e.recently_played_minutes,e.last_played_at,
+		e.achieved,e.total,COALESCE(gf.features,'{}'::jsonb),COALESCE(e.completion_basis,''),
+		e.completion_ending_count,e.completion_at,e.completion_weight
+		FROM activity_profile_evidence e
+		JOIN games g ON g.id=e.game_id
 		LEFT JOIN LATERAL (SELECT features FROM game_features WHERE game_id=g.id ORDER BY last_successful_fetch_at DESC LIMIT 1) gf ON true
-		`, userID)
+		WHERE e.profile_id=$1
+		ORDER BY e.game_id`, profileID)
 	if err != nil {
 		return ProfileEvidence{}, err
 	}
@@ -138,9 +119,8 @@ func (repo *SQLRepository) LoadProfileEvidence(ctx context.Context, profileID uu
 		var value profileEvidenceSignal
 		if err := rows.Scan(
 			&value.id, &value.name, &value.played, &value.recent, &value.lastPlayedAt,
-			&value.wishlisted, &value.feedbackAction, &value.achieved, &value.achievements, &value.features,
-			&value.completionBasis, &value.endingCount, &value.completionAt,
-			&value.completionOverridden, &value.completionWeight,
+			&value.achieved, &value.achievements, &value.features,
+			&value.completionBasis, &value.endingCount, &value.completionAt, &value.completionWeight,
 		); err != nil {
 			return ProfileEvidence{}, err
 		}
@@ -148,6 +128,21 @@ func (repo *SQLRepository) LoadProfileEvidence(ctx context.Context, profileID uu
 	}
 	if err := rows.Err(); err != nil {
 		return ProfileEvidence{}, err
+	}
+	facts := ActivityFacts{}
+	for _, value := range signals {
+		if value.played > 0 {
+			facts.PlayedGames++
+		}
+		if value.recent > 0 {
+			facts.RecentlyPlayedGames++
+		}
+		if value.achieved > 0 {
+			facts.GamesWithAchievements++
+		}
+		if value.completionWeight > 0 {
+			facts.CompletedGames++
+		}
 	}
 	signals = selectProfileEvidence(signals, 100)
 	evidence := make([]EvidenceItem, 0, len(signals))
@@ -164,18 +159,13 @@ func (repo *SQLRepository) LoadProfileEvidence(ctx context.Context, profileID uu
 		if completionBasis == "" {
 			completionBasis = "none"
 		}
-		directFeedback := value.feedbackAction
-		if directFeedback == "" {
-			directFeedback = "none"
-		}
-		positiveFeedback := value.feedbackAction == "like" && !value.completionOverridden
-		fact := fmt.Sprintf("%s; playtime_minutes=%d; recent_minutes=%d; last_played_at=%s; wishlisted=%t; direct_feedback=%s; positive_feedback=%t; achievements=%d/%d; completion_basis=%s; ending_count=%d; completion_at=%s; completion_overridden=%t; features=%s", value.name, value.played, value.recent, lastPlayedAt, value.wishlisted, directFeedback, positiveFeedback, value.achieved, value.achievements, completionBasis, value.endingCount, completionAt, value.completionOverridden, string(value.features))
+		fact := fmt.Sprintf("%s; playtime_minutes=%d; recent_minutes=%d; last_played_at=%s; achievements=%d/%d; completion_basis=%s; ending_count=%d; completion_at=%s; features=%s", value.name, value.played, value.recent, lastPlayedAt, value.achieved, value.achievements, completionBasis, value.endingCount, completionAt, string(value.features))
 		evidence = append(evidence, EvidenceItem{Key: fmt.Sprintf("signal-%03d", index+1), Value: fact})
 	}
 	if len(evidence) == 0 {
 		return ProfileEvidence{}, fmt.Errorf("%w: profile has no evidence", ErrInvalidInput)
 	}
-	return ProfileEvidence{EvidenceKey: "profile-evidence", Evidence: evidence}, nil
+	return ProfileEvidence{EvidenceKey: "profile-evidence", Evidence: evidence, Facts: facts}, nil
 }
 
 func selectProfileEvidence(input []profileEvidenceSignal, limit int) []profileEvidenceSignal {
@@ -226,16 +216,14 @@ func selectProfileEvidence(input []profileEvidenceSignal, limit int) []profileEv
 
 func profileEvidenceTier(signal profileEvidenceSignal) int {
 	switch {
-	case signal.completionBasis != "":
+	case signal.completionWeight > 0:
 		return 0
 	case signal.recent > 0:
 		return 1
-	case signal.feedbackAction != "":
+	case signal.achieved > 0:
 		return 2
-	case signal.wishlisted:
-		return 3
 	default:
-		return 4
+		return 3
 	}
 }
 
@@ -246,11 +234,8 @@ func profileEvidenceMaterialValue(signal profileEvidenceSignal) float64 {
 	case 1:
 		return float64(signal.recent)
 	case 2:
-		if signal.feedbackAction == "like" {
-			return 1
-		}
-		return 0
-	case 4:
+		return float64(signal.achieved)
+	case 3:
 		return float64(signal.played)
 	default:
 		return 0
@@ -261,22 +246,149 @@ func normalizeProfileEvidenceName(value string) string {
 	return strings.ToLower(strings.Join(strings.Fields(value), " "))
 }
 
-func (repo *SQLRepository) HasProfileSummary(ctx context.Context, id uuid.UUID, model, hash string) (bool, error) {
-	_, err := repo.store.Queries.GetProfileSummaryByHash(ctx, dbgen.GetProfileSummaryByHashParams{ID: uuidPG(id), Model: pgtype.Text{String: model, Valid: true}, InputContentHash: pgtype.Text{String: hash, Valid: true}})
+func (repo *SQLRepository) LoadCachedProfileSummary(ctx context.Context, id uuid.UUID, model, hash string) (ProfileSummary, bool, error) {
+	row, err := repo.store.Queries.GetProfileSummaryByHash(ctx, dbgen.GetProfileSummaryByHashParams{ID: uuidPG(id), Model: pgtype.Text{String: model, Valid: true}, InputContentHash: pgtype.Text{String: hash, Valid: true}})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return ProfileSummary{}, false, nil
 	}
-	return err == nil, err
+	if err != nil {
+		return ProfileSummary{}, false, err
+	}
+	if !row.Valid || !validPublishedSummary(row.String) {
+		return ProfileSummary{}, false, nil
+	}
+	return ProfileSummary{Summary: row.String}, true, nil
 }
-func (repo *SQLRepository) SaveProfileSummary(ctx context.Context, id uuid.UUID, model, hash string, value ProfileSummary) error {
-	rows, err := repo.store.Queries.UpdateProfileSummary(ctx, dbgen.UpdateProfileSummaryParams{ID: uuidPG(id), Summary: pgtype.Text{String: value.Summary, Valid: true}, Model: pgtype.Text{String: model, Valid: true}, InputContentHash: pgtype.Text{String: hash, Valid: true}})
+
+func (repo *SQLRepository) PublishProfileSummary(ctx context.Context, lease jobs.Lease, id uuid.UUID, model, hash string, value ProfileSummary, source string) error {
+	if !validPublishedSummary(value.Summary) || (source != "openai" && source != "deterministic") {
+		return ErrInvalidOutput
+	}
+	tx, err := repo.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
 	}
-	if rows != 1 {
-		return fmt.Errorf("profile no longer exists")
+	defer tx.Rollback(ctx)
+	userID, err := lockOwnedSummaryJobAndProfile(ctx, tx, lease, id)
+	if err != nil {
+		return err
 	}
-	return nil
+	command, err := tx.Exec(ctx, `UPDATE preference_profiles SET summary=$1,model=$2,input_content_hash=$3,
+		summary_source=$4,publication_state='published',published_at=now()
+		WHERE id=$5 AND user_id=$6 AND publication_state='building'
+		AND NOT EXISTS(SELECT 1 FROM deleted_user_tombstones WHERE user_id=$6)
+		AND EXISTS(SELECT 1 FROM sync_jobs j WHERE j.id=$7 AND j.user_id=$6 AND j.kind=$8
+			AND j.status='running' AND j.worker_id=$9 AND j.fencing_token=$10 AND j.lease_until>clock_timestamp())`,
+		value.Summary, model, hash, source, id, userID, lease.ID, ProfileSummaryJobKind, lease.WorkerID, lease.FencingToken)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		var exact bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM preference_profiles p JOIN sync_jobs j ON j.id=$7
+			WHERE p.id=$1 AND p.user_id=$2 AND j.user_id=p.user_id AND j.kind=$8 AND j.status='running'
+			AND j.worker_id=$9 AND j.fencing_token=$10 AND j.lease_until>clock_timestamp()
+			AND p.publication_state='published' AND p.summary=$3 AND p.model=$4 AND p.input_content_hash=$5 AND p.summary_source=$6)`,
+			id, userID, value.Summary, model, hash, source, lease.ID, ProfileSummaryJobKind, lease.WorkerID, lease.FencingToken).Scan(&exact); err != nil {
+			return err
+		}
+		if !exact {
+			return jobs.ErrLeaseLost
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (repo *SQLRepository) HandleTerminalProfileSummaryFailure(ctx context.Context, lease jobs.Lease, id uuid.UUID, model string) (bool, error) {
+	tx, err := repo.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	userID, err := lockOwnedSummaryJobAndProfile(ctx, tx, lease, id)
+	if err != nil {
+		return false, err
+	}
+	var lockedID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT id FROM preference_profiles WHERE id=$1 AND user_id=$2 AND publication_state='building' FOR UPDATE`, id, userID).Scan(&lockedID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, jobs.ErrLeaseLost
+		}
+		return false, err
+	}
+	var olderPublished bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM preference_profiles WHERE user_id=$1 AND id<>$2 AND publication_state='published')`, userID, id).Scan(&olderPublished); err != nil {
+		return false, err
+	}
+	if olderPublished {
+		command, err := tx.Exec(ctx, `UPDATE preference_profiles SET publication_state='failed' WHERE id=$1 AND user_id=$2 AND publication_state='building'
+			AND NOT EXISTS(SELECT 1 FROM deleted_user_tombstones WHERE user_id=$2)
+			AND EXISTS(SELECT 1 FROM sync_jobs j WHERE j.id=$3 AND j.user_id=$2 AND j.kind=$4
+				AND j.status='running' AND j.worker_id=$5 AND j.fencing_token=$6 AND j.lease_until>clock_timestamp())`,
+			id, userID, lease.ID, ProfileSummaryJobKind, lease.WorkerID, lease.FencingToken)
+		if err != nil {
+			return false, err
+		}
+		if command.RowsAffected() != 1 {
+			return false, jobs.ErrLeaseLost
+		}
+		return false, tx.Commit(ctx)
+	}
+	facts, err := loadActivityFacts(ctx, tx, id)
+	if err != nil {
+		return false, err
+	}
+	summary := DeterministicActivitySummary(facts)
+	hash, err := ContentHash(ProfileSummaryJobKind, SchemaVersion, "deterministic-activity-fallback-v1", model, facts)
+	if err != nil {
+		return false, err
+	}
+	command, err := tx.Exec(ctx, `UPDATE preference_profiles SET summary=$1,model=$2,input_content_hash=$3,
+		summary_source='deterministic',publication_state='published',published_at=now()
+		WHERE id=$4 AND user_id=$5 AND publication_state='building'
+		AND NOT EXISTS(SELECT 1 FROM deleted_user_tombstones WHERE user_id=$5)
+		AND EXISTS(SELECT 1 FROM sync_jobs j WHERE j.id=$6 AND j.user_id=$5 AND j.kind=$7
+			AND j.status='running' AND j.worker_id=$8 AND j.fencing_token=$9 AND j.lease_until>clock_timestamp())`,
+		summary, model, hash, id, userID, lease.ID, ProfileSummaryJobKind, lease.WorkerID, lease.FencingToken)
+	if err != nil {
+		return false, err
+	}
+	if command.RowsAffected() != 1 {
+		return false, jobs.ErrLeaseLost
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func lockOwnedSummaryJobAndProfile(ctx context.Context, tx pgx.Tx, lease jobs.Lease, profileID uuid.UUID) (uuid.UUID, error) {
+	var userID uuid.UUID
+	err := tx.QueryRow(ctx, `SELECT p.user_id FROM sync_jobs j JOIN preference_profiles p ON p.id=$1
+		WHERE j.id=$2 AND j.kind=$3 AND j.status='running' AND j.worker_id=$4 AND j.fencing_token=$5
+		AND j.lease_until>clock_timestamp() AND j.user_id=p.user_id FOR UPDATE OF j,p`,
+		profileID, lease.ID, ProfileSummaryJobKind, lease.WorkerID, lease.FencingToken).Scan(&userID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, jobs.ErrLeaseLost
+	}
+	return userID, err
+}
+
+func loadActivityFacts(ctx context.Context, tx pgx.Tx, profileID uuid.UUID) (ActivityFacts, error) {
+	var facts ActivityFacts
+	err := tx.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE playtime_minutes>0),
+		count(*) FILTER (WHERE recently_played_minutes>0),
+		count(*) FILTER (WHERE achieved>0),
+		count(*) FILTER (WHERE completion_weight>0)
+		FROM activity_profile_evidence WHERE profile_id=$1`, profileID).Scan(
+		&facts.PlayedGames, &facts.RecentlyPlayedGames, &facts.GamesWithAchievements, &facts.CompletedGames,
+	)
+	return facts, err
+}
+
+func validPublishedSummary(value string) bool {
+	return strings.TrimSpace(value) != "" && utf8.ValidString(value) && utf8.RuneCountInString(value) <= 4000
 }
 
 func uuidPG(value uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: value, Valid: true} }

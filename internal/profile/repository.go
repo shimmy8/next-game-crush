@@ -282,12 +282,60 @@ func (r *SQLRepository) buildProvidedVectors(ctx context.Context, request BuildR
 	return profile, true, nil
 }
 
-func (r *SQLRepository) LatestProfile(ctx context.Context, userID uuid.UUID) (Profile, error) {
+func (r *SQLRepository) LatestVectorComplete(ctx context.Context, userID uuid.UUID) (Profile, error) {
 	row, err := r.store.Queries.GetLatestActivityProfileState(ctx, uuidToPG(userID))
 	if err != nil {
 		return Profile{}, err
 	}
 	return r.profileFromRow(ctx, r.store.Queries, row)
+}
+
+// LatestProfile is retained as an internal compatibility alias while ranking
+// callers move to the explicit vector-complete name.
+func (r *SQLRepository) LatestProfile(ctx context.Context, userID uuid.UUID) (Profile, error) {
+	return r.LatestVectorComplete(ctx, userID)
+}
+
+// LatestPublishedProfile implements the public stale-while-revalidate view.
+// It inspects the newest state first so an authoritative insufficient snapshot
+// never resurrects an older document.
+func (r *SQLRepository) LatestPublishedProfile(ctx context.Context, userID uuid.UUID) (Profile, error) {
+	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return Profile{}, err
+	}
+	defer tx.Rollback(ctx)
+	queries := r.store.Queries.WithTx(tx)
+	newest, err := queries.GetLatestActivityProfileState(ctx, uuidToPG(userID))
+	if err != nil {
+		return Profile{}, err
+	}
+	var visible Profile
+	switch PublicationState(newest.PublicationState) {
+	case PublicationPublished:
+		visible, err = r.profileFromRow(ctx, queries, newest)
+	case PublicationInsufficient:
+		return Profile{}, pgx.ErrNoRows
+	case PublicationBuilding, PublicationFailed:
+		published, loadErr := queries.GetLatestPublishedActivityProfile(ctx, uuidToPG(userID))
+		if loadErr != nil {
+			return Profile{}, loadErr
+		}
+		visible, loadErr = r.profileFromRow(ctx, queries, published)
+		if loadErr != nil {
+			return Profile{}, loadErr
+		}
+		visible.Updating = PublicationState(newest.PublicationState) == PublicationBuilding
+	default:
+		return Profile{}, fmt.Errorf("unsupported profile publication state %q", newest.PublicationState)
+	}
+	if err != nil {
+		return Profile{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Profile{}, err
+	}
+	return visible, nil
 }
 
 type profileQueries interface {

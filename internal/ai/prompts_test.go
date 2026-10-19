@@ -54,13 +54,8 @@ func TestProfilePromptContract(t *testing.T) {
 		"120 Unicode characters",
 		"repeated only when the same supplied feature appears in multiple evidence items",
 		"recent_minutes > 0",
-		"direct_feedback=like",
-		"wishlist-only evidence",
-		"interest in the concept",
-		"never as played experience or a confirmed preference",
 		"lifetime activity is historical",
 		"Low playtime does not weaken completion",
-		"overridden completion is not positive",
 		"unknown last_played_at does not imply recency",
 		"never invent last-played or release dates",
 		"at most one concise material caveat",
@@ -68,6 +63,11 @@ func TestProfilePromptContract(t *testing.T) {
 	} {
 		if !strings.Contains(profileInstructions, required) {
 			t.Fatalf("profile instructions do not contain %q: %q", required, profileInstructions)
+		}
+	}
+	for _, forbidden := range []string{"direct_feedback", "wishlist", "overridden completion"} {
+		if strings.Contains(profileInstructions, forbidden) {
+			t.Fatalf("activity profile instructions contain forbidden %q: %q", forbidden, profileInstructions)
 		}
 	}
 }

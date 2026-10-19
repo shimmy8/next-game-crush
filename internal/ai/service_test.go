@@ -379,7 +379,7 @@ func TestProfileSummaryIsNormalizedBeforePersistence(t *testing.T) {
 		EvidenceKeys: []string{"signal-1"},
 	}}
 	service, _ := NewService(repository, client, "gpt-6-luna", "text-embedding-3-small")
-	if err := service.processProfileSummary(context.Background(), uuid.New()); err != nil {
+	if err := service.processProfileSummary(context.Background(), jobs.Lease{}, uuid.New()); err != nil {
 		t.Fatal(err)
 	}
 	if !repository.savedProfileSummary {
@@ -396,6 +396,36 @@ func TestProfileSummaryIsNormalizedBeforePersistence(t *testing.T) {
 	}
 }
 
+func TestDisabledOpenAIPublishesDeterministicActivityFallback(t *testing.T) {
+	repository := &fakeRepository{profileEvidence: ProfileEvidence{
+		EvidenceKey: "profile", Evidence: []EvidenceItem{{Key: "signal-1", Value: "playtime_minutes=12"}},
+		Facts: ActivityFacts{PlayedGames: 1, RecentlyPlayedGames: 1},
+	}}
+	client := &fakeClient{profileErr: ErrCapabilityDisabled}
+	service, _ := NewService(repository, client, "gpt-6-luna", "text-embedding-3-small")
+	if err := service.processProfileSummary(context.Background(), jobs.Lease{}, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if !repository.savedProfileSummary || repository.summarySource != "deterministic" || !strings.Contains(repository.profileSummary.Summary, "игровым временем — 1") {
+		t.Fatalf("fallback publication = saved:%v source:%q summary:%q", repository.savedProfileSummary, repository.summarySource, repository.profileSummary.Summary)
+	}
+}
+
+func TestCachedProfileSummaryStillPublishesDraft(t *testing.T) {
+	repository := &fakeRepository{
+		profileEvidence: ProfileEvidence{EvidenceKey: "profile", Evidence: []EvidenceItem{{Key: "signal-1", Value: "playtime_minutes=12"}}},
+		cachedProfile:   ProfileSummary{Summary: strings.Repeat("я", 650)},
+		cachedSummary:   true,
+	}
+	service, _ := NewService(repository, &fakeClient{}, "gpt-6-luna", "text-embedding-3-small")
+	if err := service.processProfileSummary(context.Background(), jobs.Lease{}, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if !repository.savedProfileSummary || repository.summarySource != "openai" {
+		t.Fatalf("cached summary was not published: %#v", repository)
+	}
+}
+
 type fakeRepository struct {
 	game                StoredGameEvidence
 	gameIDs             []uuid.UUID
@@ -406,6 +436,9 @@ type fakeRepository struct {
 	savedEmbedding      bool
 	savedProfileSummary bool
 	profileSummary      ProfileSummary
+	cachedProfile       ProfileSummary
+	cachedSummary       bool
+	summarySource       string
 }
 
 func (f *fakeRepository) ListGameIDs(context.Context, uuid.UUID) ([]uuid.UUID, error) {
@@ -434,14 +467,19 @@ func (f *fakeRepository) SaveGameEmbedding(context.Context, uuid.UUID, string, s
 func (f *fakeRepository) LoadProfileEvidence(context.Context, uuid.UUID) (ProfileEvidence, error) {
 	return f.profileEvidence, nil
 }
-func (f *fakeRepository) HasProfileSummary(context.Context, uuid.UUID, string, string) (bool, error) {
-	return false, nil
+func (f *fakeRepository) LoadCachedProfileSummary(context.Context, uuid.UUID, string, string) (ProfileSummary, bool, error) {
+	return f.cachedProfile, f.cachedSummary, nil
 }
 
-func (f *fakeRepository) SaveProfileSummary(_ context.Context, _ uuid.UUID, _, _ string, value ProfileSummary) error {
+func (f *fakeRepository) PublishProfileSummary(_ context.Context, _ jobs.Lease, _ uuid.UUID, _, _ string, value ProfileSummary, source string) error {
 	f.savedProfileSummary = true
 	f.profileSummary = value
+	f.summarySource = source
 	return nil
+}
+
+func (f *fakeRepository) HandleTerminalProfileSummaryFailure(context.Context, jobs.Lease, uuid.UUID, string) (bool, error) {
+	return false, nil
 }
 
 type fakeClient struct {
@@ -450,6 +488,7 @@ type fakeClient struct {
 	features       GameFeatures
 	vectors        [][]float32
 	profileSummary ProfileSummary
+	profileErr     error
 }
 
 func (f *fakeClient) ExtractGameFeatures(context.Context, GameEvidence) (GameFeatures, error) {
@@ -457,7 +496,7 @@ func (f *fakeClient) ExtractGameFeatures(context.Context, GameEvidence) (GameFea
 	return f.features, f.featureErr
 }
 func (f *fakeClient) SummarizeProfile(context.Context, ProfileEvidence) (ProfileSummary, error) {
-	return f.profileSummary, nil
+	return f.profileSummary, f.profileErr
 }
 func (f *fakeClient) ExplainRecommendation(context.Context, RecommendationEvidence) (Explanation, error) {
 	return Explanation{}, nil
