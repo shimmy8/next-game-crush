@@ -313,16 +313,17 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 			}
 			return queue.RecordResult(ctx, lease, diff)
 		}
-		profilePayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": event.UserID})
-		ready, err := queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "profile.rebuild", Stage: "profile", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":profile:v1", Payload: profilePayload, MaxAttempts: 3}})
+		overlayPayload, _ := json.Marshal(preferences.OverlayJobPayload{Version: 1, UserID: event.UserID})
+		ready, err := queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: preferences.OverlayJobKind, Stage: "preferences", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":overlay:v1", Payload: overlayPayload, MaxAttempts: 3}})
 		if err != nil {
 			return err
 		}
 		if !ready {
 			return jobs.ErrDeferred
 		}
-		rankingPayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": event.UserID})
-		ready, err = queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: "feedback:" + event.ID.String() + ":ranking:v1", Payload: rankingPayload, MaxAttempts: 3}})
+		rankingKey := "feedback:" + event.ID.String() + ":ranking:v1"
+		rankingPayload, _ := json.Marshal(map[string]any{"version": 1, "user_id": event.UserID, "request_key": rankingKey})
+		ready, err = queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", UserID: event.UserID, Priority: 100, Required: true, IdempotencyKey: rankingKey, Payload: rankingPayload, MaxAttempts: 3}})
 		if err != nil {
 			return err
 		}

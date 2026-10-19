@@ -714,6 +714,9 @@ func TestProjectionJobRebuildsProfileThenRecommendationsOnce(t *testing.T) {
 	}
 	assertJobCounts(t, db, 1, 0)
 	profileLease := claimKind(t, queue, "profile.rebuild")
+	if err := queue.RecordResult(ctx, *profileLease, map[string]any{"profileId": uuid.New(), "profileVersion": 1, "profileBuildKey": "completion-fixture-profile"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := queue.Complete(ctx, *profileLease); err != nil {
 		t.Fatal(err)
 	}

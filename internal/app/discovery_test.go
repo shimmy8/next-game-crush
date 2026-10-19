@@ -88,7 +88,7 @@ func TestAppRegistersHandlersInCorrectLanes(t *testing.T) {
 	if interactive.Concurrency() != 3 || catalogWorker.Concurrency() != 4 {
 		t.Fatalf("concurrency interactive=%d catalog=%d", interactive.Concurrency(), catalogWorker.Concurrency())
 	}
-	for _, kind := range []string{"steam.sync", "recommendations.rebuild"} {
+	for _, kind := range []string{"steam.sync", "profile.rebuild", "preferences.rebuild", "preferences.disable", "recommendations.rebuild"} {
 		if !interactive.Handles(kind) || catalogWorker.Handles(kind) {
 			t.Fatalf("kind %q must be interactive only", kind)
 		}

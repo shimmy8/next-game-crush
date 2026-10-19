@@ -16,6 +16,7 @@ import (
 	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/observability"
+	"next-game-crush/internal/recommendations"
 	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
 	dbgen "next-game-crush/internal/store/sqlc"
@@ -428,7 +429,13 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 			}
 		}
 		if !hasRecommendations {
-			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: lease.IdempotencyKey + ":recommendations:v1", Payload: encoded, MaxAttempts: 3, Priority: 100, UserID: payload.UserID}})
+			profileBuildKey, err := s.completedProfileBuildKey(ctx, lease.ID, payload.UserID)
+			if err != nil {
+				return err
+			}
+			rankingKey := lease.IdempotencyKey + ":recommendations:v1"
+			rankingPayload, _ := json.Marshal(recommendations.JobPayload{Version: recommendations.JobPayloadVersion, UserID: payload.UserID, ProfileBuildKey: profileBuildKey, RequestKey: rankingKey})
+			ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: recommendations.JobKind, Stage: "recommendations", Required: true, IdempotencyKey: rankingKey, Payload: rankingPayload, MaxAttempts: 3, Priority: 100, UserID: payload.UserID}})
 			if err != nil {
 				return err
 			}
@@ -457,6 +464,23 @@ func (s *Service) handleSteamSync(ctx context.Context, lease jobs.Lease) error {
 		return jobs.ErrDeferred
 	}
 	return nil
+}
+
+func (s *Service) completedProfileBuildKey(ctx context.Context, parentID, userID uuid.UUID) (string, error) {
+	var buildKey string
+	err := s.store.Pool.QueryRow(ctx, `SELECT COALESCE(NULLIF(child.result->>'profileBuildKey',''),p.build_key)
+		FROM sync_jobs child
+		LEFT JOIN preference_profiles p ON p.id=NULLIF(child.result->>'profileId','')::uuid AND p.user_id=child.user_id
+		WHERE child.parent_job_id=$1 AND child.user_id=$2 AND child.kind='profile.rebuild'
+		  AND child.stage='profile' AND child.status='succeeded'
+		ORDER BY child.created_at DESC,child.id DESC LIMIT 1`, parentID, userID).Scan(&buildKey)
+	if err != nil {
+		return "", fmt.Errorf("load completed activity profile build key: %w", err)
+	}
+	if strings.TrimSpace(buildKey) == "" {
+		return "", errors.New("completed activity profile build key is missing")
+	}
+	return buildKey, nil
 }
 
 func (s *Service) handleCatalogRefresh(ctx context.Context, lease jobs.Lease) error {

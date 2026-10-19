@@ -49,6 +49,17 @@ func TestCompleteFeedbackWorkflowLogsOmitSensitiveInputs(t *testing.T) {
 	if err := fixture.profiles.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}
+	preferenceRepo, err := preferences.NewSQLRepository(fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preferenceService, err := preferences.NewService(preferenceRepo, queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preferenceService.RegisterHandlers(worker); err != nil {
+		t.Fatal(err)
+	}
 	if err := fixture.ranking.RegisterHandlers(worker); err != nil {
 		t.Fatal(err)
 	}
@@ -91,10 +102,6 @@ func TestCompleteFeedbackWorkflowLogsOmitSensitiveInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	preferenceRepo, err := preferences.NewSQLRepository(fixture.db)
-	if err != nil {
-		t.Fatal(err)
-	}
 	adjustment, err := preferenceRepo.ForFeedback(ctx, fixture.userID, accepted.EventID)
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +115,18 @@ func TestCompleteFeedbackWorkflowLogsOmitSensitiveInputs(t *testing.T) {
 	}
 	if classification.Model != "deterministic-fallback" {
 		t.Fatalf("classifier failure did not use the safe fallback: model=%q", classification.Model)
+	}
+	var overlays, rankings, profiles, summaries int
+	if err := fixture.db.Pool.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE kind='preferences.rebuild'),
+		count(*) FILTER (WHERE kind='recommendations.rebuild'),
+		count(*) FILTER (WHERE kind='profile.rebuild'),
+		count(*) FILTER (WHERE kind='ai.profile_summary')
+		FROM sync_jobs WHERE parent_job_id=$1`, accepted.RebuildJobID).Scan(&overlays, &rankings, &profiles, &summaries); err != nil {
+		t.Fatal(err)
+	}
+	if overlays != 1 || rankings != 1 || profiles != 0 || summaries != 0 {
+		t.Fatalf("feedback child stages overlay/ranking/profile/summary=%d/%d/%d/%d", overlays, rankings, profiles, summaries)
 	}
 	encoded := logs.String()
 	for _, forbidden := range []string{

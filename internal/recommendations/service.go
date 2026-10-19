@@ -40,6 +40,9 @@ type DeckRefreshPlanner interface {
 type CatalogRebuildObserver interface {
 	CatalogRebuildFinished(context.Context, uuid.UUID, string, bool) error
 }
+type rankingProfileVersionReader interface {
+	RankingProfileVersion(context.Context, uuid.UUID, int64) (int64, error)
+}
 type Repository interface {
 	Candidates(context.Context, uuid.UUID, profile.Profile, int) ([]Candidate, error)
 	RankingInputs(context.Context, uuid.UUID, profile.Profile, int) (RankingInputs, error)
@@ -125,12 +128,16 @@ func (s *Service) Rebuild(ctx context.Context, userID uuid.UUID) ([]Recommendati
 	items, _, _, err := s.rebuild(ctx, userID, uuid.NewString())
 	return items, err
 }
-func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string) ([]Recommendation, int64, ExplanationStats, error) {
+func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, requestKey string) ([]Recommendation, int64, ExplanationStats, error) {
+	return s.rebuildForProfile(ctx, userID, "", requestKey)
+}
+
+func (s *Service) rebuildForProfile(ctx context.Context, userID uuid.UUID, profileBuildKey, requestKey string) ([]Recommendation, int64, ExplanationStats, error) {
 	emptyStats := ExplanationStats{FailureReasons: map[ExplanationFailureReason]int{}}
 	if s.overlays == nil {
 		return nil, 0, emptyStats, errors.New("preference overlay service is required")
 	}
-	input, err := s.resolveCoherentInputs(ctx, userID, buildKey)
+	input, err := s.resolveCoherentInputsForProfile(ctx, userID, profileBuildKey, requestKey)
 	if err != nil {
 		return nil, 0, emptyStats, fmt.Errorf("retrieve candidates: %w", err)
 	}
@@ -164,7 +171,7 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 	// only afterwards so a strong item from a later retrieval leg cannot be
 	// discarded before scoring; wishlist entries are mandatory and uncapped.
 	output = capRankedRecommendations(output, s.limit)
-	runBuildKey := RankingBuildKey(buildKey, AlgorithmVersion, input.Source)
+	runBuildKey := RankingBuildKey(requestKey, AlgorithmVersion, input.Source)
 	saved, rankingVersion, alreadyPublished, err := s.repository.SaveRanking(ctx, userID, input.Source, output, runBuildKey)
 	if err != nil {
 		return nil, 0, emptyStats, fmt.Errorf("persist ranking: %w", err)
@@ -246,12 +253,16 @@ func capRankedRecommendations(ranked []Recommendation, nonWishlistLimit int) []R
 // opening the ranking snapshot. A feedback commit in that gap makes the first
 // snapshot's direct factors newer than its overlay; rebuilding once more
 // detects that change and retries with the exact newly published overlay.
-func (s *Service) resolveCoherentInputs(ctx context.Context, userID uuid.UUID, buildKey string) (RankingInputs, error) {
+func (s *Service) resolveCoherentInputs(ctx context.Context, userID uuid.UUID, requestKey string) (RankingInputs, error) {
+	return s.resolveCoherentInputsForProfile(ctx, userID, "", requestKey)
+}
+
+func (s *Service) resolveCoherentInputsForProfile(ctx context.Context, userID uuid.UUID, profileBuildKey, requestKey string) (RankingInputs, error) {
 	for attempt := 0; attempt < 3; attempt++ {
 		if _, err := s.overlays.EnsureCurrent(ctx, userID); err != nil {
 			return RankingInputs{}, fmt.Errorf("ensure current preference overlay: %w", err)
 		}
-		input, err := s.repository.ResolveRankingInputs(ctx, RankingRequest{UserID: userID, RequestKey: buildKey}, 1000000)
+		input, err := s.repository.ResolveRankingInputs(ctx, RankingRequest{UserID: userID, ProfileBuildKey: profileBuildKey, RequestKey: requestKey}, 1000000)
 		if err != nil {
 			return RankingInputs{}, err
 		}
@@ -716,8 +727,10 @@ func safePresentation(r Recommendation) Recommendation {
 }
 
 type JobPayload struct {
-	Version int       `json:"version"`
-	UserID  uuid.UUID `json:"user_id"`
+	Version         int       `json:"version"`
+	UserID          uuid.UUID `json:"user_id"`
+	ProfileBuildKey string    `json:"profile_build_key,omitempty"`
+	RequestKey      string    `json:"request_key,omitempty"`
 }
 
 func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
@@ -729,10 +742,14 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 
 func (s *Service) handleJob(ctx context.Context, lease jobs.Lease) error {
 	var p JobPayload
-	if json.Unmarshal(lease.Payload, &p) != nil || p.Version != JobPayloadVersion || p.UserID == uuid.Nil {
+	if json.Unmarshal(lease.Payload, &p) != nil || p.Version != JobPayloadVersion || p.UserID == uuid.Nil || lease.UserID != p.UserID {
 		return errors.New("unsupported recommendations job payload schema")
 	}
-	result, rankingVersion, explanationStats, err := s.rebuild(ctx, p.UserID, stableRebuildRequestKey(lease.IdempotencyKey))
+	requestKey := strings.TrimSpace(p.RequestKey)
+	if requestKey == "" {
+		requestKey = stableRebuildRequestKey(lease.IdempotencyKey)
+	}
+	result, rankingVersion, explanationStats, err := s.rebuildForProfile(ctx, p.UserID, strings.TrimSpace(p.ProfileBuildKey), requestKey)
 	if err != nil {
 		if s.catalogRebuilds != nil {
 			if observerErr := s.catalogRebuilds.CatalogRebuildFinished(ctx, p.UserID, lease.IdempotencyKey, false); observerErr != nil {
@@ -747,11 +764,22 @@ func (s *Service) handleJob(ctx context.Context, lease jobs.Lease) error {
 		}
 	}
 	if s.queue != nil {
-		profileValue, err := s.profiles.Latest(ctx, p.UserID)
-		if err != nil {
-			return err
+		var profileVersion int64
+		if reader, ok := s.repository.(rankingProfileVersionReader); ok {
+			profileVersion, err = reader.RankingProfileVersion(ctx, p.UserID, rankingVersion)
+		} else if len(result) > 0 {
+			profileVersion = result[0].ProfileVersion
+		} else {
+			profileValue, latestErr := s.profiles.Latest(ctx, p.UserID)
+			err, profileVersion = latestErr, profileValue.Version
 		}
-		if err := s.queue.RecordResult(ctx, lease, map[string]any{"profileVersion": profileValue.Version, "rankingVersion": rankingVersion, "algorithmVersion": AlgorithmVersion, "recommendationCount": len(result), "explanations": explanationStats}); err != nil {
+		if err != nil {
+			return fmt.Errorf("resolve ranking activity profile version: %w", err)
+		}
+		if profileVersion < 1 {
+			return errors.New("resolve ranking activity profile version: invalid version")
+		}
+		if err := s.queue.RecordResult(ctx, lease, map[string]any{"profileVersion": profileVersion, "rankingVersion": rankingVersion, "algorithmVersion": AlgorithmVersion, "recommendationCount": len(result), "explanations": explanationStats}); err != nil {
 			return err
 		}
 	}

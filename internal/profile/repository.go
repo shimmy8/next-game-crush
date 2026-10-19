@@ -343,7 +343,7 @@ type profileQueries interface {
 }
 
 func (r *SQLRepository) profileFromRow(ctx context.Context, queries profileQueries, row dbgen.PreferenceProfile) (Profile, error) {
-	profile := Profile{ID: uuid.UUID(row.ID.Bytes), UserID: uuid.UUID(row.UserID.Bytes), Version: row.Version, PublicationState: PublicationState(row.PublicationState)}
+	profile := Profile{ID: uuid.UUID(row.ID.Bytes), UserID: uuid.UUID(row.UserID.Bytes), Version: row.Version, BuildKey: row.BuildKey.String, PublicationState: PublicationState(row.PublicationState)}
 	if row.Summary.Valid {
 		profile.Summary = row.Summary.String
 	}

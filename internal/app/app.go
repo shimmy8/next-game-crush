@@ -233,6 +233,21 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("register profile handlers: %w", err)
 	}
+	preferenceRepository, err := preferences.NewSQLRepository(db)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure preference repository: %w", err)
+	}
+	preferenceService, err := preferences.NewService(preferenceRepository, queue)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure preference service: %w", err)
+	}
+	// Register the overlay handler before any user workflow that can enqueue it.
+	if err := preferenceService.RegisterHandlers(interactiveWorker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register preference handlers: %w", err)
+	}
 	recommendationRepository, err := recommendations.NewSQLRepository(db, cfg.OpenAIEmbeddingModel, cfg.OpenAIModel)
 	if err != nil {
 		db.Close()
@@ -248,7 +263,7 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("configure current eligibility: %w", err)
 	}
 	sharedClock := func() time.Time { return time.Now().UTC() }
-	recommendationService, err := recommendations.NewService(recommendationRepository, profileService, openAIClient, eligibilityRepository, sharedClock)
+	recommendationService, err := recommendations.NewService(recommendationRepository, profileService, openAIClient, eligibilityRepository, sharedClock, preferenceService)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure recommendation service: %w", err)
@@ -274,20 +289,6 @@ func New(cfg config.Config) (*App, error) {
 	if err := feedbackService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register feedback handlers: %w", err)
-	}
-	preferenceRepository, err := preferences.NewSQLRepository(db)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("configure preference repository: %w", err)
-	}
-	preferenceService, err := preferences.NewService(preferenceRepository, queue)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("configure preference service: %w", err)
-	}
-	if err := preferenceService.RegisterHandlers(interactiveWorker); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("register preference handlers: %w", err)
 	}
 	notificationRepository, err := notifications.NewSQLRepository(db, eligibilityRepository, sharedClock)
 	if err != nil {

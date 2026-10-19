@@ -48,6 +48,7 @@ type Profile struct {
 	ID               uuid.UUID        `json:"id"`
 	UserID           uuid.UUID        `json:"-"`
 	Version          int64            `json:"version"`
+	BuildKey         string           `json:"-"`
 	Summary          string           `json:"summary"`
 	SummaryStatus    SummaryStatus    `json:"summaryStatus"`
 	SummarySource    SummarySource    `json:"summarySource,omitempty"`
@@ -173,6 +174,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 		}
 		if err := s.queue.RecordResult(ctx, lease, map[string]any{
 			"profileId": result.Profile.ID, "profileVersion": result.Profile.Version,
+			"profileBuildKey":  result.Profile.BuildKey,
 			"publicationState": result.Profile.PublicationState, "summaryRequired": result.SummaryRequired,
 		}); err != nil {
 			return err

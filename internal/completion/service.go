@@ -38,6 +38,13 @@ type projectionJobResult struct {
 	ProjectionHash    string `json:"projection_hash,omitempty"`
 }
 
+type recommendationJobPayload struct {
+	Version         int       `json:"version"`
+	UserID          uuid.UUID `json:"user_id"`
+	ProfileBuildKey string    `json:"profile_build_key,omitempty"`
+	RequestKey      string    `json:"request_key,omitempty"`
+}
+
 func NewService(repository *SQLRepository, classifier SemanticClassifier, model string, queue *jobs.Queue) (*Service, error) {
 	if repository == nil || classifier == nil || queue == nil || strings.TrimSpace(model) == "" {
 		return nil, errors.New("completion repository, classifier, model, and queue are required")
@@ -213,7 +220,13 @@ func (s *Service) handleProjection(ctx context.Context, lease jobs.Lease) error 
 		}
 	}
 	if result.Phase == "recommendations" {
-		ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: keyPrefix + ":recommendations:v1", Payload: profilePayload, MaxAttempts: 3, Priority: lease.Priority, UserID: payload.UserID}})
+		profileBuildKey, err := s.completedProfileBuildKey(ctx, lease.ID, payload.UserID)
+		if err != nil {
+			return err
+		}
+		rankingKey := keyPrefix + ":recommendations:v1"
+		rankingPayload, _ := json.Marshal(recommendationJobPayload{Version: 1, UserID: payload.UserID, ProfileBuildKey: profileBuildKey, RequestKey: rankingKey})
+		ready, err := s.queue.AwaitChildren(ctx, lease, []jobs.Spec{{Lane: jobs.LaneInteractive, Kind: "recommendations.rebuild", Stage: "recommendations", Required: true, IdempotencyKey: rankingKey, Payload: rankingPayload, MaxAttempts: 3, Priority: lease.Priority, UserID: payload.UserID}})
 		if err != nil {
 			return err
 		}
@@ -227,6 +240,23 @@ func (s *Service) handleProjection(ctx context.Context, lease jobs.Lease) error 
 		return errors.New("unsupported completion projection result phase")
 	}
 	return nil
+}
+
+func (s *Service) completedProfileBuildKey(ctx context.Context, parentID, userID uuid.UUID) (string, error) {
+	var buildKey string
+	err := s.repository.store.Pool.QueryRow(ctx, `SELECT COALESCE(NULLIF(child.result->>'profileBuildKey',''),p.build_key)
+		FROM sync_jobs child
+		LEFT JOIN preference_profiles p ON p.id=NULLIF(child.result->>'profileId','')::uuid AND p.user_id=child.user_id
+		WHERE child.parent_job_id=$1 AND child.user_id=$2 AND child.kind='profile.rebuild'
+		  AND child.stage='profile' AND child.status='succeeded'
+		ORDER BY child.created_at DESC,child.id DESC LIMIT 1`, parentID, userID).Scan(&buildKey)
+	if err != nil {
+		return "", fmt.Errorf("load completed activity profile build key: %w", err)
+	}
+	if strings.TrimSpace(buildKey) == "" {
+		return "", errors.New("completed activity profile build key is missing")
+	}
+	return buildKey, nil
 }
 
 func decodeProjectionJobPayload(raw json.RawMessage) (ProjectionJobPayload, error) {

@@ -1440,6 +1440,25 @@ type discoveryNudgeStub struct{ calls int }
 
 func (n *discoveryNudgeStub) Nudge(context.Context) error { n.calls++; return nil }
 
+func TestCompletedProfileBuildKeySupportsPreHandoffResult(t *testing.T) {
+	service, _, db, userID := newTestService(t)
+	ctx := context.Background()
+	parentID, profileID := uuid.New(), uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,idempotency_key,status,user_id,lane) VALUES($1,'steam.sync',$2,'succeeded',$3,'interactive')`, parentID, parentID.String(), userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,build_key,publication_state) VALUES($1,$2,1,'legacy-profile-key','building')`, profileID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,idempotency_key,status,parent_job_id,stage,required,user_id,lane,result) VALUES($1,'profile.rebuild',$2,'succeeded',$3,'profile',true,$4,'interactive',$5)`, uuid.New(), parentID.String()+":profile:v1", parentID, userID, []byte(`{"profileId":"`+profileID.String()+`","profileVersion":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := service.completedProfileBuildKey(ctx, parentID, userID)
+	if err != nil || got != "legacy-profile-key" {
+		t.Fatalf("build key=%q err=%v", got, err)
+	}
+}
+
 func TestSyncNudgesDiscoveryOnlyAfterCompletion(t *testing.T) {
 	service, _, db, userID := newTestService(t)
 	service.EnableRankingJobs()

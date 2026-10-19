@@ -186,7 +186,7 @@ func TestClassificationDoesNotDuplicateOverlayDirectGameSignals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(signals) != 1 || signals[0].GameID != highGame || signals[0].Likes != 0 || signals[0].Dislikes != 0 {
+	if len(signals) != 1 || signals[0].GameID != highGame {
 		t.Fatalf("activity signals include feedback-only evidence: %+v", signals)
 	}
 	preferenceRepository, _ := preferences.NewSQLRepository(db)

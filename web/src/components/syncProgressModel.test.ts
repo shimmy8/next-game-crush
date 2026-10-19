@@ -82,6 +82,12 @@ describe('deriveSyncPresentation', () => {
 })
 
 describe('groupSyncStages', () => {
+  it('groups preference overlay work under its safe localized stage', () => {
+    expect(groupSyncStages([
+      { kind: 'preferences.rebuild', stage: 'preferences', status: 'running' },
+    ])).toEqual([expect.objectContaining({ key: 'preferences', label: 'Предпочтения' })])
+  })
+
   it.each(['queued', 'running', 'waiting', 'retryable'])('counts %s work with a retained error as pending', (stageStatus) => {
     const rows = groupSyncStages([
       { kind: 'ai.features', stage: 'ai_features', status: stageStatus, error: 'temporary upstream timeout' },

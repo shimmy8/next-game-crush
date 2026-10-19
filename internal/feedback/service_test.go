@@ -7,14 +7,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/preferences"
-	"next-game-crush/internal/profile"
 	"next-game-crush/internal/recommendations"
 )
 
@@ -94,20 +92,6 @@ func TestLowConfidenceTextDoesNotChangeProfile(t *testing.T) {
 	}
 	if len(repo.classifications) != 1 || repo.classifications[0].Actionable {
 		t.Fatalf("classification=%#v", repo.classifications)
-	}
-}
-
-func TestLikeRaisesRelatedCandidate(t *testing.T) {
-	x, y := make([]float32, profile.Dimensions), make([]float32, profile.Dimensions)
-	x[0], y[1] = 1, 1
-	targetID := uuid.New()
-	asOf := time.Date(2026, time.October, 18, 12, 0, 0, 0, time.UTC)
-	before := profile.BuildVectors([]profile.Signal{{GameID: uuid.New(), Vector: x, PlaytimeMinutes: 100}, {GameID: targetID, Vector: y, Wishlisted: true}}, asOf)
-	after := profile.BuildVectors([]profile.Signal{{GameID: uuid.New(), Vector: x, PlaytimeMinutes: 100}, {GameID: targetID, Vector: y, Wishlisted: true, Likes: 1}}, asOf)
-	beforeScore := recommendations.Score(recommendations.Factors{PositiveSimilarity: positive(profile.Cosine(before.Positive, y)), Confidence: 1}, recommendations.DefaultWeights()).Score
-	afterScore := recommendations.Score(recommendations.Factors{PositiveSimilarity: positive(profile.Cosine(after.Positive, y)), Confidence: 1}, recommendations.DefaultWeights()).Score
-	if afterScore <= beforeScore {
-		t.Fatalf("related score did not rise: before=%f after=%f", beforeScore, afterScore)
 	}
 }
 

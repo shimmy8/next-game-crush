@@ -96,12 +96,12 @@ func TestFeedbackReranksCollectionsAndExcludesOnlyCurrentDislike(t *testing.T) {
 	byGame := make(map[uuid.UUID]recommendations.Recommendation, len(latest))
 	for _, item := range latest {
 		byGame[item.GameID] = item
-		if item.AlgorithmVersion != recommendations.AlgorithmVersion || item.Weights.Wishlist != 0 || item.Weights.PositiveFeedback != 20 || item.Weights.NegativeFeedback != -30 {
+		if item.AlgorithmVersion != recommendations.AlgorithmVersion || item.Weights.Wishlist != 0 || item.Weights.PositiveDirectFeedback != 20 || item.Weights.NegativeDirectFeedback != -30 {
 			t.Fatalf("unexpected persisted ranking-v2 snapshots for %s: algorithm=%q weights=%#v", item.GameID, item.AlgorithmVersion, item.Weights)
 		}
 	}
-	if byGame[fixture.discoveryIDs[1]].Factors.PositiveFeedback != 1 {
-		t.Fatalf("discovery feedback factor=%v, want 1", byGame[fixture.discoveryIDs[1]].Factors.PositiveFeedback)
+	if byGame[fixture.discoveryIDs[1]].Factors.PositiveDirectFeedback != 1 {
+		t.Fatalf("discovery feedback factor=%v, want 1", byGame[fixture.discoveryIDs[1]].Factors.PositiveDirectFeedback)
 	}
 	if _, present := byGame[fixture.wishlistIDs[1]]; present {
 		t.Fatal("currently disliked wishlist game remained in the published ranking")
@@ -149,11 +149,7 @@ func TestWishlistMembershipChangeReclassifiesOnlyAfterPublishedRebuild(t *testin
 		t.Fatal("unpublished wishlist change reclassified the visible collection")
 	}
 
-	p, err := fixture.profiles.Latest(ctx, fixture.userID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inputs, err := fixture.rankingRepo.RankingInputs(ctx, fixture.userID, p, 100)
+	inputs, err := fixture.rankingRepo.ResolveRankingInputs(ctx, recommendations.RankingRequest{UserID: fixture.userID, RequestKey: "wishlist-membership-publish-boundary"}, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,14 +160,14 @@ func TestWishlistMembershipChangeReclassifiesOnlyAfterPublishedRebuild(t *testin
 			continue
 		}
 		prepared = append(prepared, recommendations.Recommendation{
-			GameID: candidate.GameID, Name: candidate.Name, ProfileVersion: p.Version,
+			GameID: candidate.GameID, Name: candidate.Name, ProfileVersion: inputs.Source.Activity.Version,
 			AlgorithmVersion: recommendations.AlgorithmVersion, Score: recommendations.Score(candidate.Factors, weights).Score,
 			Factors: candidate.Factors, Weights: weights, Wishlisted: candidate.Factors.Wishlist > 0, Release: candidate.Release,
 		})
 	}
 	prepared = recommendations.Sort(prepared)
-	const buildKey = "wishlist-membership-publish-boundary"
-	saved, version, _, err := fixture.rankingRepo.SaveRanking(ctx, fixture.userID, p, prepared, buildKey)
+	buildKey := recommendations.RankingBuildKey("wishlist-membership-publish-boundary", recommendations.AlgorithmVersion, inputs.Source)
+	saved, version, _, err := fixture.rankingRepo.SaveRanking(ctx, fixture.userID, inputs.Source, prepared, buildKey)
 	if err != nil {
 		t.Fatal(err)
 	}
