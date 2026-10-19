@@ -338,7 +338,7 @@ describe('useSync', () => {
 })
 
 describe('deriveFreshness', () => {
-  const profile = (createdAt: string): PreferenceProfileData => ({ id: 'p', version: 1, summary: '', summaryStatus: 'unavailable', confidence: .8, evidenceCount: 2, createdAt, adjustments: [] })
+  const profile = (createdAt: string): PreferenceProfileData => ({ id: 'p', version: 1, summary: 'Played activity summary.', summaryStatus: 'ready', summarySource: 'deterministic', confidence: .8, evidenceCount: 2, createdAt, publishedAt: createdAt, updating: false })
 
   it('never treats missing or invalid timestamps as fresh', () => {
     expect(deriveFreshness(null, emptyCalendar, Date.parse('2026-10-17T00:00:00Z')).kind).toBe('unknown')

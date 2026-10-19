@@ -7,36 +7,38 @@ export type ReleaseWindow = {
 }
 
 export type RecommendationFactors = {
+  activitySimilarity?: number
+  positivePreferenceSimilarity?: number
+  negativePreferenceSimilarity?: number
+  positiveDirectFeedback?: number
+  negativeDirectFeedback?: number
   negativeModePreference?: number
-  positiveSimilarity?: number
-  negativeSimilarity?: number
   wishlist?: number
   tagAffinity?: number
   playtimeAffinity?: number
   achievementAffinity?: number
   recentActivityAffinity?: number
   completionAffinity?: number
-  positiveFeedback?: number
   novelty?: number
-  negativeFeedback?: number
   dateUncertainty?: number
   confidence?: number
 }
 
 export type RecommendationWeights = {
-  negativeModePreferenceWeight?: number
-  semanticSimilarity?: number
+  activitySimilarity?: number
+  positivePreferenceSimilarity?: number
+  negativePreferenceSimilarity?: number
+  positiveDirectFeedback?: number
+  negativeDirectFeedback?: number
+  negativeModePreference?: number
   wishlist?: number
   tagAffinity?: number
   playtimeAffinity?: number
   achievementAffinity?: number
   recentActivityAffinity?: number
   completionAffinity?: number
-  positiveFeedback?: number
   novelty?: number
-  negativeFeedback?: number
   dateUncertainty?: number
-  negativeSimilarityMultiplier?: number
 }
 
 export const EVIDENCE_KINDS = ['feature_overlap', 'similar_game', 'playtime_anchor', 'recent_activity_anchor', 'completion_anchor', 'achievement_anchor', 'positive_feedback', 'wishlist_context', 'negative_mode_preference'] as const
@@ -132,15 +134,21 @@ export type RankingDiff = {
 	classification?: { taxonomy: string; polarity: string; confidence: number; actionable: boolean }
 }
 
+export type SummarySource = 'openai' | 'deterministic' | 'legacy'
+
 export type PreferenceProfileData = {
-  adjustments: PreferenceAdjustment[]
+  /** @deprecated Temporary Task 8→9 compile seam. The API/client never populate this field. */
+  adjustments?: PreferenceAdjustment[]
   id: string
   version: number
   summary: string
-  summaryStatus: 'ready' | 'unavailable'
+  summaryStatus: 'ready'
+  summarySource: SummarySource
   confidence: number
   evidenceCount: number
   createdAt: string
+  publishedAt: string
+  updating: boolean
 }
 
 export type AdjustmentSummary = { id: string; label: string; effect: string; active: boolean }
@@ -179,6 +187,13 @@ export type PreflightResponse = {
   avatarUrl: string | null
 }
 
+export type EntryRefreshResponse = {
+  enqueued: boolean
+  reason: 'missing' | 'stale' | 'fresh' | 'active'
+  jobId?: string
+  lastSuccessfulAt?: string
+}
+
 type CurrentUserBase = {
   authenticated: true
   csrfToken: string
@@ -192,7 +207,12 @@ export type CurrentUser = CurrentUserBase & (
   | { accessMode: 'demo'; steamId?: never }
 )
 
-export type DashboardData = { profile: PreferenceProfileData | null; overview: RecommendationOverview }
+export type DashboardData = {
+  profile: PreferenceProfileData | null
+  /** @deprecated Temporary Task 8→9 compile seam; Task 9 makes this required. */
+  adjustments?: PreferenceAdjustment[]
+  overview: RecommendationOverview
+}
 
 export type SafeReloadReason = 'request_failed' | 'superseded' | 'aborted'
 export type DashboardReloadResult =

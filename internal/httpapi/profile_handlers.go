@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -16,7 +18,20 @@ type ProfileReadService interface {
 	Latest(context.Context, uuid.UUID) (profile.Profile, error)
 }
 
-func getProfile(service ProfileReadService, preferenceServices ...PreferenceAdjustmentService) http.HandlerFunc {
+type profileView struct {
+	ID            uuid.UUID             `json:"id"`
+	Version       int64                 `json:"version"`
+	Summary       string                `json:"summary"`
+	SummaryStatus profile.SummaryStatus `json:"summaryStatus"`
+	SummarySource profile.SummarySource `json:"summarySource"`
+	Confidence    float64               `json:"confidence"`
+	EvidenceCount int                   `json:"evidenceCount"`
+	CreatedAt     time.Time             `json:"createdAt"`
+	PublishedAt   time.Time             `json:"publishedAt"`
+	Updating      bool                  `json:"updating"`
+}
+
+func getProfile(service ProfileReadService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		session, ok := auth.SessionFromContext(r.Context())
 		if !ok {
@@ -32,19 +47,17 @@ func getProfile(service ProfileReadService, preferenceServices ...PreferenceAdju
 			http.Error(w, "profile unavailable", http.StatusInternalServerError)
 			return
 		}
-		adjustments := []AdjustmentView{}
-		if len(preferenceServices) > 0 && preferenceServices[0] != nil {
-			values, err := preferenceServices[0].List(r.Context(), session.UserID, false)
-			if err != nil {
-				http.Error(w, "profile unavailable", 500)
-				return
-			}
-			adjustments = adjustmentViews(values, false)
+		if value.ID == uuid.Nil || value.Version < 1 || strings.TrimSpace(value.Summary) == "" || value.PublicationState != profile.PublicationPublished || value.PublishedAt == nil || value.PublishedAt.IsZero() || value.CreatedAt.IsZero() ||
+			(value.SummarySource != profile.SummarySourceOpenAI && value.SummarySource != profile.SummarySourceDeterministic && value.SummarySource != profile.SummarySourceLegacy) ||
+			value.Confidence < 0 || value.Confidence > 1 || value.EvidenceCount < 0 {
+			http.Error(w, "profile unavailable", http.StatusInternalServerError)
+			return
 		}
-		writeJSON(w, struct {
-			profile.Profile
-			Adjustments []AdjustmentView `json:"adjustments"`
-		}{profile.WithSummaryState(value), adjustments})
+		writeJSON(w, profileView{
+			ID: value.ID, Version: value.Version, Summary: value.Summary, SummaryStatus: profile.SummaryReady,
+			SummarySource: value.SummarySource, Confidence: value.Confidence, EvidenceCount: value.EvidenceCount,
+			CreatedAt: value.CreatedAt, PublishedAt: value.PublishedAt.UTC(), Updating: value.Updating,
+		})
 	}
 }
 

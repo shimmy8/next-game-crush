@@ -34,7 +34,15 @@ func NewSQLRepository(database *store.Store) (*SQLRepository, error) {
 }
 
 func (r *SQLRepository) List(ctx context.Context, userID uuid.UUID, includeInactive bool) ([]Adjustment, error) {
-	rows, err := r.store.Queries.ListPreferenceAdjustments(ctx, dbgen.ListPreferenceAdjustmentsParams{UserID: uuidToPG(userID), IncludeInactive: includeInactive})
+	var (
+		rows []dbgen.PreferenceAdjustment
+		err  error
+	)
+	if includeInactive {
+		rows, err = r.store.Queries.ListPreferenceAdjustments(ctx, dbgen.ListPreferenceAdjustmentsParams{UserID: uuidToPG(userID), IncludeInactive: true})
+	} else {
+		rows, err = r.store.Queries.ListEffectivePreferenceAdjustments(ctx, uuidToPG(userID))
+	}
 	if err != nil {
 		return nil, err
 	}

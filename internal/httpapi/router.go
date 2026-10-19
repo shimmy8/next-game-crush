@@ -60,7 +60,7 @@ func NewRouter(deps Dependencies) http.Handler {
 			router.With(deps.Auth.Middleware).Get("/api/sync/{id}", syncStatus(deps.Sync))
 		}
 		if deps.Profile != nil {
-			router.With(deps.Auth.Middleware).Get("/api/profile", getProfile(deps.Profile, deps.Preferences))
+			router.With(deps.Auth.Middleware).Get("/api/profile", getProfile(deps.Profile))
 		}
 		if deps.Preferences != nil {
 			router.With(deps.Auth.Middleware).Get("/api/preference-adjustments", getPreferenceAdjustments(deps.Preferences))

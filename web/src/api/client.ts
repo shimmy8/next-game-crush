@@ -1,5 +1,5 @@
 import { isEvidenceKind } from './types'
-import type { CurrentUser, DeckCompatibility, Evidence, ExplanationSource, PlatformSupport, PreflightResponse, Recommendation, RecommendationOverview, ReviewSummary } from './types'
+import type { CurrentUser, DeckCompatibility, EntryRefreshResponse, Evidence, ExplanationSource, PlatformSupport, PreferenceProfileData, PreflightResponse, Recommendation, RecommendationFactors, RecommendationOverview, RecommendationWeights, ReviewSummary } from './types'
 
 export type { CurrentUser } from './types'
 
@@ -23,12 +23,30 @@ async function requestJSON<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-export async function getProfile(signal?: AbortSignal) {
+function safeISOTime(value: unknown): value is string {
+  return typeof value === 'string' && value !== '' && Number.isFinite(Date.parse(value))
+}
+
+function normalizeProfile(value: unknown): PreferenceProfileData | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  if (typeof raw.id !== 'string' || !raw.id.trim() || typeof raw.version !== 'number' || !Number.isSafeInteger(raw.version) || raw.version < 1
+    || typeof raw.summary !== 'string' || !raw.summary.trim() || raw.summaryStatus !== 'ready'
+    || (raw.summarySource !== 'openai' && raw.summarySource !== 'deterministic' && raw.summarySource !== 'legacy')
+    || typeof raw.confidence !== 'number' || !Number.isFinite(raw.confidence) || raw.confidence < 0 || raw.confidence > 1
+    || typeof raw.evidenceCount !== 'number' || !Number.isSafeInteger(raw.evidenceCount) || raw.evidenceCount < 0
+    || !safeISOTime(raw.createdAt) || !safeISOTime(raw.publishedAt) || typeof raw.updating !== 'boolean') return null
+  return {
+    id: raw.id, version: raw.version, summary: raw.summary, summaryStatus: 'ready', summarySource: raw.summarySource,
+    confidence: raw.confidence, evidenceCount: raw.evidenceCount, createdAt: raw.createdAt, publishedAt: raw.publishedAt, updating: raw.updating,
+  }
+}
+
+export async function getProfile(signal?: AbortSignal): Promise<PreferenceProfileData | null> {
   const response = await fetch('/api/profile', { credentials: 'same-origin', signal })
   if (response.status === 404) return null
   if (!response.ok) throw new Error(`${response.status}:/api/profile`)
-  const value = await response.json() as import('./types').PreferenceProfileData
-  return { ...value, adjustments: value.adjustments ?? [] }
+  return normalizeProfile(await response.json())
 }
 
 export async function disablePreferenceAdjustment(id: string, csrfToken: string, signal?: AbortSignal): Promise<import('./types').DisableAdjustmentAccepted> {
@@ -62,7 +80,7 @@ function normalizeLatestFeedbackAction(value: unknown): import('./types').Direct
 }
 
 const feedbackReasons = new Set(['genre', 'setting', 'multiplayer', 'single-player', 'difficulty', 'length', 'early-access', 'already-known', 'not-now', 'other'])
-const technicalExplanationText = /(?:deterministic\s+score|coming_soon\s*:|negativeModePreference(?:Weight)?|completionAffinity(?:Weight)?|(?:positiveSimilarity|negativeSimilarity|wishlist|tagAffinity|playtimeAffinity|achievementAffinity|recentActivityAffinity|completionAffinity|positiveFeedback|novelty|negativeFeedback|dateUncertainty|confidence)"?\s*:|api[ _-]?key|authorization|bearer|session|cookie|csrf|prompt)/i
+const technicalExplanationText = /(?:deterministic\s+score|coming_soon\s*:|(?:negativeModePreference|completionAffinity)(?:Weight)?|(?:activitySimilarity|positivePreferenceSimilarity|negativePreferenceSimilarity|positiveDirectFeedback|negativeDirectFeedback|positiveSimilarity|negativeSimilarity|wishlist|tagAffinity|playtimeAffinity|achievementAffinity|recentActivityAffinity|positiveFeedback|novelty|negativeFeedback|dateUncertainty|confidence)(?:Weight)?"?\s*:|api[ _-]?key|authorization|bearer|session|cookie|csrf|prompt)/i
 const privateIdentifierText = /(?:\bsk-[a-z0-9_-]{8,}\b|\b7656119\d{10}\b|\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b|\b[0-9a-f]{32,64}\b|\b\d{16,}\b|\b[^\s@]+@[^\s@]+\.[^\s@]+\b)/i
 const unsafeEvidenceSyntax = /[{}[\]]/
 const evidenceID = /^[a-z0-9][a-z0-9:_-]{0,119}$/
@@ -143,6 +161,49 @@ function normalizeReviews(value: unknown): ReviewSummary | undefined {
   return { band, label: label.trim(), positivePercent: positivePercent as number | null, total, observedAt }
 }
 
+const factorNames = [
+  'activitySimilarity', 'positivePreferenceSimilarity', 'negativePreferenceSimilarity', 'positiveDirectFeedback', 'negativeDirectFeedback',
+  'negativeModePreference', 'wishlist', 'tagAffinity', 'playtimeAffinity', 'achievementAffinity', 'recentActivityAffinity', 'completionAffinity',
+  'novelty', 'dateUncertainty', 'confidence',
+] as const satisfies readonly (keyof RecommendationFactors)[]
+
+const weightNames = [
+  'activitySimilarity', 'positivePreferenceSimilarity', 'negativePreferenceSimilarity', 'positiveDirectFeedback', 'negativeDirectFeedback',
+  'negativeModePreference', 'wishlist', 'tagAffinity', 'playtimeAffinity', 'achievementAffinity', 'recentActivityAffinity', 'completionAffinity',
+  'novelty', 'dateUncertainty',
+] as const satisfies readonly (keyof RecommendationWeights)[]
+
+function safeNumberMap<T extends Record<string, number | undefined>>(value: unknown, names: readonly (keyof T)[]): T {
+  const result: Record<string, number> = {}
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return result as T
+  const raw = value as Record<string, unknown>
+  for (const name of names) {
+    const item = raw[name as string]
+    if (typeof item === 'number' && Number.isFinite(item)) result[name as string] = item
+  }
+  return result as T
+}
+
+function normalizeFactors(value: unknown, legacy: boolean): RecommendationFactors {
+  const result = safeNumberMap<RecommendationFactors>(value, factorNames)
+  if (!legacy || typeof value !== 'object' || value === null || Array.isArray(value)) return result
+  const raw = value as Record<string, unknown>
+  const aliases: [keyof RecommendationFactors, string][] = [
+    ['activitySimilarity', 'positiveSimilarity'], ['negativePreferenceSimilarity', 'negativeSimilarity'],
+    ['positiveDirectFeedback', 'positiveFeedback'], ['negativeDirectFeedback', 'negativeFeedback'],
+  ]
+  for (const [current, old] of aliases) {
+    if (result[current] !== undefined) continue
+    const item = raw[old]
+    if (typeof item === 'number' && Number.isFinite(item)) result[current] = item
+  }
+  return result
+}
+
+function normalizeWeights(value: unknown): RecommendationWeights {
+  return safeNumberMap<RecommendationWeights>(value, weightNames)
+}
+
 function normalizeRecommendation(item: Recommendation): Recommendation {
   const { reviews: rawReviews, ...rest } = item
   const reviews = normalizeReviews(rawReviews)
@@ -155,8 +216,8 @@ function normalizeRecommendation(item: Recommendation): Recommendation {
     latestFeedbackAction: normalizeLatestFeedbackAction(item.latestFeedbackAction),
     latestFeedbackReasons: normalizeLatestFeedbackReasons(item.latestFeedbackReasons),
     ...(typeof item.wishlisted === 'boolean' ? { wishlisted: item.wishlisted } : {}),
-    factors: item.factors ?? {},
-    weights: item.weights ?? {},
+    factors: normalizeFactors(item.factors, item.algorithmVersion !== 'ranking-v5-activity-overlay'),
+    weights: normalizeWeights(item.weights),
     explanationSource,
     evidence: normalizeEvidence(item.evidence, explanationSource),
   }
@@ -209,6 +270,29 @@ export function preflightSync(csrfToken: string, signal?: AbortSignal) {
   return requestJSON<PreflightResponse>('/api/sync/preflight', {
     method: 'POST', headers: { 'X-CSRF-Token': csrfToken }, signal,
   })
+}
+
+function normalizeEntryRefresh(value: unknown): EntryRefreshResponse | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  if (typeof raw.enqueued !== 'boolean' || (raw.reason !== 'missing' && raw.reason !== 'stale' && raw.reason !== 'fresh' && raw.reason !== 'active')
+    || (raw.jobId !== undefined && (typeof raw.jobId !== 'string' || !raw.jobId))
+    || (raw.lastSuccessfulAt !== undefined && !safeISOTime(raw.lastSuccessfulAt))) return null
+  return {
+    enqueued: raw.enqueued, reason: raw.reason,
+    ...(typeof raw.jobId === 'string' ? { jobId: raw.jobId } : {}),
+    ...(typeof raw.lastSuccessfulAt === 'string' ? { lastSuccessfulAt: raw.lastSuccessfulAt } : {}),
+  }
+}
+
+export async function refreshSyncIfStale(csrfToken: string, signal?: AbortSignal): Promise<EntryRefreshResponse> {
+  const response = await fetch('/api/sync/refresh-if-stale', {
+    credentials: 'same-origin', method: 'POST', headers: { 'X-CSRF-Token': csrfToken }, signal,
+  })
+  if (!response.ok) throw new Error('Unable to refresh Steam data')
+  const value = normalizeEntryRefresh(await response.json())
+  if (!value) throw new Error('Unable to refresh Steam data')
+  return value
 }
 
 export function getSyncStatus(jobId: string, signal?: AbortSignal) {

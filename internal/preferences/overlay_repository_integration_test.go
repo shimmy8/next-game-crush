@@ -93,6 +93,53 @@ func TestSupersededAndDisabledCorrectionsAreNotLoaded(t *testing.T) {
 	}
 }
 
+func TestListPreferenceAdjustmentsDefaultsToEffectiveCorrectionsAndKeepsHistory(t *testing.T) {
+	db := openPreferenceStore(t)
+	ctx := context.Background()
+	user, game, dislike := preferenceFixture(t, db)
+	adjustmentID := uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO preference_adjustments(id,user_id,source_feedback_id,source_game_id,dimension,target,direction,confidence,strength)VALUES($1,$2,$3,$4,'mode','co-op','avoid',.9,1)`, adjustmentID, user, dislike, game); err != nil {
+		t.Fatal(err)
+	}
+	var recommendation uuid.UUID
+	if err := db.Pool.QueryRow(ctx, `SELECT recommendation_id FROM feedback_events WHERE id=$1`, dislike).Scan(&recommendation); err != nil {
+		t.Fatal(err)
+	}
+	reminder := uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO feedback_events(id,recommendation_id,user_id,action,idempotency_key,created_at)VALUES($1,$2,$3,'remind_me',$4,now()+interval '1 second')`, reminder, recommendation, user, reminder.String()); err != nil {
+		t.Fatal(err)
+	}
+	repository, _ := NewSQLRepository(db)
+	effective, err := repository.List(ctx, user, false)
+	if err != nil || len(effective) != 1 || effective[0].ID != adjustmentID {
+		t.Fatalf("effective after reminder=%+v err=%v", effective, err)
+	}
+	disableJob := uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,idempotency_key,user_id)VALUES($1,'fixture',$2,$3)`, disableJob, disableJob.String(), user); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE preference_adjustments SET active=false,disabled_at=now(),disable_rebuild_job_id=$2,disable_previous_ranking_version=1 WHERE id=$1`, adjustmentID, disableJob); err != nil {
+		t.Fatal(err)
+	}
+	effective, err = repository.List(ctx, user, false)
+	history, historyErr := repository.List(ctx, user, true)
+	if err != nil || len(effective) != 0 || historyErr != nil || len(history) != 1 || history[0].ID != adjustmentID {
+		t.Fatalf("disabled effective=%+v history=%+v err=%v/%v", effective, history, err, historyErr)
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE preference_adjustments SET active=true,disabled_at=NULL,disable_rebuild_job_id=NULL,disable_previous_ranking_version=NULL WHERE id=$1`, adjustmentID); err != nil {
+		t.Fatal(err)
+	}
+	like := uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO feedback_events(id,recommendation_id,user_id,action,idempotency_key,created_at)VALUES($1,$2,$3,'like',$4,now()+interval '2 seconds')`, like, recommendation, user, like.String()); err != nil {
+		t.Fatal(err)
+	}
+	effective, err = repository.List(ctx, user, false)
+	history, historyErr = repository.List(ctx, user, true)
+	if err != nil || len(effective) != 0 || historyErr != nil || len(history) != 1 || history[0].ID != adjustmentID {
+		t.Fatalf("superseded effective=%+v history=%+v err=%v/%v", effective, history, err, historyErr)
+	}
+}
+
 func TestOverlayBuildIsVersionedIdempotentAndDeletionFenced(t *testing.T) {
 	db := openPreferenceStore(t)
 	ctx := context.Background()

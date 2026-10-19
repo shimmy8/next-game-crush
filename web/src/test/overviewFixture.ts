@@ -26,5 +26,6 @@ export function overviewFixture(discoveries = 0, wishlist = 0): RecommendationOv
 }
 
 export function profileFixture(): PreferenceProfileData {
-  return { id: 'profile', version: 1, summary: '', summaryStatus: 'unavailable', confidence: .8, evidenceCount: 2, createdAt: new Date().toISOString(), adjustments: [] }
+  const publishedAt = new Date().toISOString()
+  return { id: 'profile', version: 1, summary: 'Played activity summary.', summaryStatus: 'ready', summarySource: 'deterministic', confidence: .8, evidenceCount: 2, createdAt: publishedAt, publishedAt, updating: false }
 }

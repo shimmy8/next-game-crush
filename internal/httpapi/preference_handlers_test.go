@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/auth"
 	"next-game-crush/internal/preferences"
-	"next-game-crush/internal/profile"
 )
 
 type fakePreferenceService struct {
@@ -77,7 +76,7 @@ func TestDisablePreferenceSecurityAndErrors(t *testing.T) {
 		})
 	}
 }
-func TestPreferenceDiagnosticsBoundedAndProfileEmptyArray(t *testing.T) {
+func TestPreferenceDiagnosticsBoundedAndDefaultReadsOnlyEffectiveActive(t *testing.T) {
 	authService, sessions := handlerService(t, "http://localhost:8080")
 	session := sessions.addSession()
 	service := &fakePreferenceService{values: []preferences.Adjustment{{ID: uuid.New(), SourceFeedbackID: uuid.New(), SourceGameID: uuid.New(), Target: preferences.ModeCoop, Dimension: "mode", Confidence: .9, Active: false}}}
@@ -107,43 +106,11 @@ func TestPreferenceDiagnosticsBoundedAndProfileEmptyArray(t *testing.T) {
 			}
 		}
 	}
-}
-
-func TestProfileResponseAddsOnlyActivePublicAdjustments(t *testing.T) {
-	authService, sessions := handlerService(t, "http://localhost:8080")
-	session := sessions.addSession()
-	source := uuid.New()
-	active := preferences.Adjustment{ID: uuid.New(), UserID: session.UserID, SourceFeedbackID: source, Dimension: "mode", Target: preferences.ModeCoop, Confidence: .9, Active: true}
-	inactive := active
-	inactive.ID = uuid.New()
-	inactive.Active = false
-	preferencesService := &fakePreferenceService{values: []preferences.Adjustment{active, inactive}}
-	router := NewRouter(Dependencies{Auth: authService, Profile: &fakeProfileReader{value: profile.Profile{Version: 3}}, Preferences: preferencesService})
-	read := func() *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/api/profile", nil)
-		req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
-		res := httptest.NewRecorder()
-		router.ServeHTTP(res, req)
-		return res
-	}
-	res := read()
-	var body struct {
-		Adjustments []AdjustmentView `json:"adjustments"`
-	}
-	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil || res.Code != 200 || len(body.Adjustments) != 1 || body.Adjustments[0].Label != "Кооперативные игры" || body.Adjustments[0].Effect != "понижаем в рекомендациях" {
-		t.Fatalf("response=%s err=%v", res.Body.String(), err)
-	}
-	if preferencesService.inactive || preferencesService.user != session.UserID || strings.Contains(res.Body.String(), source.String()) || strings.Contains(res.Body.String(), inactive.ID.String()) {
-		t.Fatal("profile ownership/provenance mismatch")
-	}
-	preferencesService.values = nil
-	res = read()
-	if !strings.Contains(res.Body.String(), `"adjustments":[]`) {
-		t.Fatalf("empty=%s", res.Body.String())
-	}
-	preferencesService.err = errors.New("private-storage-canary")
-	res = read()
-	if res.Code != 500 || strings.Contains(res.Body.String(), "private-storage-canary") {
-		t.Fatalf("failure=%s", res.Body.String())
+	defaultReq := httptest.NewRequest(http.MethodGet, "/api/preference-adjustments", nil)
+	defaultReq.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	defaultRes := httptest.NewRecorder()
+	router.ServeHTTP(defaultRes, defaultReq)
+	if defaultRes.Code != http.StatusOK || service.inactive || strings.Contains(defaultRes.Body.String(), `"active":false`) {
+		t.Fatalf("default status=%d inactive=%v body=%s", defaultRes.Code, service.inactive, defaultRes.Body.String())
 	}
 }

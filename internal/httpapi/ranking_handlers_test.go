@@ -21,7 +21,8 @@ func TestRankingReadEndpointsRequireAuthenticationAndUseSessionOwner(t *testing.
 	authService, sessions := handlerService(t, "http://localhost:8080")
 	session := sessions.addSession()
 	recommendationID := uuid.New()
-	profiles := &fakeProfileReader{value: profile.Profile{ID: uuid.New(), Version: 3}}
+	publishedAt := time.Now().UTC()
+	profiles := &fakeProfileReader{value: profile.Profile{ID: uuid.New(), Version: 3, Summary: "Published activity summary", SummarySource: profile.SummarySourceDeterministic, PublicationState: profile.PublicationPublished, PublishedAt: &publishedAt, CreatedAt: publishedAt.Add(-time.Second)}}
 	completionText := "Есть сходство с пройденной вами игрой SOMA."
 	positivePercent := 91
 	recommendationsReader := &fakeRecommendationReader{items: []recommendations.Recommendation{{ID: recommendationID, Name: "Upcoming", Platforms: &recommendations.Platforms{Windows: true, Linux: true}, DeckCompatibility: recommendations.DeckVerified, Factors: recommendations.Factors{CompletionAffinity: .5}, Weights: recommendations.DefaultWeights(), Reviews: &recommendations.ReviewSummary{Band: recommendations.ReviewPositive, Label: "Very Positive", PositivePercent: &positivePercent, Total: 1284, ObservedAt: time.Date(2026, 10, 18, 12, 34, 56, 0, time.UTC)}, Release: recommendations.ReleaseWindow{Precision: "month", Raw: "March 2027"}, Explanation: completionText, ExplanationSource: recommendations.ExplanationSourceDeterministic, Evidence: []recommendations.Evidence{{ID: "completion-anchor-1", Kind: recommendations.EvidenceCompletionAnchor, Text: completionText}}}}}
@@ -117,49 +118,49 @@ func TestIneligibleRecommendationDetailReturnsNotFound(t *testing.T) {
 	}
 }
 
-func TestProfileResponseExposesSummaryAvailability(t *testing.T) {
-	for _, test := range []struct {
-		name, summary, status string
-	}{
-		{name: "unavailable", status: "unavailable"},
-		{name: "ready", summary: "Любит вдумчивые кооперативные игры.", status: "ready"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			authService, sessions := handlerService(t, "http://localhost:8080")
-			session := sessions.addSession()
-			profiles := &fakeProfileReader{value: profile.Profile{ID: uuid.New(), Version: 3, Summary: test.summary}}
-			router := NewRouter(Dependencies{Auth: authService, Profile: profiles})
-			req := httptest.NewRequest(http.MethodGet, "/api/profile", nil)
-			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
-			response := httptest.NewRecorder()
-
-			router.ServeHTTP(response, req)
-
-			if response.Code != http.StatusOK {
-				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
-			}
-			var got struct {
-				Summary       string `json:"summary"`
-				SummaryStatus string `json:"summaryStatus"`
-			}
-			if err := json.NewDecoder(response.Body).Decode(&got); err != nil {
-				t.Fatal(err)
-			}
-			if got.Summary != test.summary || got.SummaryStatus != test.status {
-				t.Fatalf("profile summary = %q/%q, want %q/%q", got.Summary, got.SummaryStatus, test.summary, test.status)
-			}
-		})
-	}
-}
-
 type fakeProfileReader struct {
 	value  profile.Profile
 	userID uuid.UUID
+	err    error
 }
 
 func (f *fakeProfileReader) Latest(_ context.Context, userID uuid.UUID) (profile.Profile, error) {
 	f.userID = userID
-	return f.value, nil
+	return f.value, f.err
+}
+
+func TestRankingResponseUsesOnlyActivityOverlayFactorNames(t *testing.T) {
+	authService, sessions := handlerService(t, "http://localhost:8080")
+	session := sessions.addSession()
+	id := uuid.New()
+	reader := &fakeRecommendationReader{items: []recommendations.Recommendation{{
+		ID: id, Name: "Contract", Factors: recommendations.Factors{ActivitySimilarity: .8, PositivePreferenceSimilarity: .4, NegativePreferenceSimilarity: .2, PositiveDirectFeedback: 1, NegativeDirectFeedback: 0},
+		Weights: recommendations.DefaultWeights(), Release: recommendations.ReleaseWindow{Precision: "unknown"},
+	}}}
+	router := NewRouter(Dependencies{Auth: authService, Recommendations: reader})
+	req := httptest.NewRequest(http.MethodGet, "/api/recommendations/"+id.String(), nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	var body struct {
+		Factors map[string]json.RawMessage `json:"factors"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"activitySimilarity", "positivePreferenceSimilarity", "negativePreferenceSimilarity", "positiveDirectFeedback", "negativeDirectFeedback"} {
+		if _, ok := body.Factors[name]; !ok {
+			t.Fatalf("missing %s in %s", name, res.Body.String())
+		}
+	}
+	for _, legacy := range []string{"positiveSimilarity", "negativeSimilarity", "positiveFeedback", "negativeFeedback"} {
+		if _, ok := body.Factors[legacy]; ok {
+			t.Fatalf("legacy factor %s emitted in %s", legacy, res.Body.String())
+		}
+	}
 }
 
 type fakeRecommendationReader struct {

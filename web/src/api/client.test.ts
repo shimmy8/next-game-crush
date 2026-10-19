@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { disablePreferenceAdjustment, getDiagnostics, getPreferenceAdjustments, getProfile, getCurrentSync, getRecommendationOverview, normalizeCalendar, normalizeOverview, preflightSync } from './client'
+import { disablePreferenceAdjustment, getDiagnostics, getPreferenceAdjustments, getProfile, getCurrentSync, getRecommendationOverview, normalizeCalendar, normalizeOverview, preflightSync, refreshSyncIfStale } from './client'
 import type { SyncStatus } from './types'
 import { overviewFixture, recommendation, reviewFixture } from '../test/overviewFixture'
 
@@ -42,17 +42,78 @@ describe('preference adjustments', () => {
     await expect(disablePreferenceAdjustment('a/b', 'csrf', signal)).resolves.toEqual(accepted)
     expect(fetch).toHaveBeenCalledWith('/api/preference-adjustments/a%2Fb', { credentials: 'same-origin', method: 'DELETE', headers: { 'X-CSRF-Token': 'csrf' }, signal })
   })
-  it('reads explicit inactive diagnostics and normalizes old profile arrays', async () => {
-    const fetch = vi.fn(async (url: string) => new Response(JSON.stringify(url.startsWith('/api/profile') ? { version: 3, adjustments: null } : null)))
+  it('reads explicit inactive diagnostics independently from the activity profile', async () => {
+    const profile = {
+      id: 'profile-3', version: 3, summary: 'Played activity summary', summaryStatus: 'ready', summarySource: 'deterministic',
+      confidence: .8, evidenceCount: 4, createdAt: '2026-10-18T09:00:00Z', publishedAt: '2026-10-18T09:00:08Z', updating: false,
+      adjustments: [{ id: 'must-not-survive' }],
+    }
+    const fetch = vi.fn(async (url: string) => new Response(JSON.stringify(url.startsWith('/api/profile') ? profile : null)))
     vi.stubGlobal('fetch', fetch)
     await expect(getPreferenceAdjustments(true)).resolves.toEqual([])
     expect(fetch).toHaveBeenCalledWith('/api/preference-adjustments?includeInactive=true', expect.objectContaining({ credentials: 'same-origin' }))
-    await expect(getProfile()).resolves.toMatchObject({ version: 3, adjustments: [] })
+    await expect(getProfile()).resolves.toEqual(expect.objectContaining({ version: 3, summaryStatus: 'ready', summarySource: 'deterministic', updating: false }))
+    await expect(getProfile()).resolves.not.toHaveProperty('adjustments')
   })
   it('rejects failures without exposing response bodies or adjustment IDs', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('private-feedback-canary', { status: 500 })))
     await expect(disablePreferenceAdjustment('private-id', 'csrf')).rejects.toThrow('Unable to update preference adjustment')
     await expect(getPreferenceAdjustments(true)).rejects.toThrow('Unable to load preference adjustments')
+  })
+})
+
+describe('activity profile contract', () => {
+  const valid = {
+    id: 'opaque-profile', version: 8, summary: 'A published activity summary.', summaryStatus: 'ready', summarySource: 'openai',
+    confidence: .72, evidenceCount: 14, createdAt: '2026-10-18T09:00:00Z', publishedAt: '2026-10-18T09:00:08Z', updating: true,
+  }
+
+  it.each([
+    { ...valid, summary: ' ' },
+    { ...valid, summaryStatus: 'unavailable' },
+    { ...valid, summarySource: 'private-provider' },
+    { ...valid, publishedAt: 'not-a-date' },
+    { ...valid, updating: 'yes' },
+    { ...valid, confidence: Number.NaN },
+    { ...valid, evidenceCount: -1 },
+  ])('returns null for malformed ready payloads without inventing text', async (payload) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(payload))))
+    await expect(getProfile()).resolves.toBeNull()
+  })
+
+  it('returns null on 404 and preserves a valid published document', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 404 })))
+    await expect(getProfile()).resolves.toBeNull()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(valid))))
+    await expect(getProfile()).resolves.toEqual(valid)
+  })
+})
+
+describe('entry freshness', () => {
+  it.each([
+    { enqueued: false, reason: 'fresh', lastSuccessfulAt: '2026-10-18T09:00:08Z' },
+    { enqueued: true, reason: 'stale', jobId: 'job-1', lastSuccessfulAt: '2026-10-17T09:00:08Z' },
+    { enqueued: true, reason: 'missing', jobId: 'job-2' },
+    { enqueued: false, reason: 'active', jobId: 'job-3' },
+  ])('posts CSRF and validates $reason response', async (payload) => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify(payload), { status: payload.enqueued ? 202 : 200 }))
+    vi.stubGlobal('fetch', fetch)
+    const signal = new AbortController().signal
+    await expect(refreshSyncIfStale('csrf', signal)).resolves.toEqual(payload)
+    expect(fetch).toHaveBeenCalledWith('/api/sync/refresh-if-stale', {
+      credentials: 'same-origin', method: 'POST', headers: { 'X-CSRF-Token': 'csrf' }, signal,
+    })
+  })
+
+  it.each([
+    null,
+    { enqueued: false, reason: 'private' },
+    { enqueued: 'yes', reason: 'fresh' },
+    { enqueued: true, reason: 'stale', jobId: 7 },
+    { enqueued: false, reason: 'fresh', lastSuccessfulAt: 'yesterday' },
+  ])('rejects malformed response %j', async (payload) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(payload))))
+    await expect(refreshSyncIfStale('csrf')).rejects.toThrow('Unable to refresh Steam data')
   })
 })
 
@@ -156,6 +217,28 @@ describe('recommendation overview', () => {
     expect(normalized?.weights.completionAffinity).toBe(5)
   })
 
+  it('keeps only safe current factors and maps legacy factors to current names', () => {
+    const current = normalizeOverview({ discoveries: { featured: {
+      ...recommendation('current'),
+      factors: { activitySimilarity: .8, positivePreferenceSimilarity: .4, negativePreferenceSimilarity: .2, positiveDirectFeedback: 1, negativeDirectFeedback: 0, privateFactor: 99 } as never,
+    }, items: [], total: 1 } }).discoveries.featured
+    expect(current?.factors).toEqual({ activitySimilarity: .8, positivePreferenceSimilarity: .4, negativePreferenceSimilarity: .2, positiveDirectFeedback: 1, negativeDirectFeedback: 0 })
+
+    const legacy = normalizeOverview({ discoveries: { featured: {
+      ...recommendation('legacy-factors'), algorithmVersion: 'ranking-v4',
+      factors: { positiveSimilarity: .7, negativeSimilarity: .3, positiveFeedback: 1, negativeFeedback: .5 } as never,
+    }, items: [], total: 1 } }).discoveries.featured
+    expect(legacy?.factors).toEqual({ activitySimilarity: .7, negativePreferenceSimilarity: .3, positiveDirectFeedback: 1, negativeDirectFeedback: .5 })
+    expect(legacy?.factors).not.toHaveProperty('positiveSimilarity')
+  })
+
+  it('does not treat legacy factor names as current ranking output', () => {
+    const value = normalizeOverview({ discoveries: { featured: {
+      ...recommendation('new-with-legacy'), algorithmVersion: 'ranking-v5-activity-overlay', factors: { positiveSimilarity: .7 } as never,
+    }, items: [], total: 1 } }).discoveries.featured
+    expect(value?.factors).toEqual({})
+  })
+
   it('normalizes explanation sources and keeps only allowlisted safe evidence', () => {
     const raw = {
       ...recommendation('grounded'),
@@ -169,6 +252,7 @@ describe('recommendation overview', () => {
         { id: 'technical', kind: 'similar_game', text: 'Deterministic score: 90' },
         { id: 'completion-factor', kind: 'completion_anchor', text: 'Поле completionAffinity равно единице' },
         { id: 'completion-weight', kind: 'completion_anchor', text: 'Поле completionAffinityWeight равно пяти' },
+        { id: 'activity-factor', kind: 'similar_game', text: 'activitySimilarity: 0.9' },
         { id: 'secret', kind: 'similar_game', text: '0123456789abcdef0123456789abcdef' },
         { id: 'embedded', kind: 'similar_game', text: 'Причина {"sourceGameIds":["private"]}' },
         { id: '', kind: 'similar_game', text: 'Пустой идентификатор' },

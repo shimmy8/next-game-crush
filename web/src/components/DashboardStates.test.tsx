@@ -36,14 +36,14 @@ describe('DashboardPage states', () => {
     render(<DashboardPage user={user} onLogout={() => undefined} signingOut={false} initialState={{
       status: 'ready',
       data: {
-        profile: { id: 'p', version: 1, summary: '', summaryStatus: 'unavailable', confidence: .8, evidenceCount: 2, createdAt: '2026-10-17T00:00:00Z', adjustments: [] },
+        profile: { id: 'p', version: 1, summary: 'Played activity summary.', summaryStatus: 'ready', summarySource: 'deterministic', confidence: .8, evidenceCount: 2, createdAt: '2026-10-17T00:00:00Z', publishedAt: '2026-10-17T00:00:00Z', updating: false },
         overview: overviewFixture(),
       },
     }} />)
 
     expect(screen.queryByRole('heading', { name: 'Ваша игровая ДНК' })).not.toBeInTheDocument()
     expect(screen.getByRole('complementary', { name: 'Профиль вкуса' })).toBeInTheDocument()
-    expect(screen.getByText('Профиль собран из вашей библиотеки и активности.')).toBeInTheDocument()
+    expect(screen.getByText('Played activity summary.')).toBeInTheDocument()
     expect(screen.queryByText('AI-описание профиля пока недоступно. Рекомендации продолжают работать по сохранённым данным.')).not.toBeInTheDocument()
   })
 
