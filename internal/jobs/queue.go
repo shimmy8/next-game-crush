@@ -136,6 +136,32 @@ func (q *Queue) Enqueue(ctx context.Context, spec Spec) (uuid.UUID, error) {
 	return EnqueueInTx(ctx, q.store.Queries, spec)
 }
 
+// CompletedChildResult decodes the newest succeeded result for one exact
+// child stage. Coordinators use this to hand immutable outputs from one stage
+// to the next without reaching through Queue's persistence boundary.
+func (q *Queue) CompletedChildResult(ctx context.Context, parentID, userID uuid.UUID, kind, stage string, destination any) error {
+	if q == nil || q.store == nil {
+		return errors.New("queue store is required")
+	}
+	if parentID == uuid.Nil || userID == uuid.Nil || strings.TrimSpace(kind) == "" || strings.TrimSpace(stage) == "" || destination == nil {
+		return errors.New("completed child result selector is required")
+	}
+	var encoded []byte
+	err := q.store.Pool.QueryRow(ctx, `SELECT result FROM sync_jobs
+		WHERE parent_job_id=$1 AND user_id=$2 AND kind=$3 AND stage=$4 AND status='succeeded'
+		ORDER BY created_at DESC,id DESC LIMIT 1`, parentID, userID, kind, stage).Scan(&encoded)
+	if err != nil {
+		return fmt.Errorf("load completed child result: %w", err)
+	}
+	if len(encoded) == 0 || string(encoded) == "null" {
+		return errors.New("completed child result is missing")
+	}
+	if err := json.Unmarshal(encoded, destination); err != nil {
+		return errors.New("completed child result is invalid")
+	}
+	return nil
+}
+
 // EnqueueInTx enqueues using the caller's queries, so a transaction-bound
 // instance publishes the job atomically with the caller's other writes.
 func EnqueueInTx(ctx context.Context, queries *dbgen.Queries, spec Spec) (uuid.UUID, error) {

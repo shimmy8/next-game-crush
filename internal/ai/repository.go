@@ -35,6 +35,13 @@ type profileEvidenceSignal struct {
 
 func NewSQLRepository(database *store.Store) *SQLRepository { return &SQLRepository{store: database} }
 
+func (repo *SQLRepository) ProfilePublicationState(ctx context.Context, profileID uuid.UUID) (int64, string, error) {
+	var version int64
+	var source string
+	err := repo.store.Pool.QueryRow(ctx, `SELECT version,COALESCE(summary_source,'') FROM preference_profiles WHERE id=$1`, profileID).Scan(&version, &source)
+	return version, source, err
+}
+
 func (repo *SQLRepository) ListGameIDs(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := repo.store.Pool.Query(ctx, `SELECT DISTINCT g.id FROM games g
 		LEFT JOIN catalog_entries ce ON ce.game_id=g.id

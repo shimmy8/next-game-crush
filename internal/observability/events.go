@@ -150,6 +150,53 @@ type CatalogSearchEvent struct {
 	Reason       Reason
 }
 
+type ProfileBuildEvent struct {
+	Stage           string
+	ProfileVersion  int64
+	ActivitySignals int
+	VectorBearing   int
+	Duration        time.Duration
+	Reason          Reason
+}
+
+type ProfilePublicationEvent struct {
+	Stage          string
+	ProfileVersion int64
+	SummarySource  string
+	Duration       time.Duration
+	Reason         Reason
+}
+
+type ProfileReadEvent struct {
+	PublishedVersion int64
+	NewerDraft       bool
+}
+
+type OverlayBuildEvent struct {
+	Stage                string
+	OverlayVersion       int64
+	Positive             int
+	Negative             int
+	MissingVectors       int
+	EffectiveCorrections int
+	Duration             time.Duration
+	Reason               Reason
+}
+
+type FreshnessEvent struct {
+	Decision string
+	Duration time.Duration
+	Reason   Reason
+}
+
+type RankingPublicationEvent struct {
+	Algorithm      string
+	ProfileVersion int64
+	OverlayVersion int64
+	Duration       time.Duration
+	Reason         Reason
+}
+
 type Logger struct {
 	logger *slog.Logger
 }
@@ -346,6 +393,75 @@ func (l *Logger) CatalogSearch(ctx context.Context, event CatalogSearchEvent) {
 	l.logger.LogAttrs(safeContext(ctx), level, "catalog search", attrs...)
 }
 
+func (l *Logger) ProfileBuild(ctx context.Context, event ProfileBuildEvent) {
+	if l == nil || l.logger == nil {
+		return
+	}
+	attrs := []slog.Attr{slog.String("event", "profile_build"), slog.String("stage", allow(event.Stage, profileBuildStages)), slog.Int64("profile_version", nonnegative64(event.ProfileVersion)), slog.Int("activity_signals", nonnegative(event.ActivitySignals)), slog.Int("vector_bearing", nonnegative(event.VectorBearing)), durationAttr("duration_ms", event.Duration)}
+	if reason := safeReason(event.Reason); reason != "" {
+		attrs = append(attrs, slog.String("reason", reason))
+	}
+	l.logger.LogAttrs(safeContext(ctx), safeLifecycleLevel(event.Reason), "activity profile build", attrs...)
+}
+
+func (l *Logger) ProfilePublication(ctx context.Context, event ProfilePublicationEvent) {
+	if l == nil || l.logger == nil {
+		return
+	}
+	attrs := []slog.Attr{slog.String("event", "profile_publication"), slog.String("stage", allow(event.Stage, profilePublicationStages)), slog.Int64("profile_version", nonnegative64(event.ProfileVersion)), slog.String("summary_source", allow(event.SummarySource, summarySources)), durationAttr("duration_ms", event.Duration)}
+	if reason := safeReason(event.Reason); reason != "" {
+		attrs = append(attrs, slog.String("reason", reason))
+	}
+	l.logger.LogAttrs(safeContext(ctx), safeLifecycleLevel(event.Reason), "activity profile publication", attrs...)
+}
+
+func (l *Logger) ProfileRead(ctx context.Context, event ProfileReadEvent) {
+	if l == nil || l.logger == nil {
+		return
+	}
+	l.logger.LogAttrs(safeContext(ctx), slog.LevelInfo, "activity profile read", slog.String("event", "profile_read"), slog.Int64("published_version", nonnegative64(event.PublishedVersion)), slog.Bool("newer_draft", event.NewerDraft))
+}
+
+func (l *Logger) OverlayBuild(ctx context.Context, event OverlayBuildEvent) {
+	if l == nil || l.logger == nil {
+		return
+	}
+	attrs := []slog.Attr{slog.String("event", "overlay_build"), slog.String("stage", allow(event.Stage, overlayBuildStages)), slog.Int64("overlay_version", nonnegative64(event.OverlayVersion)), slog.Int("positive", nonnegative(event.Positive)), slog.Int("negative", nonnegative(event.Negative)), slog.Int("missing_vectors", nonnegative(event.MissingVectors)), slog.Int("effective_corrections", nonnegative(event.EffectiveCorrections)), durationAttr("duration_ms", event.Duration)}
+	if reason := safeReason(event.Reason); reason != "" {
+		attrs = append(attrs, slog.String("reason", reason))
+	}
+	l.logger.LogAttrs(safeContext(ctx), safeLifecycleLevel(event.Reason), "preference overlay build", attrs...)
+}
+
+func (l *Logger) Freshness(ctx context.Context, event FreshnessEvent) {
+	if l == nil || l.logger == nil {
+		return
+	}
+	attrs := []slog.Attr{slog.String("event", "entry_freshness"), slog.String("decision", allow(event.Decision, freshnessDecisions)), durationAttr("duration_ms", event.Duration)}
+	if reason := safeReason(event.Reason); reason != "" {
+		attrs = append(attrs, slog.String("reason", reason))
+	}
+	l.logger.LogAttrs(safeContext(ctx), safeLifecycleLevel(event.Reason), "application entry freshness", attrs...)
+}
+
+func (l *Logger) RankingPublication(ctx context.Context, event RankingPublicationEvent) {
+	if l == nil || l.logger == nil {
+		return
+	}
+	attrs := []slog.Attr{slog.String("event", "ranking_publication"), slog.String("algorithm", allow(event.Algorithm, rankingAlgorithms)), slog.Int64("profile_version", nonnegative64(event.ProfileVersion)), slog.Int64("overlay_version", nonnegative64(event.OverlayVersion)), durationAttr("duration_ms", event.Duration)}
+	if reason := safeReason(event.Reason); reason != "" {
+		attrs = append(attrs, slog.String("reason", reason))
+	}
+	l.logger.LogAttrs(safeContext(ctx), safeLifecycleLevel(event.Reason), "ranking publication", attrs...)
+}
+
+func safeLifecycleLevel(reason Reason) slog.Level {
+	if safeReason(reason) != "" {
+		return slog.LevelWarn
+	}
+	return slog.LevelInfo
+}
+
 func appendCorrelation(attrs []slog.Attr, correlation Correlation) []slog.Attr {
 	if correlation.WorkflowID != uuid.Nil {
 		attrs = append(attrs, slog.String("workflow_id", correlation.WorkflowID.String()))
@@ -386,6 +502,13 @@ func nonnegative(value int) int {
 	return value
 }
 
+func nonnegative64(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
 func safeContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()
@@ -413,11 +536,17 @@ var jobStages = values("started", "heartbeat", "deferred", "succeeded", "retry_s
 var sourceStages = values("started", "finished")
 var workerStages = values("started", "stopped", "claim_failed", "completion_failed", "failure_record_failed", "renewal_failed")
 var reasons = values("timeout", "rate_limited", "upstream_unavailable", "upstream_rejected", "malformed_response", "invalid_evidence", "invalid_output", "lease_lost", "persistence_failed", "internal_error", "missing", "stale", "fresh", "active")
-var jobKinds = values("steam.sync", "catalog.refresh", "catalog.refresh_game", "catalog.search.run", "catalog.search.page", "catalog.reconciliation.page", "catalog.search.qualify", "catalog.deck_refresh", "achievements.sync", "achievement.classify", "completion.project", "ai.features", "ai.embedding", "ai.profile_summary", "profile.rebuild", "preferences.rebuild", "preferences.disable", "recommendations.rebuild", "feedback.classify", "notifications.digest.send")
-var logicalStages = values("steam", "catalog", "catalog_search_run", "catalog_search_page", "catalog_reconciliation_page", "catalog_search_qualify", "catalog_deck_refresh", "achievements", "achievement_classification", "completion_projection", "ai_features", "ai_embedding", "profile_summary", "profile", "preferences", "recommendations", "feedback", "digest")
+var jobKinds = values("steam.sync", "catalog.refresh", "catalog.refresh_game", "catalog.search.run", "catalog.search.page", "catalog.reconciliation.page", "catalog.search.qualify", "catalog.deck_refresh", "achievements.sync", "achievement.classify", "completion.project", "ai.features", "ai.embedding", "ai.profile_summary", "profile.rebuild", "profile_overlay.boundary_backfill", "preferences.rebuild", "preferences.disable", "recommendations.rebuild", "feedback.classify", "notifications.digest.send")
+var logicalStages = values("steam", "catalog", "catalog_search_run", "catalog_search_page", "catalog_reconciliation_page", "catalog_search_qualify", "catalog_deck_refresh", "achievements", "achievement_classification", "completion_projection", "ai_features", "ai_embedding", "profile_summary", "profile", "profile_overlay_backfill", "preferences", "recommendations", "feedback", "digest")
 var sources = values("owned_games", "recently_played", "wishlist", "achievements")
 var availabilities = values("available", "unavailable", "request_failed", "not_modified")
 var discoverySources = values("steam")
 var discoveryModes = values("incremental", "backfill")
 var catalogSearchStages = values("scheduled", "scan", "qualify", "reconciliation", "rebuild")
 var catalogSearchFeeds = values("popular_upcoming", "popular_new", "recent", "coming_soon", "reconciliation")
+var profileBuildStages = values("started", "succeeded", "failed")
+var profilePublicationStages = values("started", "published", "failed")
+var overlayBuildStages = values("started", "succeeded", "failed")
+var summarySources = values("openai", "deterministic", "legacy")
+var freshnessDecisions = values("missing", "stale", "fresh", "active")
+var rankingAlgorithms = values("ranking-v5-activity-overlay")

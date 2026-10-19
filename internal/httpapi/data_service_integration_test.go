@@ -156,7 +156,7 @@ func TestDataServiceOmitsMalformedExplanationDiagnostics(t *testing.T) {
 func TestDeleteUserDataRetainsSharedCatalogAndRemovesOwnedRows(t *testing.T) {
 	db := openHTTPTestStore(t)
 	ctx := context.Background()
-	userID, gameID, wishlistGameID, profileID, recID, deliveryID, jobID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	userID, gameID, wishlistGameID, profileID, overlayID, recID, deliveryID, jobID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	generationID, classificationID := uuid.New(), uuid.New()
 	statements := []struct {
 		sql  string
@@ -180,14 +180,18 @@ func TestDeleteUserDataRetainsSharedCatalogAndRemovesOwnedRows(t *testing.T) {
 		{`INSERT INTO user_game_completion_projections(user_id,game_id,ending_count,hundred_percent_basis,weight,completion_at,basis,algorithm_version) VALUES($1,$2,1,false,1.5,now(),'ending','completion-v1')`, []any{userID, gameID}},
 		{`INSERT INTO preference_profiles(id,user_id,version)VALUES($1,$2,1)`, []any{profileID, userID}},
 		{`INSERT INTO profile_embeddings(profile_id,polarity,model,input_content_hash,embedding)VALUES($1,'positive','test','x',$2)`, []any{profileID, zeroVectorLiteral()}},
-		{`INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key)VALUES($1,$2,$3,1,'v1','build')`, []any{uuid.New(), userID, profileID}},
-		{`INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score)VALUES($1,$2,$3,$4,'v1',80)`, []any{recID, userID, gameID, profileID}},
+		{`INSERT INTO activity_profile_evidence(profile_id,game_id,playtime_minutes)VALUES($1,$2,10)`, []any{profileID, gameID}},
+		{`INSERT INTO preference_overlays(id,user_id,version,algorithm_version,build_key,input_content_hash)VALUES($1,$2,1,'overlay-v1','overlay-build','overlay-hash')`, []any{overlayID, userID}},
+		{`INSERT INTO preference_overlay_embeddings(overlay_id,polarity,model,input_content_hash,embedding)VALUES($1,'positive','test','overlay-vector',$2)`, []any{overlayID, zeroVectorLiteral()}},
+		{`INSERT INTO recommendation_runs(id,user_id,profile_id,preference_overlay_id,ranking_version,algorithm_version,build_key)VALUES($1,$2,$3,$4,1,'v1','build')`, []any{uuid.New(), userID, profileID, overlayID}},
+		{`INSERT INTO recommendations(id,user_id,game_id,profile_id,preference_overlay_id,algorithm_version,score)VALUES($1,$2,$3,$4,$5,'v1',80)`, []any{recID, userID, gameID, profileID, overlayID}},
 		{`INSERT INTO catalog_explanation_cache(user_id,game_id,model,input_hash,explanation)VALUES($1,$2,'fixture','personalized',jsonb_build_object('text','Owned game: private context'))`, []any{userID, gameID}},
 		{`INSERT INTO feedback_events(id,recommendation_id,user_id,action,idempotency_key)VALUES($1,$2,$3,'like','event')`, []any{uuid.New(), recID, userID}},
 		{`INSERT INTO notification_preferences(user_id)VALUES($1)`, []any{userID}},
 		{`INSERT INTO email_deliveries(id,user_id,idempotency_key,status)VALUES($1,$2,'delivery','pending')`, []any{deliveryID, userID}},
 		{`INSERT INTO sync_jobs(id,kind,idempotency_key,payload,user_id)VALUES($1,'steam.sync','job',jsonb_build_object('version',1,'user_id',$2::text),$2::uuid)`, []any{jobID, userID}},
 		{`INSERT INTO sync_jobs(id,kind,idempotency_key,payload,user_id)VALUES($1,'completion.project','completion-project',jsonb_build_object('version',1,'user_id',$2::text,'game_id',$3::text),$2::uuid)`, []any{uuid.New(), userID, gameID}},
+		{`INSERT INTO sync_jobs(id,kind,idempotency_key,payload,user_id)VALUES($1,'profile_overlay.boundary_backfill','profile-overlay-backfill',jsonb_build_object('version',1,'user_id',$2::text),$2::uuid)`, []any{uuid.New(), userID}},
 		{`INSERT INTO sync_jobs(id,kind,idempotency_key,payload)VALUES($1,'achievement.classify','achievement-classify',jsonb_build_object('version',1,'game_id',$2::text))`, []any{uuid.New(), gameID}},
 	}
 	for _, statement := range statements {
@@ -198,7 +202,7 @@ func TestDeleteUserDataRetainsSharedCatalogAndRemovesOwnedRows(t *testing.T) {
 	if err := NewSQLDataService(db, false, true).DeleteUserData(ctx, userID); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"users", "sessions", "steam_accounts", "user_games", "wishlist_entries", "achievement_summaries", "user_achievement_unlocks", "user_game_completion_evidence", "user_game_completion_projections", "preference_profiles", "profile_embeddings", "recommendations", "catalog_explanation_cache", "feedback_events", "notification_preferences", "email_deliveries"} {
+	for _, table := range []string{"users", "sessions", "steam_accounts", "user_games", "wishlist_entries", "achievement_summaries", "user_achievement_unlocks", "user_game_completion_evidence", "user_game_completion_projections", "preference_profiles", "profile_embeddings", "activity_profile_evidence", "preference_overlays", "preference_overlay_embeddings", "recommendation_runs", "recommendations", "catalog_explanation_cache", "feedback_events", "notification_preferences", "email_deliveries"} {
 		var count int
 		if err := db.Pool.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil {
 			t.Fatal(err)
@@ -398,6 +402,90 @@ func TestDeleteFencesInFlightWorkerFromRecreatingData(t *testing.T) {
 	}
 	if sharedJobs != 1 || ownedJobs != 0 || affectedUsers != 0 {
 		t.Fatalf("post-delete fanout inputs shared_jobs=%d owned_jobs=%d affected_users=%d", sharedJobs, ownedJobs, affectedUsers)
+	}
+}
+
+func TestDataDeletionFencesInFlightProfileOverlayRankingPublication(t *testing.T) {
+	db := openHTTPTestStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	userID, gameID := uuid.New(), uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,991001,'Shared lifecycle game','test',now())`, gameID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO catalog_entries(game_id,origin) VALUES($1,'seed')`, gameID); err != nil {
+		t.Fatal(err)
+	}
+
+	workerTx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileID, overlayID := uuid.New(), uuid.New()
+	if _, err = workerTx.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version,publication_state,build_key,algorithm_metadata)
+		VALUES($1,$2,1,'building','in-flight-profile','{"algorithmVersion":"activity-profile-v5"}')`, profileID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = workerTx.Exec(ctx, `INSERT INTO activity_profile_evidence(profile_id,game_id,playtime_minutes) VALUES($1,$2,30)`, profileID, gameID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = workerTx.Exec(ctx, `INSERT INTO preference_overlays(id,user_id,version,algorithm_version,build_key,input_content_hash)
+		VALUES($1,$2,1,'preference-overlay-v1','in-flight-overlay','empty-hash')`, overlayID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = workerTx.Exec(ctx, `INSERT INTO recommendation_runs(id,user_id,profile_id,preference_overlay_id,ranking_version,algorithm_version,build_key)
+		VALUES($1,$2,$3,$4,1,'ranking-v5-activity-overlay','in-flight-ranking')`, uuid.New(), userID, profileID, overlayID); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted := make(chan error, 1)
+	go func() { deleted <- NewSQLDataService(db, false, false).DeleteUserData(ctx, userID) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var blocked bool
+		if err = db.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+			WHERE datname=current_database() AND query LIKE 'DELETE FROM users WHERE id=$1%'
+			AND wait_event_type='Lock')`).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		select {
+		case deleteErr := <-deleted:
+			t.Fatalf("deletion completed before publication transaction: %v", deleteErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("deletion never waited for in-flight profile/overlay/ranking")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err = workerTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-deleted; err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"preference_profiles", "activity_profile_evidence", "preference_overlays", "recommendation_runs"} {
+		var count int
+		if err = db.Pool.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Errorf("%s survived deletion: %d", table, count)
+		}
+	}
+	var shared int
+	if err = db.Pool.QueryRow(ctx, `SELECT count(*) FROM games WHERE id=$1`, gameID).Scan(&shared); err != nil || shared != 1 {
+		t.Fatalf("shared game count=%d err=%v", shared, err)
+	}
+	if _, err = db.Pool.Exec(ctx, `INSERT INTO preference_overlays(id,user_id,version,algorithm_version,build_key,input_content_hash)
+		VALUES($1,$2,2,'preference-overlay-v1','late-overlay','late-hash')`, uuid.New(), userID); err == nil {
+		t.Fatal("late overlay recreated deleted user data")
 	}
 }
 

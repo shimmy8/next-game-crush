@@ -1107,13 +1107,14 @@ func validReviewSummary(band, label pgtype.Text, percent pgtype.Int4, total pgty
 	return review
 }
 
-func (r *SQLRepository) RankingProfileVersion(ctx context.Context, userID uuid.UUID, rankingVersion int64) (int64, error) {
-	var version int64
-	err := r.store.Pool.QueryRow(ctx, `SELECT p.version
+func (r *SQLRepository) RankingSourceVersions(ctx context.Context, userID uuid.UUID, rankingVersion int64) (int64, int64, error) {
+	var profileVersion, overlayVersion int64
+	err := r.store.Pool.QueryRow(ctx, `SELECT p.version,o.version
 		FROM recommendation_runs run
 		JOIN preference_profiles p ON p.id=run.profile_id AND p.user_id=run.user_id
-		WHERE run.user_id=$1 AND run.ranking_version=$2 AND run.published`, userID, rankingVersion).Scan(&version)
-	return version, err
+		JOIN preference_overlays o ON o.id=run.preference_overlay_id AND o.user_id=run.user_id
+		WHERE run.user_id=$1 AND run.ranking_version=$2 AND run.published`, userID, rankingVersion).Scan(&profileVersion, &overlayVersion)
+	return profileVersion, overlayVersion, err
 }
 
 func nullableExplanationFailure(reason ExplanationFailureReason) any {

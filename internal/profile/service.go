@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"next-game-crush/internal/completion"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/observability"
 )
 
 const (
@@ -97,18 +98,27 @@ type Service struct {
 	repository Repository
 	queue      *jobs.Queue
 	now        func() time.Time
+	logger     *observability.Logger
 }
 
 func NewService(repository Repository) (*Service, error) {
 	if repository == nil {
 		return nil, errors.New("profile repository is required")
 	}
-	return &Service{repository: repository, now: time.Now}, nil
+	return &Service{repository: repository, now: time.Now, logger: observability.New(nil)}, nil
 }
 
 func (s *Service) SetQueue(queue *jobs.Queue) { s.queue = queue }
+func (s *Service) SetLogger(logger *observability.Logger) {
+	if logger == nil {
+		logger = observability.New(nil)
+	}
+	s.logger = logger
+}
 
 func (s *Service) Build(ctx context.Context, request BuildRequest) (BuildResult, error) {
+	started := s.now()
+	s.logger.ProfileBuild(ctx, observability.ProfileBuildEvent{Stage: "started"})
 	if request.UserID == uuid.Nil {
 		return BuildResult{}, errors.New("user ID is required")
 	}
@@ -120,8 +130,14 @@ func (s *Service) Build(ctx context.Context, request BuildRequest) (BuildResult,
 	}
 	profile, _, err := s.repository.BuildDraft(ctx, request, s.now().UTC(), AlgorithmVersion)
 	if err != nil {
+		s.logger.ProfileBuild(ctx, observability.ProfileBuildEvent{Stage: "failed", Duration: s.now().Sub(started), Reason: observability.ReasonPersistenceFailed})
 		return BuildResult{}, fmt.Errorf("build activity profile draft: %w", err)
 	}
+	activitySignals := 0
+	for _, count := range profile.SignalCounts {
+		activitySignals += count
+	}
+	s.logger.ProfileBuild(ctx, observability.ProfileBuildEvent{Stage: "succeeded", ProfileVersion: profile.Version, ActivitySignals: activitySignals, VectorBearing: profile.EvidenceCount, Duration: s.now().Sub(started)})
 	return BuildResult{Profile: profile, SummaryRequired: profile.PublicationState == PublicationBuilding}, nil
 }
 
@@ -140,7 +156,11 @@ func (s *Service) rebuildWithKey(ctx context.Context, userID uuid.UUID, buildKey
 }
 
 func (s *Service) Latest(ctx context.Context, userID uuid.UUID) (Profile, error) {
-	return s.repository.LatestPublishedProfile(ctx, userID)
+	value, err := s.repository.LatestPublishedProfile(ctx, userID)
+	if err == nil {
+		s.logger.ProfileRead(ctx, observability.ProfileReadEvent{PublishedVersion: value.Version, NewerDraft: value.Updating})
+	}
+	return value, err
 }
 
 type JobPayload struct {

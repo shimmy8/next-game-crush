@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/observability"
 )
 
 const JobPayloadVersion = 1
@@ -65,6 +66,7 @@ type Service struct {
 	catalogAdmission      CatalogFeatureAdmission
 	catalogChangedHook    func(context.Context, uuid.UUID) error
 	now                   func() time.Time
+	logger                *observability.Logger
 }
 
 func NewService(repository Repository, client Client, model, embeddingModel string) (*Service, error) {
@@ -74,10 +76,16 @@ func NewService(repository Repository, client Client, model, embeddingModel stri
 	if strings.TrimSpace(model) == "" || strings.TrimSpace(embeddingModel) == "" {
 		return nil, errors.New("AI model IDs are required")
 	}
-	return &Service{repository: repository, client: client, model: model, embeddingModel: embeddingModel, now: time.Now}, nil
+	return &Service{repository: repository, client: client, model: model, embeddingModel: embeddingModel, now: time.Now, logger: observability.New(nil)}, nil
 }
 
 func (service *Service) SetQueue(queue *jobs.Queue) { service.queue = queue }
+func (service *Service) SetLogger(logger *observability.Logger) {
+	if logger == nil {
+		logger = observability.New(nil)
+	}
+	service.logger = logger
+}
 func (service *Service) SetCatalogFeatureAdmission(admission CatalogFeatureAdmission) {
 	service.catalogAdmission = admission
 }
@@ -243,12 +251,22 @@ func (service *Service) deferCatalogChanged(ctx context.Context, lease jobs.Leas
 	return jobs.ErrDeferred
 }
 func (service *Service) handleProfileSummary(ctx context.Context, lease jobs.Lease) error {
+	started := service.now()
+	service.logger.ProfilePublication(ctx, observability.ProfilePublicationEvent{Stage: "started"})
 	payload, err := decodeJobPayload(lease.Payload, false, true)
 	if err != nil {
 		return err
 	}
 	err = service.processProfileSummary(ctx, lease, payload.ProfileID)
 	if err == nil {
+		if reader, ok := service.repository.(interface {
+			ProfilePublicationState(context.Context, uuid.UUID) (int64, string, error)
+		}); ok {
+			version, source, readErr := reader.ProfilePublicationState(ctx, payload.ProfileID)
+			if readErr == nil {
+				service.logger.ProfilePublication(ctx, observability.ProfilePublicationEvent{Stage: "published", ProfileVersion: version, SummarySource: source, Duration: service.now().Sub(started)})
+			}
+		}
 		return nil
 	}
 	if !terminalProfileSummaryAttempt(lease, err) {
@@ -256,11 +274,21 @@ func (service *Service) handleProfileSummary(ctx context.Context, lease jobs.Lea
 	}
 	published, terminalErr := service.repository.HandleTerminalProfileSummaryFailure(ctx, lease, payload.ProfileID, service.model)
 	if terminalErr != nil {
+		service.logger.ProfilePublication(ctx, observability.ProfilePublicationEvent{Stage: "failed", Duration: service.now().Sub(started), Reason: observability.ReasonPersistenceFailed})
 		return terminalErr
 	}
 	if published {
+		if reader, ok := service.repository.(interface {
+			ProfilePublicationState(context.Context, uuid.UUID) (int64, string, error)
+		}); ok {
+			version, source, readErr := reader.ProfilePublicationState(ctx, payload.ProfileID)
+			if readErr == nil {
+				service.logger.ProfilePublication(ctx, observability.ProfilePublicationEvent{Stage: "published", ProfileVersion: version, SummarySource: source, Duration: service.now().Sub(started)})
+			}
+		}
 		return nil
 	}
+	service.logger.ProfilePublication(ctx, observability.ProfilePublicationEvent{Stage: "failed", Duration: service.now().Sub(started), Reason: observability.ReasonInvalidOutput})
 	return err
 }
 

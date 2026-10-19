@@ -18,6 +18,7 @@ import (
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/observability"
 	"next-game-crush/internal/preferences"
 	"next-game-crush/internal/profile"
 )
@@ -40,8 +41,8 @@ type DeckRefreshPlanner interface {
 type CatalogRebuildObserver interface {
 	CatalogRebuildFinished(context.Context, uuid.UUID, string, bool) error
 }
-type rankingProfileVersionReader interface {
-	RankingProfileVersion(context.Context, uuid.UUID, int64) (int64, error)
+type rankingSourceVersionReader interface {
+	RankingSourceVersions(context.Context, uuid.UUID, int64) (int64, int64, error)
 }
 type Repository interface {
 	Candidates(context.Context, uuid.UUID, profile.Profile, int) ([]Candidate, error)
@@ -78,6 +79,7 @@ type Service struct {
 	catalogRebuilds    CatalogRebuildObserver
 	eligibility        catalog.CurrentEligibilityReader
 	clock              func() time.Time
+	logger             *observability.Logger
 }
 
 func (s *Service) SetQueue(queue *jobs.Queue)                       { s.queue = queue }
@@ -122,7 +124,13 @@ func NewService(repository Repository, profiles *profile.Service, explainer Expl
 		}
 		overlays = preferenceRepositoryEnsurer{repository: preferenceRepository}
 	}
-	return &Service{repository: repository, profiles: profiles, overlays: overlays, explainer: explainer, eligibility: eligibility, clock: clock, limit: 100}, nil
+	return &Service{repository: repository, profiles: profiles, overlays: overlays, explainer: explainer, eligibility: eligibility, clock: clock, logger: observability.New(nil), limit: 100}, nil
+}
+func (s *Service) SetLogger(logger *observability.Logger) {
+	if logger == nil {
+		logger = observability.New(nil)
+	}
+	s.logger = logger
 }
 func (s *Service) Rebuild(ctx context.Context, userID uuid.UUID) ([]Recommendation, error) {
 	items, _, _, err := s.rebuild(ctx, userID, uuid.NewString())
@@ -741,6 +749,7 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 }
 
 func (s *Service) handleJob(ctx context.Context, lease jobs.Lease) error {
+	started := s.clock()
 	var p JobPayload
 	if json.Unmarshal(lease.Payload, &p) != nil || p.Version != JobPayloadVersion || p.UserID == uuid.Nil || lease.UserID != p.UserID {
 		return errors.New("unsupported recommendations job payload schema")
@@ -751,6 +760,7 @@ func (s *Service) handleJob(ctx context.Context, lease jobs.Lease) error {
 	}
 	result, rankingVersion, explanationStats, err := s.rebuildForProfile(ctx, p.UserID, strings.TrimSpace(p.ProfileBuildKey), requestKey)
 	if err != nil {
+		s.logger.RankingPublication(ctx, observability.RankingPublicationEvent{Algorithm: AlgorithmVersion, Duration: s.clock().Sub(started), Reason: observability.ReasonPersistenceFailed})
 		if s.catalogRebuilds != nil {
 			if observerErr := s.catalogRebuilds.CatalogRebuildFinished(ctx, p.UserID, lease.IdempotencyKey, false); observerErr != nil {
 				return errors.Join(err, observerErr)
@@ -765,8 +775,9 @@ func (s *Service) handleJob(ctx context.Context, lease jobs.Lease) error {
 	}
 	if s.queue != nil {
 		var profileVersion int64
-		if reader, ok := s.repository.(rankingProfileVersionReader); ok {
-			profileVersion, err = reader.RankingProfileVersion(ctx, p.UserID, rankingVersion)
+		var overlayVersion int64
+		if reader, ok := s.repository.(rankingSourceVersionReader); ok {
+			profileVersion, overlayVersion, err = reader.RankingSourceVersions(ctx, p.UserID, rankingVersion)
 		} else if len(result) > 0 {
 			profileVersion = result[0].ProfileVersion
 		} else {
@@ -779,9 +790,10 @@ func (s *Service) handleJob(ctx context.Context, lease jobs.Lease) error {
 		if profileVersion < 1 {
 			return errors.New("resolve ranking activity profile version: invalid version")
 		}
-		if err := s.queue.RecordResult(ctx, lease, map[string]any{"profileVersion": profileVersion, "rankingVersion": rankingVersion, "algorithmVersion": AlgorithmVersion, "recommendationCount": len(result), "explanations": explanationStats}); err != nil {
+		if err := s.queue.RecordResult(ctx, lease, map[string]any{"profileVersion": profileVersion, "preferenceOverlayVersion": overlayVersion, "rankingVersion": rankingVersion, "algorithmVersion": AlgorithmVersion, "recommendationCount": len(result), "explanations": explanationStats}); err != nil {
 			return err
 		}
+		s.logger.RankingPublication(ctx, observability.RankingPublicationEvent{Algorithm: AlgorithmVersion, ProfileVersion: profileVersion, OverlayVersion: overlayVersion, Duration: s.clock().Sub(started)})
 	}
 	return nil
 }

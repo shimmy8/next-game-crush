@@ -202,7 +202,7 @@ func TestNilLoggerAndNilSinkDoNotPanic(t *testing.T) {
 }
 
 func TestPublicEventsCannotCarryRawErrorsPayloadsOrAttributes(t *testing.T) {
-	for _, value := range []any{SyncRequestEvent{}, JobAttemptEvent{}, SyncSourceEvent{}, WorkerEvent{}, CatalogDiscoveryEvent{}, CatalogSearchEvent{}} {
+	for _, value := range []any{SyncRequestEvent{}, JobAttemptEvent{}, SyncSourceEvent{}, WorkerEvent{}, CatalogDiscoveryEvent{}, CatalogSearchEvent{}, ProfileBuildEvent{}, ProfilePublicationEvent{}, ProfileReadEvent{}, OverlayBuildEvent{}, FreshnessEvent{}, RankingPublicationEvent{}} {
 		typeOf := reflect.TypeOf(value)
 		for i := 0; i < typeOf.NumField(); i++ {
 			field := typeOf.Field(i)
@@ -211,6 +211,39 @@ func TestPublicEventsCannotCarryRawErrorsPayloadsOrAttributes(t *testing.T) {
 				t.Fatalf("%s exposes unsafe field %s", typeOf.Name(), field.Name)
 			}
 		}
+	}
+}
+
+func TestProfileOverlayObservabilityExposesOnlySafeAggregates(t *testing.T) {
+	var output bytes.Buffer
+	logger := New(slog.New(slog.NewJSONHandler(&output, nil)))
+	logger.ProfileBuild(context.Background(), ProfileBuildEvent{Stage: "succeeded", ProfileVersion: 2, ActivitySignals: 7, VectorBearing: 5, Duration: time.Second})
+	logger.ProfilePublication(context.Background(), ProfilePublicationEvent{Stage: "published", ProfileVersion: 2, SummarySource: "deterministic", Duration: time.Second})
+	logger.ProfileRead(context.Background(), ProfileReadEvent{PublishedVersion: 1, NewerDraft: true})
+	logger.OverlayBuild(context.Background(), OverlayBuildEvent{Stage: "succeeded", OverlayVersion: 3, Positive: 2, Negative: 1, MissingVectors: 4, EffectiveCorrections: 1})
+	logger.Freshness(context.Background(), FreshnessEvent{Decision: "stale"})
+	logger.RankingPublication(context.Background(), RankingPublicationEvent{Algorithm: "ranking-v5-activity-overlay", ProfileVersion: 2, OverlayVersion: 3})
+	events := decodeEvents(t, output.String())
+	if len(events) != 6 {
+		t.Fatalf("events=%d", len(events))
+	}
+	for _, event := range events {
+		for _, forbidden := range []string{"steam_id", "user_id", "game_id", "feedback", "prompt", "model_output", "summary", "payload", "workflow_id", "job_id"} {
+			if _, exists := event[forbidden]; exists {
+				t.Fatalf("unsafe field %q: %#v", forbidden, event)
+			}
+		}
+	}
+	if events[2]["newer_draft"] != true || events[5]["algorithm"] != "ranking-v5-activity-overlay" {
+		t.Fatalf("events=%#v", events)
+	}
+
+	output.Reset()
+	logger.ProfilePublication(context.Background(), ProfilePublicationEvent{Stage: "provider-body-canary", SummarySource: "raw-model-output-canary", Reason: "secret-canary"})
+	event := decodeEvents(t, output.String())[0]
+	encoded, _ := json.Marshal(event)
+	if strings.Contains(string(encoded), "canary") || event["stage"] != "unknown" || event["summary_source"] != "unknown" || event["reason"] != "internal_error" {
+		t.Fatalf("untrusted profile event escaped: %s", encoded)
 	}
 }
 

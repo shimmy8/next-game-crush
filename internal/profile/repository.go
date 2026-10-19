@@ -314,6 +314,15 @@ func (r *SQLRepository) LatestPublishedProfile(ctx context.Context, userID uuid.
 	switch PublicationState(newest.PublicationState) {
 	case PublicationPublished:
 		visible, err = r.profileFromRow(ctx, queries, newest)
+		if err == nil {
+			var boundaryActive bool
+			if activeErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM sync_jobs
+				WHERE user_id=$1 AND kind='profile_overlay.boundary_backfill'
+				  AND status IN ('queued','running','waiting','retryable'))`, userID).Scan(&boundaryActive); activeErr != nil {
+				return Profile{}, activeErr
+			}
+			visible.Updating = boundaryActive
+		}
 	case PublicationInsufficient:
 		return Profile{}, pgx.ErrNoRows
 	case PublicationBuilding, PublicationFailed:

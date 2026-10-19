@@ -163,16 +163,29 @@ func (s *Service) Start(ctx context.Context, userID uuid.UUID) (uuid.UUID, error
 // workflow and the most recent successful root workflow is at least 24 hours
 // old. The server clock is authoritative for the freshness boundary.
 func (s *Service) RefreshIfStale(ctx context.Context, userID uuid.UUID) (RefreshDecision, error) {
+	started := s.now()
+	logDecision := func(reason RefreshReason, err error) {
+		event := observability.FreshnessEvent{Decision: string(reason), Duration: s.now().Sub(started)}
+		if err != nil {
+			event.Reason = observability.ReasonPersistenceFailed
+		}
+		s.logger.Freshness(ctx, event)
+	}
 	if userID == uuid.Nil {
-		return RefreshDecision{}, errors.New("user ID is required")
+		err := errors.New("user ID is required")
+		logDecision(RefreshReasonMissing, err)
+		return RefreshDecision{}, err
 	}
 	active, err := s.store.Queries.GetActiveRootSteamSync(ctx, uuidPG(userID))
 	if err == nil {
 		jobID := uuid.UUID(active.ID.Bytes)
+		logDecision(RefreshReasonActive, nil)
 		return RefreshDecision{Reason: RefreshReasonActive, JobID: &jobID}, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return RefreshDecision{}, fmt.Errorf("find active sync: %w", err)
+		wrapped := fmt.Errorf("find active sync: %w", err)
+		logDecision(RefreshReasonMissing, wrapped)
+		return RefreshDecision{}, wrapped
 	}
 
 	reason := RefreshReasonMissing
@@ -182,27 +195,35 @@ func (s *Service) RefreshIfStale(ctx context.Context, userID uuid.UUID) (Refresh
 		last := latest.UpdatedAt.Time
 		lastSuccessfulAt = &last
 		if last.After(s.now().Add(-refreshFreshnessWindow)) {
+			logDecision(RefreshReasonFresh, nil)
 			return RefreshDecision{Reason: RefreshReasonFresh, LastSuccessfulAt: lastSuccessfulAt}, nil
 		}
 		reason = RefreshReasonStale
 	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return RefreshDecision{}, fmt.Errorf("load latest successful sync: %w", err)
+		wrapped := fmt.Errorf("load latest successful sync: %w", err)
+		logDecision(reason, wrapped)
+		return RefreshDecision{}, wrapped
 	}
 
 	preflight, err := s.Preflight(ctx, userID)
 	if err != nil {
+		logDecision(reason, err)
 		return RefreshDecision{}, err
 	}
 	if !preflight.CanSync {
+		logDecision(reason, ErrPreflightBlocked)
 		return RefreshDecision{}, ErrPreflightBlocked
 	}
 	jobID, created, err := s.enqueueSync(ctx, userID)
 	if err != nil {
+		logDecision(reason, err)
 		return RefreshDecision{}, err
 	}
 	if !created {
+		logDecision(RefreshReasonActive, nil)
 		return RefreshDecision{Reason: RefreshReasonActive, JobID: &jobID, LastSuccessfulAt: lastSuccessfulAt}, nil
 	}
+	logDecision(reason, nil)
 	return RefreshDecision{Enqueued: true, Reason: reason, JobID: &jobID, LastSuccessfulAt: lastSuccessfulAt}, nil
 }
 

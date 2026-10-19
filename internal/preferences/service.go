@@ -7,11 +7,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/observability"
+	"time"
 )
 
 type Service struct {
 	repository *SQLRepository
 	queue      *jobs.Queue
+	logger     *observability.Logger
+	now        func() time.Time
 }
 
 type OverlayJobPayload struct {
@@ -23,7 +27,13 @@ func NewService(repository *SQLRepository, queue *jobs.Queue) (*Service, error) 
 	if repository == nil || queue == nil {
 		return nil, errors.New("preference repository and queue are required")
 	}
-	return &Service{repository: repository, queue: queue}, nil
+	return &Service{repository: repository, queue: queue, logger: observability.New(nil), now: time.Now}, nil
+}
+func (s *Service) SetLogger(logger *observability.Logger) {
+	if logger == nil {
+		logger = observability.New(nil)
+	}
+	s.logger = logger
 }
 func (s *Service) List(ctx context.Context, userID uuid.UUID, includeInactive bool) ([]Adjustment, error) {
 	return s.repository.List(ctx, userID, includeInactive)
@@ -39,6 +49,8 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 		return errors.New("worker is required")
 	}
 	if err := worker.Register(OverlayJobKind, func(ctx context.Context, lease jobs.Lease) error {
+		started := s.now()
+		s.logger.OverlayBuild(ctx, observability.OverlayBuildEvent{Stage: "started"})
 		var payload OverlayJobPayload
 		if json.Unmarshal(lease.Payload, &payload) != nil || payload.Version != 1 || payload.UserID == uuid.Nil || lease.UserID != payload.UserID {
 			return errors.New("unsupported preference overlay job payload schema")
@@ -48,8 +60,10 @@ func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 			overlay, err = s.repository.RebuildOverlay(ctx, payload.UserID, lease.IdempotencyKey)
 		}
 		if err != nil {
+			s.logger.OverlayBuild(ctx, observability.OverlayBuildEvent{Stage: "failed", Duration: s.now().Sub(started), Reason: observability.ReasonPersistenceFailed})
 			return err
 		}
+		s.logger.OverlayBuild(ctx, observability.OverlayBuildEvent{Stage: "succeeded", OverlayVersion: overlay.Version, Positive: overlay.Metadata.PositiveSources, Negative: overlay.Metadata.NegativeSources, MissingVectors: overlay.Metadata.MissingVectors, EffectiveCorrections: overlay.Metadata.EffectiveCorrections, Duration: s.now().Sub(started)})
 		return s.queue.RecordResult(ctx, lease, map[string]any{"preferenceOverlayId": overlay.ID, "preferenceOverlayVersion": overlay.Version, "inputContentHash": overlay.InputContentHash})
 	}); err != nil {
 		return err

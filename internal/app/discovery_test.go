@@ -88,7 +88,7 @@ func TestAppRegistersHandlersInCorrectLanes(t *testing.T) {
 	if interactive.Concurrency() != 3 || catalogWorker.Concurrency() != 4 {
 		t.Fatalf("concurrency interactive=%d catalog=%d", interactive.Concurrency(), catalogWorker.Concurrency())
 	}
-	for _, kind := range []string{"steam.sync", "profile.rebuild", "preferences.rebuild", "preferences.disable", "recommendations.rebuild"} {
+	for _, kind := range []string{"steam.sync", "profile.rebuild", "profile_overlay.boundary_backfill", "preferences.rebuild", "preferences.disable", "recommendations.rebuild"} {
 		if !interactive.Handles(kind) || catalogWorker.Handles(kind) {
 			t.Fatalf("kind %q must be interactive only", kind)
 		}
@@ -298,10 +298,33 @@ func TestDisabledSearchSchedulesNoNewCatalogWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer application.store.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := application.scheduler.Run(ctx); err != nil {
+	userID := uuid.New()
+	if _, err := application.store.Pool.Exec(context.Background(), `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := application.store.Pool.Exec(context.Background(), `INSERT INTO catalog_rebuild_state(user_id,dirty_revision,dirty_since,first_dirty_at)
+		VALUES($1,1,now()-interval '1 hour',now()-interval '1 hour')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- application.scheduler.Run(ctx) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var swept int
+		if err := application.store.Pool.QueryRow(context.Background(), `SELECT count(*) FROM sync_jobs
+			WHERE user_id=$1 AND kind='recommendations.rebuild'`, userID).Scan(&swept); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		if swept == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("disabled scheduler did not complete its startup sweep")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	var work int
 	if err := application.store.Pool.QueryRow(context.Background(), `SELECT count(*) FROM sync_jobs
@@ -309,7 +332,12 @@ func TestDisabledSearchSchedulesNoNewCatalogWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	if work != 0 {
+		cancel()
 		t.Fatalf("disabled scheduler created %d catalog jobs", work)
+	}
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
 	}
 }
 

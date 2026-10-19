@@ -24,6 +24,7 @@ import (
 	"next-game-crush/internal/observability"
 	"next-game-crush/internal/preferences"
 	"next-game-crush/internal/profile"
+	"next-game-crush/internal/profileoverlay"
 	"next-game-crush/internal/recommendations"
 	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
@@ -158,6 +159,7 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("configure AI jobs: %w", err)
 	}
 	aiService.SetQueue(queue)
+	aiService.SetLogger(eventLogger)
 	if err := aiService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register AI handlers: %w", err)
@@ -229,6 +231,7 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("configure profile service: %w", err)
 	}
 	profileService.SetQueue(queue)
+	profileService.SetLogger(eventLogger)
 	if err := profileService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register profile handlers: %w", err)
@@ -243,6 +246,7 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("configure preference service: %w", err)
 	}
+	preferenceService.SetLogger(eventLogger)
 	// Register the overlay handler before any user workflow that can enqueue it.
 	if err := preferenceService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
@@ -269,11 +273,18 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("configure recommendation service: %w", err)
 	}
 	recommendationService.SetQueue(queue)
+	recommendationService.SetLogger(eventLogger)
 	recommendationService.SetExplanationCache(recommendationRepository, cfg.OpenAIModel)
 	recommendationService.SetOverviewSources(recommendationRepository, discoveryService)
 	if err := recommendationService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register recommendation handlers: %w", err)
+	}
+	// The rollout coordinator is registered only after every required child
+	// stage it can enqueue is available on the interactive worker.
+	if err := profileoverlay.RegisterBoundaryBackfill(interactiveWorker, queue); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register profile overlay boundary backfill: %w", err)
 	}
 	recommendationService.SetDeckRefreshPlanner(catalogService)
 	feedbackRepository, err := feedback.NewSQLRepository(db)
@@ -313,6 +324,10 @@ func New(cfg config.Config) (*App, error) {
 	if err := notificationService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register notification handlers: %w", err)
+	}
+	if err := profileoverlay.EnsureBoundaryBackfill(setupCtx, db, queue); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("schedule profile overlay boundary backfill: %w", err)
 	}
 	syncService.EnableRankingJobs()
 	authService, err := auth.New(auth.Config{AppBaseURL: cfg.AppBaseURL, AllowedSteamID: cfg.AllowedSteamID, SessionSecret: cfg.SessionSecret, FixtureAuth: cfg.FixtureAuth, DemoMode: cfg.DemoMode}, auth.NewSQLRepository(db), nil)
