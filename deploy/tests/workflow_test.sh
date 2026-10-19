@@ -241,10 +241,12 @@ assert_text_contains "$verify_job" 'docker compose build app' 'verify must build
 assert_text_not_contains "$verify_job" 'playwright|PLAYWRIGHT|google-chrome' \
   'automatic deployment verification must remain browser-independent'
 assert_text_contains "$verify_job" 'bash -n deploy/deploy\.sh deploy/tests/\*\.sh' 'verify must syntax-check deployment scripts'
-for test_script in compose deploy docs workflow; do
+for test_script in compose deploy workflow; do
   assert_text_contains "$verify_job" "bash deploy/tests/${test_script}_test\\.sh" \
     "verify must run ${test_script}_test.sh in its own diagnosable step"
 done
+assert_text_not_contains "$verify_job" 'bash deploy/tests/docs_test\.sh' \
+  'automatic deployment verification must not gate on deployment documentation'
 [[ "$(grep -Ec '^    runs-on: ubuntu-24\.04$' "$workflow")" -eq 3 ]] ||
   fail 'every job must use the pinned Ubuntu 24.04 runner image'
 

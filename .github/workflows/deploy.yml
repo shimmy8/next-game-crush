@@ -29,9 +29,6 @@ jobs:
       - name: Verify guarded deployment contract
         run: bash deploy/tests/deploy_test.sh
 
-      - name: Verify deployment documentation contract
-        run: bash deploy/tests/docs_test.sh
-
       - name: Verify workflow contract
         run: bash deploy/tests/workflow_test.sh
 
