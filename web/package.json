@@ -9,8 +9,7 @@
     "build": "tsc --noEmit && vite build",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint . --max-warnings 0",
-    "e2e": "playwright test"
+    "lint": "eslint . --max-warnings 0"
   },
   "dependencies": {
     "react": "19.3.1",
@@ -18,7 +17,6 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@playwright/test": "1.56.1",
     "@tailwindcss/vite": "4.3.3",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.3",

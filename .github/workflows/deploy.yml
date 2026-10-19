@@ -54,7 +54,6 @@ jobs:
           set -Eeuo pipefail
           docker compose up --quiet-pull --wait --wait-timeout 60 test-db
           docker compose up -d mailpit
-          make prepare-e2e-db
 
       - name: Verify generated SQL bindings
         shell: bash

@@ -9,9 +9,7 @@ import RecommendationCard from '../components/RecommendationCard'
 import SteamIdentity from '../components/SteamIdentity'
 import SteamPreflightStatus from '../components/SteamPreflightStatus'
 import SyncProgress from '../components/SyncProgress'
-import TestDigestButton from '../components/TestDigestButton'
 import CalendarPage from './CalendarPage'
-import DiagnosticsPage from './DiagnosticsPage'
 import FeedbackWorkflowProvider from '../components/FeedbackWorkflowProvider'
 import { useFeedbackWorkflows } from '../components/FeedbackWorkflowContext'
 import type { FeedbackPresentationOrigin } from '../components/FeedbackWorkflowContext'
@@ -21,7 +19,6 @@ type DashboardPageProps = {
   user: CurrentUser
   signingOut: boolean
   onLogout: () => void
-  onDataDeleted?: () => void
   initialState?: DashboardLoadState
 }
 
@@ -90,7 +87,7 @@ function UpcomingWindows({ calendar }: { calendar: CalendarResponse }) {
   return <aside className="windows-card"><div className="eyebrow">Без точного дня</div><h2>На горизонте</h2><ul>{windows.map(([key, label, count]) => <li key={key}><span>{label}</span><strong>{count}</strong></li>)}</ul><p>Мы не ставим игры в выдуманные даты.</p></aside>
 }
 
-function DashboardContent({ user, signingOut, onLogout, onDataDeleted = onLogout, dashboard, rankingDiff, setRankingDiff }: DashboardPageProps & { dashboard: ReturnType<typeof useDashboardData>; rankingDiff: RankingDiff | null; setRankingDiff(diff: RankingDiff): void }) {
+function DashboardContent({ user, signingOut, onLogout, dashboard, rankingDiff, setRankingDiff }: DashboardPageProps & { dashboard: ReturnType<typeof useDashboardData>; rankingDiff: RankingDiff | null; setRankingDiff(diff: RankingDiff): void }) {
   const [readOnlyNotice, setReadOnlyNotice] = useState('')
   const { state, reload, emptyData } = dashboard
   const workflows = useFeedbackWorkflows()
@@ -202,7 +199,7 @@ function DashboardContent({ user, signingOut, onLogout, onDataDeleted = onLogout
             : <PreferenceProfile profile={data.profile} />}
           {data.profile && entryRefresh.status === 'error' && <p className="profile-refresh-error" role="status">Не удалось обновить профиль. Используем предыдущую версию.</p>}
           <ExplicitRecommendationSettings adjustments={data.adjustments} csrfToken={user.csrfToken} onRankingUpdated={rankingUpdated} readOnly={readOnly} />
-          <CatalogCoverage status={catalogStatus} /><UpcomingWindows calendar={calendar} /><TestDigestButton csrfToken={user.csrfToken} readOnly={readOnly} /><DiagnosticsPage csrfToken={user.csrfToken} onDeleted={onDataDeleted} readOnly={readOnly} />
+          <CatalogCoverage status={catalogStatus} /><UpcomingWindows calendar={calendar} />
         </div>
       </div>}
 

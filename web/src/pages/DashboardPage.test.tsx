@@ -33,6 +33,13 @@ it('shows demo banner and intercepts visible mutation controls', () => {
   expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST' || init?.method === 'DELETE')).toBe(false)
 })
 
+it('does not show diagnostics or test digest controls on the dashboard', () => {
+  render(<DashboardPage user={user} signingOut={false} onLogout={() => undefined} initialState={{ status: 'ready', data: { adjustments: [], profile: profileFixture(), overview: overviewFixture(1, 0) } }} />)
+  expect(screen.queryByRole('heading', { name: 'Диагностика и данные' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('heading', { name: 'Тестовый дайджест' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Отправить дайджест' })).not.toBeInTheDocument()
+})
+
 it('shows first-run profile progress while an initial sync is active', async () => {
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     if (String(input) === '/api/sync/current') return new Response(JSON.stringify({ id: 'active', stage: 'steam', status: 'running', progress: 25, stages: [] }))
