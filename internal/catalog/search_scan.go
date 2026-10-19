@@ -22,14 +22,16 @@ var searchFeedOrder = []steam.SearchFeed{
 }
 
 type SearchScanService struct {
-	repo                  *SearchRepository
-	source                steam.SearchCatalog
-	queue                 *jobs.Queue
-	qualificationProducer SearchQualificationProducer
-	cfg                   DiscoveryConfig
-	now                   func() time.Time
-	afterPageCommitHook   func() error
-	beforePagePersistHook func() error
+	repo                             *SearchRepository
+	source                           steam.SearchCatalog
+	queue                            *jobs.Queue
+	qualificationProducer            SearchQualificationProducer
+	cfg                              DiscoveryConfig
+	now                              func() time.Time
+	afterPageCommitHook              func() error
+	beforePagePersistHook            func() error
+	afterReconciliationTerminalHook  func() error
+	afterReconciliationSuccessorHook func() error
 }
 
 // SearchQualificationProducer is installed explicitly by the catalog worker
@@ -132,7 +134,10 @@ func (s *SearchScanService) RegisterHandlers(worker *jobs.Worker) error {
 	if err := worker.Register(SearchRunJobKind, s.handleRun); err != nil {
 		return err
 	}
-	return worker.Register(SearchPageJobKind, s.handlePage)
+	if err := worker.Register(SearchPageJobKind, s.handlePage); err != nil {
+		return err
+	}
+	return worker.Register(ReconciliationPageJobKind, s.handleReconciliationPage)
 }
 
 func (s *SearchScanService) handleRun(ctx context.Context, lease jobs.Lease) error {
@@ -219,10 +224,98 @@ func (s *SearchScanService) ProcessRun(ctx context.Context, payload SearchRunPay
 		return errors.New("invalid search run payload")
 	}
 	run := RunRef{ID: payload.RunID, Revision: payload.RunRevision, Generation: payload.Generation}
+	runRow, err := s.repo.store.Queries.GetSearchRun(ctx, catalogUUID(payload.RunID))
+	if err != nil {
+		return err
+	}
+	if RunKind(runRow.Kind) == RunReconciliation {
+		startedAt := s.now().UTC()
+		command, err := s.repo.store.Pool.Exec(ctx, `UPDATE catalog_search_runs SET status='running',started_at=COALESCE(started_at,$2)
+			WHERE id=$1 AND run_revision=$3 AND retry_generation=$4 AND status IN ('queued','running')`,
+			payload.RunID, startedAt, payload.RunRevision, payload.Generation)
+		if err != nil {
+			return err
+		}
+		if command.RowsAffected() != 1 {
+			return jobs.ErrLeaseLost
+		}
+		if runRow.StartedAt.Valid {
+			startedAt = runRow.StartedAt.Time.UTC()
+		}
+		page := ReconciliationPagePayload{Version: 1, RunID: run.ID, RunRevision: run.Revision, PageGeneration: run.Generation,
+			ScanStartedAt: startedAt, NewAppCount: int(runRow.NewAppCount)}
+		var priorPayload, priorResult []byte
+		var priorStatus string
+		var priorUsed int
+		err = s.repo.store.Pool.QueryRow(ctx, `WITH previous AS (
+			SELECT id,status,new_app_count FROM catalog_search_runs WHERE kind='reconciliation' AND id<>$2
+			ORDER BY occurrence_at DESC,run_revision DESC LIMIT 1
+		), continuations AS (
+			SELECT j.payload,j.result,'failed'::text AS status,r.new_app_count AS used_count,0 AS source_order
+			FROM sync_jobs j JOIN catalog_search_runs r ON r.id=$2
+			WHERE j.kind=$1 AND j.payload->>'run_id'=$2::text
+				AND (j.payload->>'page_generation')::integer<$3
+				AND (j.result->>'continuation'='true' OR j.status='dead')
+			UNION ALL
+			SELECT j.payload,j.result,previous.status,previous.new_app_count,1 FROM previous
+			JOIN sync_jobs j ON (j.payload->>'run_id')::uuid=previous.id
+			WHERE j.kind=$1 AND previous.status IN ('partial','failed')
+				AND (j.result->>'continuation'='true' OR j.status='dead')
+		) SELECT payload,result,status,used_count FROM continuations ORDER BY source_order,
+			(payload->>'page_generation')::integer DESC,(payload->>'page')::integer DESC LIMIT 1`,
+			ReconciliationPageJobKind, payload.RunID, payload.Generation).Scan(&priorPayload, &priorResult, &priorStatus, &priorUsed)
+		if err == nil {
+			var previous ReconciliationPagePayload
+			var manifest reconciliationManifest
+			if strictDiscoveryPayload(priorPayload, &previous) != nil || strictDiscoveryPayload(priorResult, &manifest) != nil {
+				return errors.New("invalid reconciliation continuation")
+			}
+			page.Since = previous.Since
+			if !previous.ScanStartedAt.IsZero() {
+				page.ScanStartedAt = previous.ScanStartedAt
+			}
+			if manifest.Continuation {
+				page.AfterAppID = manifest.ResumeAfterAppID
+			} else {
+				page.AfterAppID = previous.AfterAppID
+			}
+			if priorStatus == "failed" {
+				page.Page = previous.Page
+				page.NewAppCount = priorUsed
+				if manifest.Continuation {
+					page.Page = manifest.ResumePage
+					page.NewAppCount = manifest.NewAppsUsed
+				}
+				if _, err = s.repo.store.Pool.Exec(ctx, `UPDATE catalog_search_runs SET new_app_count=GREATEST(new_app_count,$2)
+					WHERE id=$1 AND run_revision=$3 AND retry_generation=$4 AND status='running'`,
+					payload.RunID, page.NewAppCount, payload.RunRevision, payload.Generation); err != nil {
+					return err
+				}
+			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		} else {
+			var watermark *time.Time
+			watermarkErr := s.repo.store.Pool.QueryRow(ctx, `SELECT COALESCE(NULLIF(page.payload->>'scan_started_at','')::timestamptz,
+				r.started_at,r.occurrence_at) FROM catalog_search_runs r LEFT JOIN LATERAL (
+					SELECT payload FROM sync_jobs WHERE kind=$2 AND payload->>'run_id'=r.id::text
+					ORDER BY (payload->>'page_generation')::integer DESC,(payload->>'page')::integer DESC LIMIT 1
+				) page ON true WHERE r.kind='reconciliation' AND r.id<>$1 AND r.status='complete'
+				ORDER BY r.occurrence_at DESC,r.run_revision DESC LIMIT 1`, payload.RunID, ReconciliationPageJobKind).Scan(&watermark)
+			if watermarkErr != nil && !errors.Is(watermarkErr, pgx.ErrNoRows) {
+				return watermarkErr
+			}
+			if watermark != nil {
+				page.Since = watermark.UTC().Add(-reconciliationWatermarkOverlap)
+			}
+		}
+		_, err = s.queue.Enqueue(ctx, reconciliationPageSpec(page))
+		return err
+	}
 	if err := s.repo.PrepareRun(ctx, run); err != nil {
 		return err
 	}
-	_, err := s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}))
+	_, err = s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}))
 	return err
 }
 

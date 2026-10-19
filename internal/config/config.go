@@ -81,10 +81,7 @@ func Load() (Config, error) {
 	}{
 		{"CATALOG_LOOKBACK_DAYS", &cfg.CatalogDiscovery.LookbackDays, 366},
 		{"CATALOG_HORIZON_DAYS", &cfg.CatalogDiscovery.HorizonDays, 366},
-		{"CATALOG_DISCOVERY_INTERVAL_HOURS", &cfg.CatalogDiscovery.IntervalHours, 24},
-		{"CATALOG_DISCOVERY_HOURLY_BUDGET", &cfg.CatalogDiscovery.HourlyBudget, 1000},
-		{"CATALOG_DISCOVERY_UNKNOWN_FRESHNESS_DAYS", &cfg.CatalogDiscovery.UnknownFreshnessDays, 730},
-		{"CATALOG_DISCOVERY_PAGE_SIZE", &cfg.CatalogDiscovery.PageSize, 200},
+		{"CATALOG_RECONCILIATION_PAGE_SIZE", &cfg.CatalogDiscovery.ReconciliationPageSize, 200},
 	} {
 		if raw := strings.TrimSpace(os.Getenv(setting.name)); raw != "" {
 			value, err := strconv.Atoi(raw)
@@ -94,14 +91,6 @@ func Load() (Config, error) {
 				*setting.target = value
 			}
 		}
-	}
-	// During rollout, legacy shared limits supply a fallback only. Explicit search
-	// settings below always win, and catalog AI retains its independent budget.
-	if strings.TrimSpace(os.Getenv("CATALOG_DISCOVERY_HOURLY_BUDGET")) != "" {
-		cfg.CatalogDiscovery.AppDetailsHourlyBudget = cfg.CatalogDiscovery.HourlyBudget
-	}
-	if strings.TrimSpace(os.Getenv("CATALOG_DISCOVERY_PAGE_SIZE")) != "" {
-		cfg.CatalogDiscovery.SearchPageSize = cfg.CatalogDiscovery.PageSize
 	}
 	for _, setting := range []struct {
 		name   string

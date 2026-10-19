@@ -155,6 +155,30 @@ func TestWeeklyReconciliationUsesSameOccurrenceRules(t *testing.T) {
 	}
 }
 
+func TestHarnessReconciliationDoesNotReuseWeeklyOccurrence(t *testing.T) {
+	s, db := searchSchedulerFixture(t)
+	ctx := context.Background()
+	weekly, err := s.EnqueueReconciliation(ctx, searchClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualAt := searchClock().Add(37 * time.Second)
+	fresh, err := s.EnqueueTestReconciliation(ctx, manualAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.ID == weekly.ID || fresh.OccurredAt.Equal(weekly.OccurredAt) || !fresh.OccurredAt.Equal(manualAt.Truncate(time.Second)) {
+		t.Fatalf("weekly=%+v harness=%+v", weekly, fresh)
+	}
+	var count int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM catalog_search_runs WHERE schedule_name='reconciliation'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("reconciliation runs=%d, want 2", count)
+	}
+}
+
 func TestSearchInitialDependsOnDiscoveryState(t *testing.T) {
 	for _, state := range []string{"membership", "queued", "running", "complete", "failed"} {
 		t.Run(state, func(t *testing.T) {

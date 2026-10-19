@@ -40,6 +40,7 @@ type App struct {
 	interactiveWorker interface{ Run(context.Context) error }
 	catalogWorker     interface{ Run(context.Context) error }
 	scheduler         interface{ Run(context.Context) error }
+	catalogRestart    chan chan error
 	serve             func() error
 }
 
@@ -163,18 +164,13 @@ func New(cfg config.Config) (*App, error) {
 	}
 	syncService.SetAIJobPlanner(aiService)
 	discoveryRepo := catalog.NewDiscoveryRepository(db)
-	discoveryService, err := catalog.NewDiscoveryService(discoveryRepo, catalogSteamClient, catalogSteamClient, queue, cfg.CatalogDiscovery, eventLogger)
+	discoveryService, err := catalog.NewDiscoveryService(discoveryRepo, catalogSteamClient, queue, cfg.CatalogDiscovery, eventLogger)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure catalog discovery: %w", err)
 	}
-	discoveryService.SetEnrichmentPlanner(aiService)
 	discoveryService.SetSearchEnrichmentPlanner(aiService)
 	aiService.SetCatalogChangedHook(discoveryService.MarkCatalogChanged)
-	if err := discoveryService.RegisterHandlers(interactiveWorker); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("register catalog discovery handlers: %w", err)
-	}
 	searchRepo := catalog.NewSearchRepository(db)
 	searchScan, err := catalog.NewSearchScanService(searchRepo, catalogSteamClient, queue, cfg.CatalogDiscovery, nil)
 	if err != nil {
@@ -339,7 +335,7 @@ func New(cfg config.Config) (*App, error) {
 		AIBudgetPerHour: cfg.CatalogDiscovery.AIHourlyBudget, StaleAfter: 48 * time.Hour,
 	}))
 	deps.Data = dataService
-	return &App{store: db, queue: queue, searchRepo: searchRepo, searchScan: searchScan, aiService: aiService,
+	application := &App{store: db, queue: queue, searchRepo: searchRepo, searchScan: searchScan, aiService: aiService,
 		interactiveWorker: interactiveWorker, catalogWorker: catalogWorker, scheduler: searchScheduler, server: &http.Server{
 			Addr:              cfg.HTTPAddr,
 			Handler:           httpapi.NewRouter(deps),
@@ -347,7 +343,12 @@ func New(cfg config.Config) (*App, error) {
 			ReadTimeout:       15 * time.Second,
 			WriteTimeout:      30 * time.Second,
 			IdleTimeout:       60 * time.Second,
-		}}, nil
+		}, catalogRestart: make(chan chan error)}
+	if cfg.TestHarness {
+		deps.TestCatalog = &catalogHarness{store: db, scheduler: searchScheduler, restart: application.restartCatalogRuntime}
+		application.server.Handler = httpapi.NewRouter(deps)
+	}
+	return application, nil
 }
 
 func validateLegacyCutoverDrain(remaining int64, cutover catalog.LegacyCutoverResult) error {
@@ -405,11 +406,10 @@ func (app *App) Run(ctx context.Context) error {
 		name string
 		err  error
 	}
-	results := make(chan componentResult, 4)
+	results := make(chan componentResult, 3)
 	go func() { results <- componentResult{"http server", app.listenAndServe()} }()
 	go func() { results <- componentResult{"interactive job worker", app.interactiveWorker.Run(ctx)} }()
-	go func() { results <- componentResult{"catalog job worker", app.catalogWorker.Run(ctx)} }()
-	go func() { results <- componentResult{"catalog scheduler", app.scheduler.Run(ctx)} }()
+	go func() { results <- componentResult{"catalog runtime", app.runCatalogRuntime(ctx)} }()
 	var first componentResult
 	select {
 	case first = <-results:
@@ -418,7 +418,7 @@ func (app *App) Run(ctx context.Context) error {
 	}
 	cancel()
 	shutdownErr := app.shutdownHTTP()
-	remaining := 4
+	remaining := 3
 	if first.name != "context" {
 		remaining--
 	}

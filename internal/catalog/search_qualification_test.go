@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,10 +14,9 @@ import (
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
-	dbgen "next-game-crush/internal/store/sqlc"
 )
 
-func TestSearchQualificationKindAndKeyAreDistinctFromLegacyV1(t *testing.T) {
+func TestSearchQualificationProtocolRemainsCatalogLaneOnly(t *testing.T) {
 	payload := SearchQualificationPayload{Version: 1, AppID: 620,
 		CandidateRevision: CandidateRevision{RunRevision: 9, ObservationOrdinal: 17},
 		ReservationID:     uuid.MustParse("11111111-1111-4111-8111-111111111111"),
@@ -29,17 +27,13 @@ func TestSearchQualificationKindAndKeyAreDistinctFromLegacyV1(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantKey := "catalog.search.qualify:v1:620:run:9:observation:17:reservation:11111111-1111-4111-8111-111111111111:retry:3"
-	if spec.Kind != SearchQualificationJobKind || spec.Kind == QualifyJobKind || spec.IdempotencyKey != wantKey ||
-		spec.Lane != jobs.LaneCatalog || spec.Stage != "catalog_search_qualify" || spec.MaxAttempts != 4 || !spec.Optional || spec.Required {
+	if spec.Kind != SearchQualificationJobKind || spec.IdempotencyKey != wantKey || spec.Lane != jobs.LaneCatalog ||
+		spec.Stage != "catalog_search_qualify" || spec.MaxAttempts != 4 || !spec.Optional || spec.Required {
 		t.Fatalf("unexpected spec: %+v", spec)
 	}
 	wantJSON := `{"version":1,"app_id":620,"candidate_revision":{"run_revision":9,"observation_ordinal":17},"reservation_id":"11111111-1111-4111-8111-111111111111","reservation_token":"22222222-2222-4222-8222-222222222222","retry_generation":3,"priority":80}`
 	if string(spec.Payload) != wantJSON {
 		t.Fatalf("payload=%s", spec.Payload)
-	}
-	legacy := qualificationSpec(QualificationPayload{Version: 1, App: DiscoveredApp{AppID: 620, LastModified: time.Unix(100, 0).UTC()}, BudgetHour: time.Unix(0, 0).UTC(), Priority: 50}, uuid.Nil)
-	if legacy.Kind != QualifyJobKind || legacy.Lane != jobs.LaneInteractive || legacy.MaxAttempts != 3 || legacy.IdempotencyKey == spec.IdempotencyKey {
-		t.Fatalf("legacy protocol changed: %+v", legacy)
 	}
 	invalid := []SearchQualificationPayload{payload, payload, payload, payload, payload, payload}
 	invalid[0].Version = 2
@@ -70,229 +64,6 @@ func TestSemanticIdentityExcludesReviewReleaseAndPrice(t *testing.T) {
 	if SemanticContentHash(base) == SemanticContentHash(changedMeaning) {
 		t.Fatal("semantic description change did not alter identity")
 	}
-}
-
-func TestLegacyAndSearchAIJobsStayInTheirOriginLane(t *testing.T) {
-	db := openCatalogTestStore(t)
-	ctx := context.Background()
-	queue := jobs.NewQueue(db)
-	enrichment, err := ai.NewService(ai.NewSQLRepository(db), discoveryEnrichmentClient{}, "text-v1", "embedding-v1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	enrichment.SetQueue(queue)
-	admission := &allowCatalogFeatureAdmission{}
-	enrichment.SetCatalogFeatureAdmission(admission)
-
-	legacyID, catalogID := uuid.New(), uuid.New()
-	details := steam.GameDetails{AppID: 701, Type: "game", Name: "Semantic Lane Test", ShortDescription: "same semantic evidence",
-		Genres: []steam.Genre{{ID: "1", Description: "Action"}}, ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "Coming Soon"}}
-	insert := func(id uuid.UUID, appID int64, value steam.GameDetails) {
-		t.Helper()
-		snapshot, marshalErr := json.Marshal(value)
-		if marshalErr != nil {
-			t.Fatal(marshalErr)
-		}
-		if _, execErr := db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at,source_snapshot,availability)
-			VALUES($1,$2,$3,'steam_search',now(),$4,'available')`, id, appID, value.Name, snapshot); execErr != nil {
-			t.Fatal(execErr)
-		}
-	}
-	insert(legacyID, 701, details)
-	catalogDetails := details
-	catalogDetails.AppID = 702
-	catalogDetails.Name = "Catalog Lane Test"
-	insert(catalogID, 702, catalogDetails)
-
-	enqueue := func(fn func(context.Context, *dbgen.Queries) error) {
-		t.Helper()
-		tx, beginErr := db.Pool.Begin(ctx)
-		if beginErr != nil {
-			t.Fatal(beginErr)
-		}
-		defer tx.Rollback(ctx)
-		if callErr := fn(ctx, db.Queries.WithTx(tx)); callErr != nil {
-			t.Fatal(callErr)
-		}
-		if commitErr := tx.Commit(ctx); commitErr != nil {
-			t.Fatal(commitErr)
-		}
-	}
-	enqueue(func(ctx context.Context, q *dbgen.Queries) error {
-		return enqueueDiscoveryFeatures(ctx, q, enrichment, legacyID, details, 80)
-	})
-	// Search observes the same semantic identity while the interactive root is
-	// pending. It must join that root without changing its lane or attempts.
-	enqueue(func(ctx context.Context, q *dbgen.Queries) error {
-		return enqueueSearchDiscoveryFeatures(ctx, q, enrichment, legacyID, details, 80)
-	})
-	enqueue(func(ctx context.Context, q *dbgen.Queries) error {
-		return enqueueSearchDiscoveryFeatures(ctx, q, enrichment, catalogID, catalogDetails, 80)
-	})
-
-	var roots, interactiveRoots, catalogRoots int
-	if err = db.Pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE lane='interactive' AND max_attempts=3),count(*) FILTER(WHERE lane='catalog' AND max_attempts=4)
-		FROM sync_jobs WHERE kind='ai.features'`).Scan(&roots, &interactiveRoots, &catalogRoots); err != nil {
-		t.Fatal(err)
-	}
-	if roots != 2 || interactiveRoots != 1 || catalogRoots != 1 {
-		t.Fatalf("feature roots=%d interactive/3=%d catalog/4=%d", roots, interactiveRoots, catalogRoots)
-	}
-	var legacyAttempts int
-	if err = db.Pool.QueryRow(ctx, `SELECT attempts FROM sync_jobs WHERE kind='ai.features' AND lane='interactive'`).Scan(&legacyAttempts); err != nil {
-		t.Fatal(err)
-	}
-	if legacyAttempts != 0 {
-		t.Fatalf("same-semantic search join changed pending legacy attempts to %d", legacyAttempts)
-	}
-
-	interactive := jobs.NewWorker(queue, jobs.LaneInteractive, "lane-test-interactive", jobs.WithPollInterval(time.Millisecond))
-	catalog := jobs.NewWorker(queue, jobs.LaneCatalog, "lane-test-catalog", jobs.WithPollInterval(time.Millisecond))
-	if err = enrichment.RegisterHandlers(interactive); err != nil {
-		t.Fatal(err)
-	}
-	if err = enrichment.RegisterCatalogHandlers(catalog); err != nil {
-		t.Fatal(err)
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan error, 2)
-	go func() { done <- interactive.Run(runCtx) }()
-	go func() { done <- catalog.Run(runCtx) }()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var pending, dead int
-		if err = db.Pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE status NOT IN ('succeeded','dead')),count(*) FILTER(WHERE status='dead')
-			FROM sync_jobs WHERE kind IN ('ai.features','ai.embedding')`).Scan(&pending, &dead); err != nil {
-			cancel()
-			t.Fatal(err)
-		}
-		if dead != 0 {
-			cancel()
-			t.Fatal("AI lane test produced a dead job")
-		}
-		if pending == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatalf("AI lane jobs did not finish: pending=%d", pending)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	cancel()
-	for range 2 {
-		if workerErr := <-done; workerErr != nil {
-			t.Fatal(workerErr)
-		}
-	}
-
-	rows, err := db.Pool.Query(ctx, `SELECT payload->>'game_id',kind,lane,max_attempts FROM sync_jobs
-		WHERE kind IN ('ai.features','ai.embedding') ORDER BY payload->>'game_id',kind`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	counts := map[uuid.UUID]int{}
-	for rows.Next() {
-		var gameRaw, kind, lane string
-		var maxAttempts int
-		if err = rows.Scan(&gameRaw, &kind, &lane, &maxAttempts); err != nil {
-			t.Fatal(err)
-		}
-		gameID, parseErr := uuid.Parse(gameRaw)
-		if parseErr != nil {
-			t.Fatal(parseErr)
-		}
-		counts[gameID]++
-		wantLane, wantAttempts := "catalog", 4
-		if gameID == legacyID {
-			wantLane, wantAttempts = "interactive", 3
-		}
-		if lane != wantLane || maxAttempts != wantAttempts {
-			t.Fatalf("%s %s lane/max_attempts=%s/%d want %s/%d", gameID, kind, lane, maxAttempts, wantLane, wantAttempts)
-		}
-	}
-	if err = rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if counts[legacyID] != 2 || counts[catalogID] != 2 {
-		t.Fatalf("root+embedding counts legacy=%d catalog=%d", counts[legacyID], counts[catalogID])
-	}
-	identities := admission.identitiesSnapshot()
-	if admission.calls.Load() != 2 || len(identities) != 2 || identities[0] != identities[1] {
-		t.Fatalf("catalog admission calls=%d identities=%v; root and cache-hit resumption must share one identity and interactive execution must bypass it", admission.calls.Load(), identities)
-	}
-}
-
-type allowCatalogFeatureAdmission struct {
-	calls atomic.Int32
-	mu    sync.Mutex
-	ids   []string
-}
-
-func (a *allowCatalogFeatureAdmission) ReserveCatalogFeature(_ context.Context, _ jobs.Lease, identity string, _ time.Time) (bool, time.Time, error) {
-	a.calls.Add(1)
-	a.mu.Lock()
-	a.ids = append(a.ids, identity)
-	a.mu.Unlock()
-	return true, time.Time{}, nil
-}
-
-func (a *allowCatalogFeatureAdmission) identitiesSnapshot() []string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return append([]string(nil), a.ids...)
-}
-
-type searchQualificationPlanner struct{ calls int }
-
-func (p *searchQualificationPlanner) PlanCatalogGameFeatureJob(_ context.Context, gameID uuid.UUID, hash string, priority int) (jobs.Spec, error) {
-	p.calls++
-	raw, _ := json.Marshal(map[string]any{"game_id": gameID, "content_hash": hash})
-	return jobs.Spec{Lane: jobs.LaneCatalog, Kind: "feature.test", Stage: "feature", IdempotencyKey: "feature:" + gameID.String() + ":" + hash,
-		Payload: raw, Priority: priority, MaxAttempts: 4}, nil
-}
-
-func enableSearchQualificationProducer(t *testing.T, scan *SearchScanService, repo *SearchRepository) {
-	t.Helper()
-	scan.SetSearchQualificationProducer(repo)
-}
-
-func searchQualificationFixture(t *testing.T, observation steam.SearchObservation, details steam.GameDetails) (*DiscoveryService, *discoveryMetadata, *SearchRepository, jobs.Lease) {
-	t.Helper()
-	db := openCatalogTestStore(t)
-	cfg := DefaultDiscoveryConfig()
-	cfg.Enabled = true
-	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
-	repo := NewSearchRepository(db)
-	scan, err := NewSearchScanService(repo, &searchStub{}, jobs.NewQueue(db), cfg, func() time.Time { return now })
-	if err != nil {
-		t.Fatal(err)
-	}
-	enableSearchQualificationProducer(t, scan, repo)
-	run := searchTestRun(t, repo, cfg, now.Add(-time.Hour))
-	if err := scan.CommitPage(context.Background(), run, steam.FeedPopularUpcoming, 0, 0,
-		steam.SearchPage{Start: 0, Count: 1, Total: 1, Items: []steam.SearchObservation{observation}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := scan.CommitPage(context.Background(), run, steam.FeedPopularNew, 0, 0,
-		steam.SearchPage{Start: 0, Count: 0, Total: 0}); err != nil {
-		t.Fatal(err)
-	}
-	metadata := &discoveryMetadata{details: details}
-	service, err := NewDiscoveryService(NewDiscoveryRepository(db), &discoverySourceStub{}, metadata, jobs.NewQueue(db), cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	service.now = func() time.Time { return now }
-	lease, err := service.queue.Claim(context.Background(), jobs.LaneCatalog, "search-qualification-test", time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lease == nil || lease.Kind != SearchQualificationJobKind {
-		t.Fatalf("claimed %+v", lease)
-	}
-	return service, metadata, repo, *lease
 }
 
 func TestSearchQualificationProducerAtomicallyReservesAndEnqueues(t *testing.T) {
@@ -456,7 +227,7 @@ func TestCatalogAIBudgetDefersAtExecutionWithPriorityAndRestart(t *testing.T) {
 	cfg := DefaultDiscoveryConfig()
 	cfg.AIHourlyBudget = 1
 	queue := jobs.NewQueue(db)
-	gate, err := NewDiscoveryService(NewDiscoveryRepository(db), &discoverySourceStub{}, &discoveryMetadata{}, queue, cfg, nil)
+	gate, err := NewDiscoveryService(NewDiscoveryRepository(db), &discoveryMetadata{}, queue, cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +312,7 @@ func TestCatalogAIDeadExecutionSchedulesRecoveryThroughRealWorker(t *testing.T) 
 	cfg := DefaultDiscoveryConfig()
 	cfg.AIHourlyBudget = 10
 	queue := jobs.NewQueue(db)
-	gate, err := NewDiscoveryService(NewDiscoveryRepository(db), &discoverySourceStub{}, &discoveryMetadata{}, queue, cfg, nil)
+	gate, err := NewDiscoveryService(NewDiscoveryRepository(db), &discoveryMetadata{}, queue, cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -607,7 +378,7 @@ func TestCatalogAIEmbeddingDeathSchedulesOneRecoveryWithoutDuplicateEmbedding(t 
 	cfg := DefaultDiscoveryConfig()
 	cfg.AIHourlyBudget = 10
 	queue := jobs.NewQueue(db)
-	gate, err := NewDiscoveryService(NewDiscoveryRepository(db), &discoverySourceStub{}, &discoveryMetadata{}, queue, cfg, nil)
+	gate, err := NewDiscoveryService(NewDiscoveryRepository(db), &discoveryMetadata{}, queue, cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -715,55 +486,6 @@ func TestSearchQualificationPersistsCanonicalAndReviewState(t *testing.T) {
 		t.Fatalf("canonical=%q review=%q/%q/%v/%d active=%v soon=%v tombstone=%q hash=%q reservation=%q work=%q releases=%d feature=%d calls=%d deck=%d",
 			name, reviewBand, reviewLabel, reviewPercent, reviewTotal, active, comingSoon, tombstone, semanticHash,
 			reservationStatus, workStatus, releaseCount, featureJobs, planner.calls, metadata.deckCalls)
-	}
-}
-
-func TestLegacyQualificationV1RemainsOperationalAlongsideSearchQualification(t *testing.T) {
-	service, metadata := discoveryFixture(t)
-	ctx := context.Background()
-	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
-	service.now = func() time.Time { return now }
-	legacyApp := DiscoveredApp{AppID: 42, LastModified: now}
-	legacy := qualificationLease(t, service, legacyApp, 0)
-	if err := service.handleQualification(ctx, legacy); err != nil {
-		t.Fatal(err)
-	}
-	if err := service.queue.Complete(ctx, legacy); err != nil {
-		t.Fatal(err)
-	}
-	repo := NewSearchRepository(service.repo.store)
-	cfg := service.cfg
-	scan, err := NewSearchScanService(repo, &searchStub{}, service.queue, cfg, service.now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	enableSearchQualificationProducer(t, scan, repo)
-	run := searchTestRun(t, repo, cfg, now.Add(time.Minute))
-	observation := testObservation(43, "20 Oct, 2026", steam.ReviewUnknown, "")
-	if err := scan.CommitPage(ctx, run, steam.FeedPopularUpcoming, 0, 0, steam.SearchPage{Start: 0, Count: 1, Total: 1, Items: []steam.SearchObservation{observation}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := scan.CommitPage(ctx, run, steam.FeedPopularNew, 0, 0, steam.SearchPage{Start: 0, Count: 0, Total: 0}); err != nil {
-		t.Fatal(err)
-	}
-	metadata.details = steam.GameDetails{AppID: 43, Type: "game", Name: "Search Candidate", ShortDescription: "new path",
-		ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "20 Oct, 2026"}}
-	searchLease, err := service.queue.Claim(ctx, jobs.LaneCatalog, "coexistence", time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if searchLease == nil || searchLease.Kind != SearchQualificationJobKind || searchLease.IdempotencyKey == legacy.IdempotencyKey {
-		t.Fatalf("search lease=%+v legacy=%+v", searchLease, legacy)
-	}
-	if err := service.handleSearchQualification(ctx, *searchLease); err != nil {
-		t.Fatal(err)
-	}
-	var games int
-	if err := service.repo.store.Pool.QueryRow(ctx, `SELECT count(*) FROM games WHERE steam_app_id IN (42,43)`).Scan(&games); err != nil {
-		t.Fatal(err)
-	}
-	if games != 2 {
-		t.Fatalf("games=%d", games)
 	}
 }
 

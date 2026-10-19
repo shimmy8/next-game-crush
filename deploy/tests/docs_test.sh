@@ -109,10 +109,9 @@ assert_contains "$setup_guide" 'ISPmanager' \
   'VPS guide must explain how the detected control panel affects Nginx changes'
 for catalog_setting in \
   CATALOG_HORIZON_DAYS \
-  CATALOG_DISCOVERY_INTERVAL_HOURS \
-  CATALOG_DISCOVERY_HOURLY_BUDGET \
-  CATALOG_DISCOVERY_UNKNOWN_FRESHNESS_DAYS \
-  CATALOG_DISCOVERY_PAGE_SIZE
+  CATALOG_REFRESH_CRON \
+  CATALOG_RECONCILIATION_CRON \
+  CATALOG_RECONCILIATION_PAGE_SIZE
 do
   assert_contains "$setup_guide" "${catalog_setting}=" \
     "VPS guide must write ${catalog_setting} to the production environment"

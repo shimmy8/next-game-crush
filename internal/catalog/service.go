@@ -241,7 +241,7 @@ func (s *Service) refreshOne(ctx context.Context, game dbgen.Game) error {
 		return fmt.Errorf("read refreshed catalog ranking evidence: %w", err)
 	}
 	if (candidateBefore || candidateAfter) && (!bytes.Equal(beforeEvidence, afterEvidence) || candidateBefore != candidateAfter) {
-		if err := NewDiscoveryRepository(s.store).MarkCandidatesChanged(ctx, tx, now); err != nil {
+		if err := NewDiscoveryRepository(s.store).MarkCandidateSetDirtyAt(ctx, tx, EligibilityChange{GameID: uuid.UUID(updated.ID.Bytes), Kind: EligibilityChangeSemanticContent}, now); err != nil {
 			return fmt.Errorf("mark refreshed catalog candidates changed: %w", err)
 		}
 	}

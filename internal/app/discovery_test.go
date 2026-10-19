@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -21,6 +22,10 @@ import (
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/steam"
 )
+
+type catalogRunnerFunc func(context.Context) error
+
+func (f catalogRunnerFunc) Run(ctx context.Context) error { return f(ctx) }
 
 func discoveryAppConfig(t *testing.T) config.Config {
 	t.Helper()
@@ -83,12 +88,12 @@ func TestAppRegistersHandlersInCorrectLanes(t *testing.T) {
 	if interactive.Concurrency() != 3 || catalogWorker.Concurrency() != 4 {
 		t.Fatalf("concurrency interactive=%d catalog=%d", interactive.Concurrency(), catalogWorker.Concurrency())
 	}
-	for _, kind := range []string{catalog.QualifyJobKind, catalog.TickJobKind, "steam.sync", "recommendations.rebuild"} {
+	for _, kind := range []string{"steam.sync", "recommendations.rebuild"} {
 		if !interactive.Handles(kind) || catalogWorker.Handles(kind) {
 			t.Fatalf("kind %q must be interactive only", kind)
 		}
 	}
-	for _, kind := range []string{catalog.SearchRunJobKind, catalog.SearchPageJobKind, catalog.SearchQualificationJobKind, catalog.DeckRefreshJobKind} {
+	for _, kind := range []string{catalog.SearchRunJobKind, catalog.SearchPageJobKind, catalog.ReconciliationPageJobKind, catalog.SearchQualificationJobKind, catalog.DeckRefreshJobKind} {
 		if !catalogWorker.Handles(kind) || interactive.Handles(kind) {
 			t.Fatalf("kind %q must be catalog only", kind)
 		}
@@ -98,6 +103,168 @@ func TestAppRegistersHandlersInCorrectLanes(t *testing.T) {
 	}
 	if catalogWorker.Handles("profile.rebuild") {
 		t.Fatal("profile handler leaked into catalog lane")
+	}
+}
+
+func TestCatalogHarnessReadsPersistedReconciliationState(t *testing.T) {
+	cfg := discoveryAppConfig(t)
+	application, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.store.Close()
+	ctx := context.Background()
+	runID := uuid.New()
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO catalog_search_runs(id,schedule_name,occurrence_at,kind,status,completed_at,last_successful_at)
+		VALUES($1,'reconciliation',now(),'reconciliation','complete',now(),now())`, runID); err != nil {
+		t.Fatal(err)
+	}
+	var revision int64
+	if err = application.store.Pool.QueryRow(ctx, `SELECT run_revision FROM catalog_search_runs WHERE id=$1`, runID).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,
+		material_run_revision,material_observation_ordinal,material_fingerprint,active)
+		VALUES(620,$1,1,$1,1,'fixture',true)`, revision); err != nil {
+		t.Fatal(err)
+	}
+	identity := runID.String() + ":620"
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO catalog_metadata_ingress_work(steam_app_id,ingress_kind,ingress_identity,
+		run_revision,observation_ordinal,material_run_revision,material_observation_ordinal,material_fingerprint,status)
+		VALUES(620,'reconciliation',$1,$2,1,$2,1,'fixture','complete')`, identity, revision); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(catalog.ReconciliationPagePayload{Version: 1, RunID: runID, RunRevision: revision})
+	result := []byte(`{"version":1,"apps":[{"appid":620}],"next_app_id":620,"has_more":false}`)
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,lane,stage,idempotency_key,payload,result,status)
+		VALUES($1,'catalog.reconciliation.page','catalog','catalog_reconciliation_page',$2,$3,$4,'succeeded')`, uuid.New(), "harness:"+runID.String(), payload, result); err != nil {
+		t.Fatal(err)
+	}
+	harness := &catalogHarness{store: application.store}
+	value, err := harness.TestCatalogRun(ctx, runID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := value.(harnessRunState)
+	if state.Status != "succeeded" || len(state.CommittedPages) != 1 || len(state.ProcessedAppIDs) != 1 ||
+		state.ProcessedAppIDs[0] != 620 || len(state.PublishedAppIDs) != 1 || state.PublishedAppIDs[0] != 620 {
+		t.Fatalf("state=%+v", state)
+	}
+	oldPagePayload, _ := json.Marshal(catalog.ReconciliationPagePayload{Version: 1, RunID: runID, RunRevision: revision, PageGeneration: 0})
+	if _, err = application.store.Pool.Exec(ctx, `UPDATE catalog_search_runs SET retry_generation=1 WHERE id=$1`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,lane,stage,idempotency_key,payload,status)
+		VALUES($1,'catalog.reconciliation.page','catalog','catalog_reconciliation_page',$2,$3,'dead')`,
+		uuid.New(), "harness-old-page:"+runID.String(), oldPagePayload); err != nil {
+		t.Fatal(err)
+	}
+	value, err = harness.TestCatalogRun(ctx, runID.String())
+	if err != nil || value.(harnessRunState).Status != "succeeded" {
+		t.Fatalf("historical dead page poisoned newer generation: value=%+v err=%v", value, err)
+	}
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO catalog_search_worklist(run_id,steam_app_id,run_revision,observation_ordinal,status)
+		VALUES($1,620,$2,1,'pending')`, runID, revision); err != nil {
+		t.Fatal(err)
+	}
+	for _, pendingStatus := range []string{"pending", "reserved", "deferred"} {
+		if _, err = application.store.Pool.Exec(ctx, `UPDATE catalog_search_worklist SET status=$2 WHERE run_id=$1`, runID, pendingStatus); err != nil {
+			t.Fatal(err)
+		}
+		value, err = harness.TestCatalogRun(ctx, runID.String())
+		if err != nil || value.(harnessRunState).Status != "running" {
+			t.Fatalf("%s Search work was reported terminal: value=%+v err=%v", pendingStatus, value, err)
+		}
+	}
+	if _, err = application.store.Pool.Exec(ctx, `UPDATE catalog_search_worklist SET status='complete' WHERE run_id=$1`, runID); err != nil {
+		t.Fatal(err)
+	}
+	qualificationID := uuid.New()
+	qualificationPayload, _ := json.Marshal(map[string]any{"app_id": 620, "candidate_revision": map[string]any{
+		"run_revision": revision, "observation_ordinal": 1,
+	}})
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,lane,stage,idempotency_key,payload,status)
+		VALUES($1,'catalog.search.qualify','catalog','catalog_search_qualify',$2,$3,'queued')`,
+		qualificationID, "harness-qualification:"+runID.String(), qualificationPayload); err != nil {
+		t.Fatal(err)
+	}
+	value, err = harness.TestCatalogRun(ctx, runID.String())
+	if err != nil || value.(harnessRunState).Status != "running" {
+		t.Fatalf("pending qualification was reported terminal: value=%+v err=%v", value, err)
+	}
+	if _, err = application.store.Pool.Exec(ctx, `UPDATE sync_jobs SET status='succeeded' WHERE id=$1`, qualificationID); err != nil {
+		t.Fatal(err)
+	}
+	oldQualificationPayload, _ := json.Marshal(map[string]any{"app_id": 620, "candidate_revision": map[string]any{
+		"run_revision": revision - 1, "observation_ordinal": 1,
+	}})
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,lane,stage,idempotency_key,payload,status)
+		VALUES($1,'catalog.search.qualify','catalog','catalog_search_qualify',$2,$3,'dead')`,
+		uuid.New(), "harness-old-qualification:"+runID.String(), oldQualificationPayload); err != nil {
+		t.Fatal(err)
+	}
+	gameID := uuid.New()
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at)
+		VALUES($1,620,'Harness','steam_search',now())`, gameID); err != nil {
+		t.Fatal(err)
+	}
+	aiPayload, _ := json.Marshal(map[string]any{"game_id": gameID, "execution": map[string]any{"generation": 1}})
+	aiID := uuid.New()
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,lane,stage,idempotency_key,payload,status)
+		VALUES($1,'ai.features','catalog','ai_features',$2,$3,'queued')`, aiID, "harness-ai:"+runID.String(), aiPayload); err != nil {
+		t.Fatal(err)
+	}
+	value, err = harness.TestCatalogRun(ctx, runID.String())
+	if err != nil || value.(harnessRunState).Status != "running" {
+		t.Fatalf("downstream AI was reported terminal: value=%+v err=%v", value, err)
+	}
+	if _, err = application.store.Pool.Exec(ctx, `UPDATE sync_jobs SET status='dead' WHERE id=$1`, aiID); err != nil {
+		t.Fatal(err)
+	}
+	value, err = harness.TestCatalogRun(ctx, runID.String())
+	if err != nil || value.(harnessRunState).Status != "dead" {
+		t.Fatalf("dead downstream AI was reported successful: value=%+v err=%v", value, err)
+	}
+	newAIPayload, _ := json.Marshal(map[string]any{"game_id": gameID, "execution": map[string]any{"generation": 2}})
+	if _, err = application.store.Pool.Exec(ctx, `INSERT INTO sync_jobs(id,kind,lane,stage,idempotency_key,payload,status)
+		VALUES($1,'ai.features','catalog','ai_features',$2,$3,'succeeded')`,
+		uuid.New(), "harness-ai-current:"+runID.String(), newAIPayload); err != nil {
+		t.Fatal(err)
+	}
+	value, err = harness.TestCatalogRun(ctx, runID.String())
+	if err != nil || value.(harnessRunState).Status != "succeeded" {
+		t.Fatalf("historical dead downstream jobs poisoned newer success: value=%+v err=%v", value, err)
+	}
+	if _, err = application.store.Pool.Exec(ctx, `UPDATE catalog_search_worklist SET status='failed' WHERE run_id=$1`, runID); err != nil {
+		t.Fatal(err)
+	}
+	value, err = harness.TestCatalogRun(ctx, runID.String())
+	if err != nil || value.(harnessRunState).Status != "dead" {
+		t.Fatalf("failed downstream work was reported successful: value=%+v err=%v", value, err)
+	}
+}
+
+func TestCatalogRuntimeRestartPropagatesConcurrentFatalError(t *testing.T) {
+	fatal := errors.New("catalog runtime failed during restart")
+	application := &App{
+		catalogWorker:  catalogRunnerFunc(func(ctx context.Context) error { <-ctx.Done(); return nil }),
+		scheduler:      catalogRunnerFunc(func(ctx context.Context) error { <-ctx.Done(); return fatal }),
+		catalogRestart: make(chan chan error),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runtimeResult := make(chan error, 1)
+	go func() { runtimeResult <- application.runCatalogRuntime(ctx) }()
+	if err := application.restartCatalogRuntime(ctx); !errors.Is(err, fatal) {
+		t.Fatalf("restart err=%v", err)
+	}
+	select {
+	case err := <-runtimeResult:
+		if !errors.Is(err, fatal) {
+			t.Fatalf("runtime err=%v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("catalog runtime swallowed fatal restart error")
 	}
 }
 

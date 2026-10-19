@@ -186,3 +186,10 @@ func (s *SearchScheduler) EnqueueReconciliation(ctx context.Context, at time.Tim
 	}
 	return s.enqueueOccurrence(ctx, occurrence, "reconciliation", RunReconciliation)
 }
+
+// EnqueueTestReconciliation is a harness-only seam. Unlike the production
+// weekly scheduler it uses the requested instant, so a fixture reset cannot
+// accidentally reuse the current cron occurrence and skip upstream I/O.
+func (s *SearchScheduler) EnqueueTestReconciliation(ctx context.Context, at time.Time) (RunRef, error) {
+	return s.enqueueOccurrence(ctx, at, "reconciliation", RunReconciliation)
+}

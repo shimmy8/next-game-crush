@@ -71,7 +71,13 @@ Search ingestion. `CATALOG_REFRESH_CRON` controls the daily Search occurrence,
 `CATALOG_REFRESH_TIMEZONE` interprets both five-field expressions. Release
 windows remain UTC-based. The current production Compose file also passes the
 30-day lookback/horizon, independent Store/AI hourly budgets, catalog worker
-concurrency, Search page size, per-feed page cap, and per-run new-AppID cap.
+concurrency, Search page size, per-feed page cap, per-run new-AppID cap, and
+`CATALOG_RECONCILIATION_PAGE_SIZE`. Reconciliation uses low-priority durable
+`GetAppList` pages and the same AppDetails reservation/budget gate. The page and
+new-AppID caps also bound each reconciliation occurrence; a partial scan stores
+its continuation and resumes on the next occurrence. The retired
+hourly discovery variables are ignored and should be removed from old `.env`
+files during rollout.
 
 An app restart catches up the latest missed occurrence using durable,
 idempotent rows. It does not replay every missed wall-clock tick, and HTTP

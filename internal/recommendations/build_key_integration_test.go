@@ -15,12 +15,6 @@ import (
 	"next-game-crush/internal/steam"
 )
 
-type inertDiscoverySource struct{}
-
-func (inertDiscoverySource) ListChangedGames(context.Context, time.Time, uint32, int) (catalog.DiscoveryPage, error) {
-	return catalog.DiscoveryPage{}, nil
-}
-
 type inertSteamClient struct{}
 
 func (inertSteamClient) PlayerSummary(context.Context, string) (steam.PlayerSummary, error) {
@@ -194,7 +188,7 @@ func TestClockTransitionsChangeRealRankingBeforeRetryPublishes(t *testing.T) {
 	cfg := catalog.DefaultDiscoveryConfig()
 	cfg.Enabled = false
 	queue := jobs.NewQueue(repo.store)
-	discovery, err := catalog.NewDiscoveryService(catalog.NewDiscoveryRepository(repo.store), inertDiscoverySource{}, inertSteamClient{}, queue, cfg, nil)
+	discovery, err := catalog.NewDiscoveryService(catalog.NewDiscoveryRepository(repo.store), inertSteamClient{}, queue, cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

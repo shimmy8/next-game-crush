@@ -26,6 +26,7 @@ type Dependencies struct {
 	Feedback        FeedbackService
 	Digests         DigestService
 	Data            DataService
+	TestCatalog     TestCatalogService
 	DemoEnabled     bool
 }
 
@@ -80,6 +81,11 @@ func NewRouter(deps Dependencies) http.Handler {
 		if deps.Data != nil {
 			router.With(deps.Auth.Middleware).Get("/api/jobs", listJobs(deps.Data))
 			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Delete("/api/data", deleteData(deps.Data, deps.Auth))
+		}
+		if deps.TestCatalog != nil {
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/test/catalog/runs", startTestCatalogRun(deps.TestCatalog))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner).Get("/api/test/catalog/runs/{id}", getTestCatalogRun(deps.TestCatalog))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/test/catalog/runtime/restart", restartTestCatalogRuntime(deps.TestCatalog))
 		}
 	}
 	if deps.Digests != nil {

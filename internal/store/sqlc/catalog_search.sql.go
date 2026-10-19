@@ -937,10 +937,17 @@ func (q *Queries) ListDueEligibilityChanges(ctx context.Context, arg ListDueElig
 }
 
 const listTerminalSearchRuns = `-- name: ListTerminalSearchRuns :many
-SELECT r.id, r.run_revision, r.schedule_name, r.occurrence_at, r.kind, r.config_snapshot, r.status, r.retry_generation, r.next_retry_at, r.observation_ordinal, r.new_app_count, r.created_at, r.started_at, r.completed_at, r.last_successful_at, r.safe_error,j.updated_at AS job_updated_at FROM catalog_search_runs r
-JOIN sync_jobs j ON j.idempotency_key='catalog.search.run:v1:'||r.schedule_name||':'||
+SELECT r.id, r.run_revision, r.schedule_name, r.occurrence_at, r.kind, r.config_snapshot, r.status, r.retry_generation, r.next_retry_at, r.observation_ordinal, r.new_app_count, r.created_at, r.started_at, r.completed_at, r.last_successful_at, r.safe_error,(CASE WHEN root.status='dead' THEN root.updated_at ELSE page.updated_at END)::timestamptz AS job_updated_at FROM catalog_search_runs r
+LEFT JOIN sync_jobs root ON root.idempotency_key='catalog.search.run:v1:'||r.schedule_name||':'||
     extract(epoch FROM r.occurrence_at)::bigint::text||':retry:'||r.retry_generation::text
-WHERE j.status='dead' AND r.status IN ('queued','running','failed','partial')
+LEFT JOIN LATERAL (
+    SELECT updated_at FROM sync_jobs
+    WHERE kind='catalog.reconciliation.page' AND payload->>'run_id'=r.id::text
+      AND (payload->>'page_generation')::integer=r.retry_generation AND status='dead'
+    ORDER BY updated_at DESC LIMIT 1
+) page ON true
+WHERE r.status IN ('queued','running','failed','partial')
+  AND (root.status='dead' OR page.updated_at IS NOT NULL)
 ORDER BY r.run_revision FOR UPDATE OF r
 `
 

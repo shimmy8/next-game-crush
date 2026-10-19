@@ -10,12 +10,13 @@ import (
 type RunKind string
 
 const (
-	RunScheduled      RunKind = "scheduled"
-	RunManual         RunKind = "manual"
-	RunInitial        RunKind = "initial"
-	RunReconciliation RunKind = "reconciliation"
-	SearchRunJobKind          = "catalog.search.run"
-	SearchPageJobKind         = "catalog.search.page"
+	RunScheduled              RunKind = "scheduled"
+	RunManual                 RunKind = "manual"
+	RunInitial                RunKind = "initial"
+	RunReconciliation         RunKind = "reconciliation"
+	SearchRunJobKind                  = "catalog.search.run"
+	SearchPageJobKind                 = "catalog.search.page"
+	ReconciliationPageJobKind         = "catalog.reconciliation.page"
 )
 
 type RunRef struct {
@@ -39,6 +40,18 @@ type SearchPagePayload struct {
 	Feed           steam.SearchFeed `json:"feed"`
 	Start          int              `json:"start"`
 	PageGeneration int              `json:"page_generation"`
+}
+
+type ReconciliationPagePayload struct {
+	Version        int       `json:"version"`
+	RunID          uuid.UUID `json:"run_id"`
+	RunRevision    int64     `json:"run_revision"`
+	ScanStartedAt  time.Time `json:"scan_started_at"`
+	Since          time.Time `json:"since"`
+	AfterAppID     uint32    `json:"after_app_id"`
+	PageGeneration int       `json:"page_generation"`
+	Page           int       `json:"page"`
+	NewAppCount    int       `json:"new_app_count"`
 }
 
 type CandidateRevision struct {
