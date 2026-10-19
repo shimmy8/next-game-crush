@@ -9,12 +9,11 @@ const diff = { rebuildStatus: 'succeeded', previousVersion: 4, currentVersion: 5
 
 it('shows active human labels only and handles empty normalized data', () => {
   const { rerender } = render(<PreferenceAdjustments adjustments={[rule, { ...rule, id: 'inactive-id', label: 'Одиночные игры', active: false }]} csrfToken="csrf" />)
-  expect(screen.getByText('Учитываем ваши корректировки')).toBeInTheDocument()
   expect(screen.getByText('Кооперативные игры')).toBeInTheDocument()
   expect(screen.queryByText('Одиночные игры')).not.toBeInTheDocument()
   expect(screen.queryByText('opaque-rule')).not.toBeInTheDocument()
   rerender(<PreferenceAdjustments adjustments={[]} csrfToken="csrf" />)
-  expect(screen.queryByText('Учитываем ваши корректировки')).not.toBeInTheDocument()
+  expect(screen.queryByText('Кооперативные игры')).not.toBeInTheDocument()
 })
 
 it('keeps correction controls visible but read-only in demo mode', () => {

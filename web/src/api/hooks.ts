@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getRecommendationOverview, getCurrentSync, getProfile, getSyncStatus, normalizeOverview, preflightSync, startSync } from './client'
-import type { CalendarResponse, DashboardData, DashboardLoadState, DashboardReloadResult, PreflightResponse, SafeReloadReason, SyncStatus } from './types'
+import { getPreferenceAdjustments, getRecommendationOverview, getCurrentSync, getProfile, getSyncStatus, normalizeOverview, preflightSync, refreshSyncIfStale, startSync } from './client'
+import type { CalendarResponse, CurrentUser, DashboardData, DashboardLoadState, DashboardReloadResult, PreflightResponse, SafeReloadReason, SyncStatus } from './types'
 
 const EMPTY_OVERVIEW = normalizeOverview({})
 
@@ -69,10 +69,10 @@ export function useDashboardData(initialState?: DashboardLoadState) {
     abort.current = controller
     const current = ++request.current
     try {
-      const [profile, overview] = await Promise.all([getProfile(controller.signal), getRecommendationOverview(controller.signal)])
+      const [profile, adjustments, overview] = await Promise.all([getProfile(controller.signal), getPreferenceAdjustments(false, controller.signal), getRecommendationOverview(controller.signal)])
       if (current !== request.current) return nonFresh('superseded')
       if (controller.signal.aborted) return nonFresh('aborted')
-      const data = { profile, overview }
+      const data = { profile, adjustments, overview }
       const count = Object.values(overview.calendar).reduce((total, items) => total + items.length, 0)
       if (!profile && count === 0) publish({ status: 'empty', data })
       else {
@@ -99,7 +99,42 @@ export function useDashboardData(initialState?: DashboardLoadState) {
     }
   }, [initialState, reload])
 
-  return { state, reload, emptyData: { profile: null, overview: EMPTY_OVERVIEW } satisfies DashboardData }
+  return { state, reload, emptyData: { profile: null, adjustments: [], overview: EMPTY_OVERVIEW } satisfies DashboardData }
+}
+
+export function useEntryRefresh(user: CurrentUser, onSyncComplete: () => void): { status: 'idle' | 'checking' | 'syncing' | 'error'; sync: SyncStatus | null } {
+  const [status, setStatus] = useState<'idle' | 'checking' | 'syncing' | 'error'>('idle')
+  const [sync, setSync] = useState<SyncStatus | null>(null)
+  const completed = useRef(onSyncComplete)
+  useEffect(() => { completed.current = onSyncComplete }, [onSyncComplete])
+
+  useEffect(() => {
+    if (user.accessMode === 'demo') return
+    const controller = new AbortController()
+    void (async () => {
+      setStatus('checking')
+      try {
+        const decision = await refreshSyncIfStale(user.csrfToken, controller.signal)
+        if (controller.signal.aborted) return
+        if ((decision.reason === 'missing' || decision.reason === 'stale' || decision.reason === 'active') && decision.jobId) {
+          setStatus('syncing')
+          const terminal = await pollSyncJob(decision.jobId, { signal: controller.signal, onStatus: setSync })
+          if (controller.signal.aborted) return
+          if (terminal?.status === 'succeeded' || terminal?.status === 'ready') {
+            completed.current()
+            setStatus('idle')
+          } else if (terminal) setStatus('error')
+          return
+        }
+        setStatus('idle')
+      } catch (error) {
+        if (!controller.signal.aborted && !isAbortError(error)) setStatus('error')
+      }
+    })()
+    return () => controller.abort()
+  }, [user.accessMode, user.csrfToken])
+
+  return { status, sync }
 }
 
 export function useSync(csrfToken: string, onComplete: () => void) {

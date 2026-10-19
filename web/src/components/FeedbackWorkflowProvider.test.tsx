@@ -56,7 +56,7 @@ describe('FeedbackWorkflowProvider', () => {
     const submitFeedback = vi.fn().mockResolvedValue(accepted)
     const readRankingDiff = vi.fn(() => new Promise<typeof diff>((resolve) => { finishPolling = resolve }))
     const onRankingUpdated = vi.fn()
-    const reload = vi.fn().mockResolvedValue({ kind: 'fresh', data: { profile: null, overview: overviewFixture(0, 0) } })
+    const reload = vi.fn().mockResolvedValue({ kind: 'fresh', data: { adjustments: [], profile: null, overview: overviewFixture(0, 0) } })
     render(<StrictMode><FeedbackWorkflowProvider csrfToken="csrf" submitFeedback={submitFeedback} readRankingDiff={readRankingDiff} wait={async () => undefined} reload={reload} onRankingUpdated={onRankingUpdated}><Probe /></FeedbackWorkflowProvider></StrictMode>)
 
     fireEvent.click(screen.getByText('dislike one'))
@@ -122,7 +122,7 @@ describe('FeedbackWorkflowProvider', () => {
 
   it('keeps a dislike locked through stale reconciliation and releases only after fresh confirmation', async () => {
     const overview = overviewFixture(0, 0)
-    const reload = vi.fn().mockResolvedValueOnce({ kind: 'stale', data: { profile: null, overview }, reason: 'request_failed' }).mockResolvedValueOnce({ kind: 'fresh', data: { profile: null, overview } })
+    const reload = vi.fn().mockResolvedValueOnce({ kind: 'stale', data: { adjustments: [], profile: null, overview }, reason: 'request_failed' }).mockResolvedValueOnce({ kind: 'fresh', data: { adjustments: [], profile: null, overview } })
     const submitFeedback = vi.fn().mockResolvedValue(accepted)
     render(<FeedbackWorkflowProvider csrfToken="csrf" submitFeedback={submitFeedback} readRankingDiff={vi.fn().mockResolvedValue(diff)} wait={async () => undefined} reload={reload}><Probe /></FeedbackWorkflowProvider>)
     fireEvent.click(screen.getByText('dislike one'))
@@ -136,7 +136,7 @@ describe('FeedbackWorkflowProvider', () => {
   it('clears an existing tombstone only after a later fresh like confirmation', async () => {
     const dislikeOverview = overviewFixture(0, 0)
     const likeOverview = overviewFixture(1, 0); likeOverview.discoveries.featured!.gameId = 'game-1'; likeOverview.discoveries.featured!.latestFeedbackAction = 'like'
-    const reload = vi.fn().mockResolvedValueOnce({ kind: 'fresh', data: { profile: null, overview: dislikeOverview } }).mockResolvedValueOnce({ kind: 'fresh', data: { profile: null, overview: likeOverview } })
+    const reload = vi.fn().mockResolvedValueOnce({ kind: 'fresh', data: { adjustments: [], profile: null, overview: dislikeOverview } }).mockResolvedValueOnce({ kind: 'fresh', data: { adjustments: [], profile: null, overview: likeOverview } })
     const submitFeedback = vi.fn().mockResolvedValue(accepted)
     render(<FeedbackWorkflowProvider csrfToken="csrf" submitFeedback={submitFeedback} readRankingDiff={vi.fn().mockResolvedValue(diff)} wait={async () => undefined} reload={reload}><Probe /></FeedbackWorkflowProvider>)
     fireEvent.click(screen.getByText('dislike one')); await waitFor(() => expect(screen.getByTestId('busy')).toHaveTextContent('false')); expect(screen.getByTestId('tombstone')).toHaveTextContent('true')

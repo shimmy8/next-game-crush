@@ -137,8 +137,6 @@ export type RankingDiff = {
 export type SummarySource = 'openai' | 'deterministic' | 'legacy'
 
 export type PreferenceProfileData = {
-  /** @deprecated Temporary Task 8→9 compile seam. The API/client never populate this field. */
-  adjustments?: PreferenceAdjustment[]
   id: string
   version: number
   summary: string
@@ -209,8 +207,7 @@ export type CurrentUser = CurrentUserBase & (
 
 export type DashboardData = {
   profile: PreferenceProfileData | null
-  /** @deprecated Temporary Task 8→9 compile seam; Task 9 makes this required. */
-  adjustments?: PreferenceAdjustment[]
+  adjustments: PreferenceAdjustment[]
   overview: RecommendationOverview
 }
 

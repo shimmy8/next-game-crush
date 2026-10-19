@@ -54,5 +54,5 @@ function AdjustmentRow({ adjustment, csrfToken, onRankingUpdated, disable = disa
 export default function PreferenceAdjustments({ adjustments = [], ...props }: Props) {
   const active = adjustments.filter((item) => item.active)
   if (!active.length) return null
-  return <section className="preference-adjustments" aria-label="Учитываем ваши корректировки"><h3>Учитываем ваши корректировки</h3><ul>{active.map((adjustment) => <AdjustmentRow key={adjustment.id} adjustment={adjustment} {...props} />)}</ul></section>
+  return <div className="preference-adjustments"><ul>{active.map((adjustment) => <AdjustmentRow key={adjustment.id} adjustment={adjustment} {...props} />)}</ul></div>
 }

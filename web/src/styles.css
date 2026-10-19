@@ -135,11 +135,14 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .recommendation-grid .cover-panel { min-height: 185px; border-right: 0; border-bottom: 1px solid var(--line); }
 .recommendation-grid .recommendation-card__body { padding: 22px; }
 .recommendation-grid .recommendation-card h3 { font-size: 1.45rem; }
-.profile-card, .windows-card, .digest-card { padding: 24px; border: 1px solid var(--line); border-radius: 14px; background: #11151f; }
+.profile-card, .explicit-settings, .windows-card, .digest-card { padding: 24px; border: 1px solid var(--line); border-radius: 14px; background: #11151f; }
 .profile-card h2, .windows-card h2, .digest-card h2 { margin: 8px 0 14px; font-size: 1.2rem; }
 .digest-card p { color: var(--muted); font-size: .82rem; line-height: 1.5; }
 .digest-card button { width: 100%; }
 .profile-card > p { color: #b8b7c4; line-height: 1.58; font-size: .88rem; }
+.profile-card .profile-update { color: #d7b267; font-weight: 700; }
+.profile-refresh-error { margin: 0; padding: 12px 14px; border: 1px solid #6b5238; border-radius: 10px; color: #e0bf8f; background: #201a16; font-size: .82rem; }
+.explicit-settings > p { color: var(--muted); line-height: 1.45; font-size: .78rem; }
 .confidence-line { display: flex; justify-content: space-between; margin-top: 22px; color: var(--muted); font-size: .75rem; }
 .confidence-line strong { color: var(--ink); }
 .meter { height: 5px; background: #292e3c; border-radius: 6px; margin: 8px 0 19px; overflow: hidden; }
@@ -302,7 +305,7 @@ footer { display: flex; justify-content: space-between; gap: 20px; border-top: 1
 .feedback-fields .feedback-reasons label { display: flex; gap: 5px; align-items: center; }
 .feedback-reasons legend { color: var(--muted); font-size: .8rem; }
 .feedback-fields > textarea { width: 100%; min-height: 72px; resize: vertical; color: var(--ink); background: #0f131d; border: 1px solid #3a4050; border-radius: 8px; padding: 8px; }
-.preference-adjustments { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+.preference-adjustments { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
 .preference-adjustments h3 { font-size: .85rem; }
 .preference-adjustments ul, .adjustment-history ul { list-style: none; padding: 0; }
 .preference-adjustments li, .adjustment-history li { display: grid; gap: 7px; margin: 12px 0; min-width: 0; font-size: .75rem; overflow-wrap: anywhere; }

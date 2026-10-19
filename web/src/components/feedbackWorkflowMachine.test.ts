@@ -40,11 +40,11 @@ function freshRecommendation(action: 'like' | 'dislike' | null, present = true):
     item.latestFeedbackAction = action
     overview.discoveries.featured = item
   }
-  return { kind: 'fresh', data: { profile: null, overview } }
+  return { kind: 'fresh', data: { adjustments: [], profile: null, overview } }
 }
 
 const fresh = freshRecommendation('dislike')
-const stale = { kind: 'stale', data: { profile: null, overview: overviewFixture() }, reason: 'request_failed' } satisfies DashboardReloadResult
+const stale = { kind: 'stale', data: { adjustments: [], profile: null, overview: overviewFixture() }, reason: 'request_failed' } satisfies DashboardReloadResult
 const failed = { kind: 'failed', reason: 'request_failed' } satisfies DashboardReloadResult
 
 function acquireRecord(

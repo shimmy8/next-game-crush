@@ -8,7 +8,7 @@ function renderForm(options: { readOnly?: boolean; initialAction?: 'like' | 'dis
   const submitFeedback = vi.fn().mockResolvedValue({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 })
   const readRankingDiff = vi.fn().mockResolvedValue({ rebuildStatus: 'succeeded', previousVersion: 1, currentVersion: 2, added: [], removed: [], reordered: [] })
   const overview = overviewFixture(1, 0); overview.discoveries.featured!.latestFeedbackAction = 'like'
-  render(<FeedbackWorkflowProvider csrfToken="csrf" submitFeedback={submitFeedback} readRankingDiff={readRankingDiff} wait={async () => undefined} reload={async () => ({ kind: 'fresh', data: { profile: null, overview } })}><FeedbackForm gameId={overview.discoveries.featured!.gameId} recommendationId="rec" rankingVersion={1} gameName="Game" {...options} /></FeedbackWorkflowProvider>)
+  render(<FeedbackWorkflowProvider csrfToken="csrf" submitFeedback={submitFeedback} readRankingDiff={readRankingDiff} wait={async () => undefined} reload={async () => ({ kind: 'fresh', data: { adjustments: [], profile: null, overview } })}><FeedbackForm gameId={overview.discoveries.featured!.gameId} recommendationId="rec" rankingVersion={1} gameName="Game" {...options} /></FeedbackWorkflowProvider>)
   return { submitFeedback }
 }
 

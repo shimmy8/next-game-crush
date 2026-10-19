@@ -26,7 +26,7 @@ describe('DashboardPage states', () => {
   })
 
   it('labels stale data and keeps it visible', () => {
-    render(<DashboardPage user={user} onLogout={() => undefined} signingOut={false} initialState={{ status: 'stale', message: 'Данные от 15 октября', data: { profile: null, overview: overviewFixture() } }} />)
+    render(<DashboardPage user={user} onLogout={() => undefined} signingOut={false} initialState={{ status: 'stale', message: 'Данные от 15 октября', data: { adjustments: [], profile: null, overview: overviewFixture() } }} />)
     expect(screen.getByText('Данные от 15 октября')).toBeInTheDocument()
     expect(screen.getByRole('heading', { level: 1, name: 'Новая находка для вас' })).toBeInTheDocument()
     expect(screen.getByText('Пока не нашли новых игр вне вашего списка желаемого')).toBeInTheDocument()
@@ -36,13 +36,14 @@ describe('DashboardPage states', () => {
     render(<DashboardPage user={user} onLogout={() => undefined} signingOut={false} initialState={{
       status: 'ready',
       data: {
+        adjustments: [],
         profile: { id: 'p', version: 1, summary: 'Played activity summary.', summaryStatus: 'ready', summarySource: 'deterministic', confidence: .8, evidenceCount: 2, createdAt: '2026-10-17T00:00:00Z', publishedAt: '2026-10-17T00:00:00Z', updating: false },
         overview: overviewFixture(),
       },
     }} />)
 
     expect(screen.queryByRole('heading', { name: 'Ваша игровая ДНК' })).not.toBeInTheDocument()
-    expect(screen.getByRole('complementary', { name: 'Профиль вкуса' })).toBeInTheDocument()
+    expect(screen.getByRole('complementary', { name: 'Профиль игры' })).toBeInTheDocument()
     expect(screen.getByText('Played activity summary.')).toBeInTheDocument()
     expect(screen.queryByText('AI-описание профиля пока недоступно. Рекомендации продолжают работать по сохранённым данным.')).not.toBeInTheDocument()
   })
@@ -58,7 +59,7 @@ describe('DashboardPage states', () => {
       return new Response(JSON.stringify(response), { status: 200 })
     })
     vi.stubGlobal('fetch', fetch)
-    render(<DashboardPage user={user} onLogout={() => undefined} signingOut={false} initialState={{ status: 'empty', data: { profile: null, overview: overviewFixture() } }} />)
+    render(<DashboardPage user={user} onLogout={() => undefined} signingOut={false} initialState={{ status: 'empty', data: { adjustments: [], profile: null, overview: overviewFixture() } }} />)
 
     expect(screen.getByText('Saved Player')).toBeInTheDocument()
     expect(screen.queryByText(user.steamId.slice(-6))).not.toBeInTheDocument()

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CurrentUser } from '../api/client'
-import { useDashboardData, useSync } from '../api/hooks'
+import { useDashboardData, useEntryRefresh, useSync } from '../api/hooks'
 import type { CalendarResponse, CatalogStatus, DashboardLoadState, RankingDiff, Recommendation, RecommendationOverview, WishlistCollection } from '../api/types'
 import CatalogCoverage, { SourceTimestamp } from '../components/CatalogCoverage'
 import PreferenceProfile from '../components/PreferenceProfile'
+import { ExplicitRecommendationSettings } from '../components/ExplicitRecommendationSettings'
 import RecommendationCard from '../components/RecommendationCard'
 import SteamIdentity from '../components/SteamIdentity'
 import SteamPreflightStatus from '../components/SteamPreflightStatus'
@@ -96,6 +97,7 @@ function DashboardContent({ user, signingOut, onLogout, onDataDeleted = onLogout
   const pendingVerdictTimers = useRef(new Map<string, number>())
   const refresh = useCallback(() => { void reload() }, [reload])
   const { sync, starting, requestError, preflight, preflightError, checking, run } = useSync(user.csrfToken, refresh)
+  const entryRefresh = useEntryRefresh(user, refresh)
   const rankingUpdated = useCallback((diff: RankingDiff) => { setRankingDiff(diff); void reload() }, [reload, setRankingDiff])
   const hasData = state.status === 'ready' || state.status === 'stale' || state.status === 'unknown' || state.status === 'empty'
 	const sourceData = hasData ? state.data : emptyData
@@ -179,7 +181,7 @@ function DashboardContent({ user, signingOut, onLogout, onDataDeleted = onLogout
     <main id="main-content">
       {readOnlyNotice && <p className="demo-global-notice" role="status">{readOnlyNotice}</p>}
       <SteamPreflightStatus checking={checking} preflight={preflight} error={preflightError} onRetry={requestSync} />
-      <SyncProgress value={sync} requestError={requestError} />
+      <SyncProgress value={sync ?? entryRefresh.sync} requestError={requestError} />
       {state.status === 'loading' && <section className="state-card" role="status"><span className="spinner" aria-hidden="true" /><div><strong>Листаем вашу игровую историю</strong><p>Загружаем профиль и календарь…</p></div></section>}
       {state.status === 'error' && <section className="state-card state-card--error" role="alert"><div><strong>Дневник пока не открылся</strong><p>{state.message}</p></div><button type="button" onClick={() => { void reload() }}>Повторить</button></section>}
       {state.status === 'stale' && <section className="stale-banner" role="status"><strong>Показываем сохранённые рекомендации.</strong> {state.message}</section>}
@@ -194,7 +196,14 @@ function DashboardContent({ user, signingOut, onLogout, onDataDeleted = onLogout
           <section className="recommendations-section" aria-labelledby="more-title"><div className="section-heading"><div><div className="eyebrow">Вне вашего желаемого</div><h2 id="more-title">Ещё новые игры</h2></div><span>Всего новых игр: {discoveries.total}</span></div>{discoveryItems.length > 0 && <div className="recommendation-grid">{discoveryItems.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled presentationOrigin={{ surface: 'dashboard', lane: 'discoveries', recommendationId: item.id }} readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(item.gameId)} />)}</div>}</section>
           <section className="recommendations-section wishlist-section" aria-labelledby="wishlist-title"><div className="section-heading"><div><div className="eyebrow">Следим за релизами</div><h2 id="wishlist-title">Уже в вашем желаемом</h2></div><span>Всего в желаемом: {wishlist.total}</span></div><WishlistFreshness wishlist={wishlist} />{wishlistItems.length > 0 ? <div className="recommendation-grid">{wishlistItems.map((item) => <RecommendationCard item={item} key={item.id} feedbackEnabled presentationOrigin={{ surface: 'dashboard', lane: 'wishlist', recommendationId: item.id }} readOnly={readOnly} onVerdictAnimationEnd={() => finishVerdictExit(item.gameId)} />)}</div> : wishlist.status === 'ready' ? <p className="wishlist-empty">В желаемом нет подходящих будущих релизов.</p> : null}</section>
         </div>
-        <div className="right-rail"><PreferenceProfile profile={data.profile} csrfToken={user.csrfToken} onRankingUpdated={rankingUpdated} readOnly={readOnly} /><CatalogCoverage status={catalogStatus} /><UpcomingWindows calendar={calendar} /><TestDigestButton csrfToken={user.csrfToken} readOnly={readOnly} /><DiagnosticsPage csrfToken={user.csrfToken} onDeleted={onDataDeleted} readOnly={readOnly} /></div>
+        <div className="right-rail">
+          {!data.profile && (entryRefresh.status === 'checking' || entryRefresh.status === 'syncing' || (sync && !['succeeded', 'ready', 'dead', 'failed'].includes(sync.status)))
+            ? <aside className="profile-card profile-card--building" aria-label="Профиль игры"><div className="eyebrow">Профиль игры</div><p role="status">Синхронизируем Steam и собираем профиль по вашей игровой активности.</p></aside>
+            : <PreferenceProfile profile={data.profile} />}
+          {data.profile && entryRefresh.status === 'error' && <p className="profile-refresh-error" role="status">Не удалось обновить профиль. Используем предыдущую версию.</p>}
+          <ExplicitRecommendationSettings adjustments={data.adjustments} csrfToken={user.csrfToken} onRankingUpdated={rankingUpdated} readOnly={readOnly} />
+          <CatalogCoverage status={catalogStatus} /><UpcomingWindows calendar={calendar} /><TestDigestButton csrfToken={user.csrfToken} readOnly={readOnly} /><DiagnosticsPage csrfToken={user.csrfToken} onDeleted={onDataDeleted} readOnly={readOnly} />
+        </div>
       </div>}
 
       {hasData && <CalendarPage calendar={calendar} rankingDiff={rankingDiff} feedbackEnabled readOnly={readOnly} />}

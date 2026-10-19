@@ -16,7 +16,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 function show(overview: RecommendationOverview) {
-  render(<DashboardPage user={user} signingOut={false} onLogout={() => undefined} initialState={{ status: 'ready', data: { profile: profileFixture(), overview } }} />)
+  render(<DashboardPage user={user} signingOut={false} onLogout={() => undefined} initialState={{ status: 'ready', data: { adjustments: [], profile: profileFixture(), overview } }} />)
 }
 
 function finishVerdictAnimation(element: HTMLElement) {
@@ -26,11 +26,45 @@ function finishVerdictAnimation(element: HTMLElement) {
 it('shows demo banner and intercepts visible mutation controls', () => {
   const demoUser: CurrentUser = { authenticated: true, accessMode: 'demo', csrfToken: 'csrf', expiresAt: '2026-10-18T00:00:00Z' }
   const fetchMock = vi.mocked(fetch)
-  render(<DashboardPage user={demoUser} signingOut={false} onLogout={() => undefined} initialState={{ status: 'ready', data: { profile: profileFixture(), overview: overviewFixture(1, 0) } }} />)
+  render(<DashboardPage user={demoUser} signingOut={false} onLogout={() => undefined} initialState={{ status: 'ready', data: { adjustments: [], profile: profileFixture(), overview: overviewFixture(1, 0) } }} />)
   expect(screen.getByRole('status', { name: 'Демо-режим' })).toHaveTextContent('реальные данные владельца')
   fireEvent.click(screen.getByRole('button', { name: 'Синхронизировать' }))
   expect(screen.getByText(/только для просмотра/i)).toBeInTheDocument()
   expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST' || init?.method === 'DELETE')).toBe(false)
+})
+
+it('shows first-run profile progress while an initial sync is active', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input) === '/api/sync/current') return new Response(JSON.stringify({ id: 'active', stage: 'steam', status: 'running', progress: 25, stages: [] }))
+    if (String(input) === '/api/sync/active') return new Promise<Response>(() => undefined)
+    if (String(input) === '/api/sync/refresh-if-stale') return new Response(JSON.stringify({ enqueued: false, reason: 'active', jobId: 'active' }))
+    return new Response(null, { status: 204 })
+  }))
+  render(<DashboardPage user={user} signingOut={false} onLogout={() => undefined} initialState={{ status: 'empty', data: { profile: null, adjustments: [], overview: overviewFixture() } }} />)
+  expect(await screen.findByText('Синхронизируем Steam и собираем профиль по вашей игровой активности.')).toBeInTheDocument()
+  expect(screen.queryByText('Синхронизируйте Steam, чтобы собрать персональный профиль.')).not.toBeInTheDocument()
+})
+
+it('keeps explicit settings outside an updating activity profile', () => {
+  const adjustment = { id: 'rule', dimension: 'mode' as const, target: 'co-op', label: 'Кооперативные игры', effect: 'понижаем', active: true, confidence: .9, createdAt: '2026-10-19T00:00:00Z' }
+  render(<DashboardPage user={user} signingOut={false} onLogout={() => undefined} initialState={{ status: 'ready', data: { profile: { ...profileFixture(), updating: true }, adjustments: [adjustment], overview: overviewFixture() } }} />)
+  const profile = screen.getByRole('complementary', { name: 'Профиль игры' })
+  const settings = screen.getByRole('complementary', { name: 'Явные настройки рекомендаций' })
+  expect(within(profile).getByText('Профиль обновляется')).toBeInTheDocument()
+  expect(within(profile).queryByText('Кооперативные игры')).not.toBeInTheDocument()
+  expect(within(settings).getByRole('button', { name: 'Не учитывать: Кооперативные игры' })).toBeEnabled()
+})
+
+it('keeps the published profile visible when automatic entry refresh fails', async () => {
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input) === '/api/sync/current') return new Response(null, { status: 204 })
+    if (String(input) === '/api/sync/refresh-if-stale') return new Response(null, { status: 503 })
+    return new Response(null, { status: 204 })
+  }))
+  render(<DashboardPage user={user} signingOut={false} onLogout={() => undefined} initialState={{ status: 'ready', data: { profile: profileFixture(), adjustments: [], overview: overviewFixture() } }} />)
+  expect(screen.getByText('Played activity summary.')).toBeInTheDocument()
+  expect(await screen.findByText('Не удалось обновить профиль. Используем предыдущую версию.')).toBeInTheDocument()
+  expect(screen.getByText('Played activity summary.')).toBeInTheDocument()
 })
 
 describe('DashboardPage collections', () => {
@@ -212,13 +246,13 @@ describe('DashboardPage collections', () => {
 		const hero = screen.getByRole('region', { name: 'Новая находка для вас' })
 		fireEvent.click(within(hero).getByRole('button', { name: 'Не моё' }))
 		fireEvent.click(within(hero).getByRole('button', { name: 'Сохранить отзыв' }))
-		await waitFor(() => expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1))
+		await waitFor(() => expect(fetch.mock.calls.filter(([input, init]) => init?.method === 'POST' && String(input).includes('/feedback'))).toHaveLength(1))
 		const calendarCard = screen.getAllByRole('article').find((article) => within(article).queryByRole('button', { name: 'Оценить' }) && article.textContent?.includes('Discovery 1'))
 		const calendarLauncher = within(calendarCard!).getByRole('button', { name: 'Оценить' })
 		expect(calendarLauncher).toBeDisabled()
 		fireEvent.click(calendarLauncher)
 		expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-		expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1)
+		expect(fetch.mock.calls.filter(([input, init]) => init?.method === 'POST' && String(input).includes('/feedback'))).toHaveLength(1)
 		acceptDislike(new Response(JSON.stringify({ eventId: 'event', rebuildJobId: 'job', previousRankingVersion: 1 })))
 	})
 
