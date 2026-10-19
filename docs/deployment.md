@@ -58,6 +58,27 @@ The VPS layout is:
 └── incoming/              # mode-protected workflow staging directories
 ```
 
+## Catalog scheduler on the VPS
+
+Catalog scheduling is part of the application binary. The `app` service starts
+HTTP, the interactive worker, the isolated catalog worker, and the cron
+coordinator in one lifecycle. Normal deployment through `docker compose up`
+therefore needs no host crontab and no separate GitHub Actions schedule.
+
+Set `CATALOG_DISCOVERY_ENABLED=1` in the server-only `.env` to enable Steam
+Search ingestion. `CATALOG_REFRESH_CRON` controls the daily Search occurrence,
+`CATALOG_RECONCILIATION_CRON` controls the lower-frequency reconciliation, and
+`CATALOG_REFRESH_TIMEZONE` interprets both five-field expressions. Release
+windows remain UTC-based. The current production Compose file also passes the
+30-day lookback/horizon, independent Store/AI hourly budgets, catalog worker
+concurrency, Search page size, per-feed page cap, and per-run new-AppID cap.
+
+An app restart catches up the latest missed occurrence using durable,
+idempotent rows. It does not replay every missed wall-clock tick, and HTTP
+readiness does not wait for Steam or OpenAI. Keep one application replica for
+this single-user deployment; PostgreSQL still serializes occurrences, budgets,
+and host throttling if a rollout briefly overlaps containers.
+
 ## Check status and logs
 
 These commands do not require sourcing or printing `.env`:

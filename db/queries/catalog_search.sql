@@ -303,6 +303,20 @@ WHERE steam_app_id=sqlc.arg(steam_app_id)
   AND COALESCE(material_observation_ordinal,observation_ordinal)=sqlc.arg(observation_ordinal)::bigint
   AND status='reserved';
 
+-- name: CompleteMetadataIngressQualificationWork :execrows
+UPDATE catalog_metadata_ingress_work SET status='complete',next_eligible_at=NULL,updated_at=sqlc.arg(now_at)
+WHERE steam_app_id=sqlc.arg(steam_app_id)
+  AND material_run_revision=sqlc.arg(run_revision)::bigint
+  AND material_observation_ordinal=sqlc.arg(observation_ordinal)::bigint
+  AND status='reserved';
+
+-- name: FailMetadataIngressQualificationWork :execrows
+UPDATE catalog_metadata_ingress_work SET status='reserved',next_eligible_at=sqlc.arg(next_retry_at),updated_at=sqlc.arg(now_at)
+WHERE steam_app_id=sqlc.arg(steam_app_id)
+  AND material_run_revision=sqlc.arg(run_revision)::bigint
+  AND material_observation_ordinal=sqlc.arg(observation_ordinal)::bigint
+  AND status='reserved';
+
 -- name: FailSearchQualificationWork :execrows
 UPDATE catalog_search_worklist SET status='reserved',next_retry_at=sqlc.arg(next_retry_at)
 WHERE steam_app_id=sqlc.arg(steam_app_id)

@@ -347,7 +347,13 @@ func (r *DiscoveryRepository) persistSearchQualificationFailure(ctx context.Cont
 		if err != nil {
 			return err
 		}
-		if rows < 1 {
+		ingressRows, err := q.FailMetadataIngressQualificationWork(ctx, dbgen.FailMetadataIngressQualificationWorkParams{
+			NextRetryAt: timestamptz(due), NowAt: timestamptz(now), SteamAppID: payload.AppID,
+			RunRevision: payload.CandidateRevision.RunRevision, ObservationOrdinal: payload.CandidateRevision.ObservationOrdinal})
+		if err != nil {
+			return err
+		}
+		if rows+ingressRows < 1 {
 			return errors.New("search qualification work retry fence lost")
 		}
 		nextPayload := payload
@@ -534,7 +540,13 @@ func (r *DiscoveryRepository) persistSearchQualification(ctx context.Context, le
 	if err != nil {
 		return err
 	}
-	if rows < 1 {
+	ingressRows, err := q.CompleteMetadataIngressQualificationWork(ctx, dbgen.CompleteMetadataIngressQualificationWorkParams{
+		NowAt: timestamptz(now), SteamAppID: payload.AppID, RunRevision: payload.CandidateRevision.RunRevision,
+		ObservationOrdinal: payload.CandidateRevision.ObservationOrdinal})
+	if err != nil {
+		return err
+	}
+	if rows+ingressRows < 1 {
 		return errors.New("search qualification completion work fence lost")
 	}
 	return commitDiscoveryLease(ctx, tx, lease)

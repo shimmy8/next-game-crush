@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/observability"
 	"next-game-crush/internal/steam"
@@ -161,13 +162,51 @@ func (s *DiscoveryService) EnsureScheduled(ctx context.Context) error {
 		return nil
 	}
 	slot := discoveryTickSlot(s.now(), s.cfg.IntervalHours)
-	if _, err := s.queue.Enqueue(ctx, tickSpec(slot)); err != nil {
-		return err
-	}
-	_, err := s.queue.Enqueue(ctx, tickSpec(slot.Add(time.Duration(s.cfg.IntervalHours)*time.Hour)))
+	_, err := s.enqueueLegacy(ctx, tickSpec(slot), tickSpec(slot.Add(time.Duration(s.cfg.IntervalHours)*time.Hour)))
 	return err
 }
 func (s *DiscoveryService) Nudge(ctx context.Context) error { return s.EnsureScheduled(ctx) }
+
+func (s *DiscoveryService) enqueueLegacy(ctx context.Context, specs ...jobs.Spec) (bool, error) {
+	tx, err := s.repo.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	allowed, err := s.repo.LegacyEnqueueAllowedForUpdate(ctx, tx)
+	if err != nil || !allowed {
+		if err != nil {
+			return false, err
+		}
+		return false, tx.Commit(ctx)
+	}
+	q := s.repo.store.Queries.WithTx(tx)
+	for _, spec := range specs {
+		if _, err := jobs.EnqueueInTx(ctx, q, spec); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit(ctx)
+}
+
+func (s *DiscoveryService) deferLegacy(ctx context.Context, lease jobs.Lease, at time.Time) error {
+	tx, err := s.repo.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	allowed, err := s.repo.LegacyEnqueueAllowedForUpdate(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return legacySupersededError{}
+	}
+	if err := s.queue.DeferUntilInTx(ctx, tx, lease, at); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 func (s *DiscoveryService) DiscoveryStatus(ctx context.Context) (PresentationStatus, error) {
 	return s.repo.PresentationStatus(ctx, s.cfg.Enabled, s.now().UTC(), time.Duration(s.cfg.IntervalHours)*time.Hour)
 }
@@ -185,8 +224,12 @@ func (s *DiscoveryService) handleTick(ctx context.Context, lease jobs.Lease) err
 	}
 	now := s.now().UTC()
 	next := discoveryTickSlot(now, s.cfg.IntervalHours).Add(time.Duration(s.cfg.IntervalHours) * time.Hour)
-	if _, err := s.queue.Enqueue(ctx, tickSpec(next)); err != nil {
+	allowed, err := s.enqueueLegacy(ctx, tickSpec(next))
+	if err != nil {
 		return err
+	}
+	if !allowed {
+		return nil
 	}
 	if err := s.repo.reconcileDeadRetries(ctx, now); err != nil {
 		return err

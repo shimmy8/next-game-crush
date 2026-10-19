@@ -437,7 +437,19 @@ func (s *DiscoveryService) handleRebuildWakeup(ctx context.Context, lease jobs.L
 	if strictDiscoveryPayload(lease.Payload, &payload) != nil || payload.Version != 1 || payload.UserID == uuid.Nil || payload.Revision < 1 || lease.UserID != payload.UserID {
 		return errors.New("unsupported catalog rebuild wakeup payload schema")
 	}
-	return s.ScheduleRebuilds(ctx)
+	// Task 12 owns all new rebuild publication. The retained v1 handler only
+	// drains an already-claimed row: it serializes with cutover, then succeeds
+	// without enqueueing or deferring anything. Dirty state remains for the
+	// Search scheduler, including after a crash before queue completion.
+	tx, err := s.repo.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := s.repo.LegacyEnqueueAllowedForUpdate(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // CatalogRebuildFinished is called by the recommendation handler only after a

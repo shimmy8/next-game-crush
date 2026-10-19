@@ -67,15 +67,19 @@ type SteamIdentity struct {
 }
 
 type Service struct {
-	store                *store.Store
-	queue                *jobs.Queue
-	client               steam.Client
-	catalog              *catalog.Service
-	now                  func() time.Time
-	aiJobs               AIJobPlanner
-	rankingJobs          bool
-	logger               *observability.Logger
-	discovery            interface{ Nudge(context.Context) error }
+	store         *store.Store
+	queue         *jobs.Queue
+	client        steam.Client
+	catalog       *catalog.Service
+	now           func() time.Time
+	aiJobs        AIJobPlanner
+	rankingJobs   bool
+	logger        *observability.Logger
+	discovery     interface{ Nudge(context.Context) error }
+	searchRefresh interface {
+		EnqueueUserSyncCandidates(context.Context, *jobs.Queue, catalog.DiscoveryConfig, string, []catalog.RefreshTarget, time.Time) (int, error)
+	}
+	searchConfig         catalog.DiscoveryConfig
 	achievementSnapshots AchievementSnapshotRecorder
 }
 
@@ -100,6 +104,11 @@ func (s *Service) SetAchievementSnapshotRecorder(recorder AchievementSnapshotRec
 func (s *Service) EnableRankingJobs() { s.rankingJobs = true }
 func (s *Service) SetDiscoveryNudger(nudger interface{ Nudge(context.Context) error }) {
 	s.discovery = nudger
+}
+func (s *Service) SetSearchCandidateRefresher(refresher interface {
+	EnqueueUserSyncCandidates(context.Context, *jobs.Queue, catalog.DiscoveryConfig, string, []catalog.RefreshTarget, time.Time) (int, error)
+}, cfg catalog.DiscoveryConfig) {
+	s.searchRefresh, s.searchConfig = refresher, cfg
 }
 
 func NewService(database *store.Store, queue *jobs.Queue, client steam.Client, catalogService *catalog.Service, options ...ServiceOption) (*Service, error) {
@@ -387,6 +396,10 @@ func (s *Service) handleCatalogRefresh(ctx context.Context, lease jobs.Lease) er
 	}
 	targets, err := s.catalog.RefreshTargets(ctx)
 	if err != nil {
+		return err
+	}
+	if s.searchRefresh != nil {
+		_, err := s.searchRefresh.EnqueueUserSyncCandidates(ctx, s.queue, s.searchConfig, lease.IdempotencyKey, targets, s.now().UTC())
 		return err
 	}
 	specs := make([]jobs.Spec, 0, len(targets))

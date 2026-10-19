@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
 	dbgen "next-game-crush/internal/store/sqlc"
@@ -100,6 +101,35 @@ func TestCandidateReservationDeduplicatesEveryIngress(t *testing.T) {
 	}
 	if err := db.Pool.QueryRow(ctx, `SELECT used FROM catalog_budget_reservations WHERE kind='appdetails'`).Scan(&used); err != nil || used != 1 {
 		t.Fatalf("unexpected budget used=%d err=%v", used, err)
+	}
+}
+
+func TestUserSyncRefreshUsesDurableSearchQualification(t *testing.T) {
+	db := openCatalogTestStore(t)
+	repo := NewSearchRepository(db)
+	queue := jobs.NewQueue(db)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	_, rev := insertMetadataRun(t, db, "daily", "scheduled", now.Add(-time.Hour), 621, "user-sync", "complete", nil)
+	insertReservationCandidate(t, repo, 621, rev, "user-sync", now.Add(-time.Minute))
+	cfg := DefaultDiscoveryConfig()
+	count, err := repo.EnqueueUserSyncCandidates(ctx, queue, cfg, "sync:durable", []RefreshTarget{{AppID: 621, Priority: 100}}, now)
+	if err != nil || count != 1 {
+		t.Fatalf("enqueued=%d err=%v", count, err)
+	}
+	var kind, lane, status string
+	if err := db.Pool.QueryRow(ctx, `SELECT kind,lane,status FROM sync_jobs WHERE kind=$1`, SearchQualificationJobKind).Scan(&kind, &lane, &status); err != nil {
+		t.Fatal(err)
+	}
+	if kind != SearchQualificationJobKind || lane != string(jobs.LaneCatalog) || status != "queued" {
+		t.Fatalf("job kind=%q lane=%q status=%q", kind, lane, status)
+	}
+	var ingressStatus string
+	if err := db.Pool.QueryRow(ctx, `SELECT status FROM catalog_metadata_ingress_work WHERE steam_app_id=621 AND ingress_kind='user_sync'`).Scan(&ingressStatus); err != nil {
+		t.Fatal(err)
+	}
+	if ingressStatus != "reserved" {
+		t.Fatalf("ingress status=%q", ingressStatus)
 	}
 }
 

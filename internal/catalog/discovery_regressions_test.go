@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -220,5 +221,263 @@ func TestDiscoveryIntervalNudgeKeepsSingleFutureChain(t *testing.T) {
 				t.Fatalf("interval %d: adjacent-hour concurrent restart nudges left %d future and %d pending ticks", interval, future, total)
 			}
 		})
+	}
+}
+
+func TestLegacyCutoverSweepsQueuedWorkAndFencesRunningRetry(t *testing.T) {
+	db := openCatalogTestStore(t)
+	repo := NewDiscoveryRepository(db)
+	queue := jobs.NewQueue(db)
+	ctx := context.Background()
+
+	runningID, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: TickJobKind, IdempotencyKey: "cutover:running", MaxAttempts: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := queue.Claim(ctx, jobs.LaneInteractive, "cutover-worker", time.Minute)
+	if err != nil || lease == nil || lease.ID != runningID {
+		t.Fatalf("claim=%+v err=%v", lease, err)
+	}
+	for index, status := range []string{"queued", "waiting", "retryable"} {
+		id, enqueueErr := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: QualifyJobKind,
+			IdempotencyKey: fmt.Sprintf("cutover:%s", status), MaxAttempts: 3})
+		if enqueueErr != nil {
+			t.Fatal(enqueueErr)
+		}
+		if index > 0 {
+			if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET status=$2 WHERE id=$1`, id, status); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	result, err := repo.CutOverLegacyDiscovery(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Cancelled != 3 || result.RunningFenced != 1 {
+		t.Fatalf("cutover=%+v", result)
+	}
+	outcome, err := queue.Fail(ctx, *lease, errors.New("post-cutover failure"), time.Now().UTC())
+	if err != nil || outcome != jobs.FailureDead {
+		t.Fatalf("failure outcome=%q err=%v", outcome, err)
+	}
+	if count, err := repo.CountNonterminalLegacyJobs(ctx); err != nil || count != 0 {
+		t.Fatalf("nonterminal=%d err=%v", count, err)
+	}
+
+	// Idempotent calls still sweep a legacy row written out of band, without
+	// changing the original cutover timestamp.
+	var firstCutover time.Time
+	if err := db.Pool.QueryRow(ctx, `SELECT legacy_cutover_at FROM catalog_workflow_state WHERE singleton`).Scan(&firstCutover); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: BackfillJobKind, IdempotencyKey: "cutover:late"}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := repo.CutOverLegacyDiscovery(ctx)
+	if err != nil || second.Cancelled != 1 || second.RunningFenced != 0 {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	var secondCutover time.Time
+	if err := db.Pool.QueryRow(ctx, `SELECT legacy_cutover_at FROM catalog_workflow_state WHERE singleton`).Scan(&secondCutover); err != nil {
+		t.Fatal(err)
+	}
+	if !secondCutover.Equal(firstCutover) {
+		t.Fatalf("cutover timestamp changed: %s -> %s", firstCutover, secondCutover)
+	}
+}
+
+func TestLegacyEnqueueRaceWithCutoverLeavesNoSurvivingWork(t *testing.T) {
+	db := openCatalogTestStore(t)
+	repo := NewDiscoveryRepository(db)
+	service := &DiscoveryService{repo: repo, queue: jobs.NewQueue(db)}
+	ctx := context.Background()
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() {
+		<-start
+		_, err := service.enqueueLegacy(ctx, tickSpec(time.Now().UTC().Truncate(time.Hour)))
+		errs <- err
+	}()
+	go func() {
+		<-start
+		_, err := repo.CutOverLegacyDiscovery(ctx)
+		errs <- err
+	}()
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if count, err := repo.CountNonterminalLegacyJobs(ctx); err != nil || count != 0 {
+		t.Fatalf("race left nonterminal=%d err=%v", count, err)
+	}
+}
+
+func TestLegacyCutoverStopsClaimedTickAndScanSuccessors(t *testing.T) {
+	s, _ := discoveryFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	s.source = &discoverySourceStub{pages: []DiscoveryPage{{
+		Apps:      []DiscoveredApp{{AppID: 42, LastModified: now}},
+		NextAppID: 42,
+	}}}
+
+	tickID, err := s.queue.Enqueue(ctx, tickSpec(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick := leaseDiscoveryID(t, s, tickID)
+	scan, _ := scanLease(t, s, DiscoveryBackfill, now, 0)
+
+	seeded := make([]uuid.UUID, 0, 3)
+	for _, status := range []string{"queued", "waiting", "retryable"} {
+		id, enqueueErr := s.queue.Enqueue(ctx, jobs.Spec{
+			Lane: jobs.LaneInteractive, Kind: QualifyJobKind,
+			IdempotencyKey: "claimed-cutover:" + status, MaxAttempts: 3,
+		})
+		if enqueueErr != nil {
+			t.Fatal(enqueueErr)
+		}
+		if status != "queued" {
+			if _, err = s.repo.store.Pool.Exec(ctx, `UPDATE sync_jobs SET status=$2 WHERE id=$1`, id, status); err != nil {
+				t.Fatal(err)
+			}
+		}
+		seeded = append(seeded, id)
+	}
+
+	cutover, err := s.repo.CutOverLegacyDiscovery(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cutover.Cancelled != 3 || cutover.RunningFenced != 2 {
+		t.Fatalf("cutover=%+v", cutover)
+	}
+	if err = s.handleTick(ctx, tick); err != nil {
+		t.Fatalf("claimed tick completion: %v", err)
+	}
+	if err = s.queue.Complete(ctx, tick); err != nil {
+		t.Fatal(err)
+	}
+	scanErr := s.handleScan(ctx, scan)
+	var superseded legacySupersededError
+	if !errors.As(scanErr, &superseded) {
+		t.Fatalf("claimed scan error=%v, want superseded", scanErr)
+	}
+	outcome, err := s.queue.Fail(ctx, scan, scanErr, now)
+	if err != nil || outcome != jobs.FailureDead {
+		t.Fatalf("claimed scan outcome=%q err=%v", outcome, err)
+	}
+
+	var cancelled, tickSucceeded, scanDead, successorTicks, childQualifications, deferred, legacyLive int
+	if err = s.repo.store.Pool.QueryRow(ctx, `SELECT
+		count(*) FILTER(WHERE id=ANY($1::uuid[]) AND status='dead' AND last_error='superseded_catalog_workflow'),
+		count(*) FILTER(WHERE id=$3 AND status='succeeded'),
+		count(*) FILTER(WHERE id=$4 AND status='dead' AND last_error='superseded_catalog_workflow'),
+		count(*) FILTER(WHERE kind=$2 AND id<>$3),
+		count(*) FILTER(WHERE parent_job_id=$4),
+		count(*) FILTER(WHERE id IN ($3,$4) AND status IN ('waiting','retryable','queued')),
+		count(*) FILTER(WHERE kind=ANY($5::text[]) AND status NOT IN ('succeeded','dead'))
+		FROM sync_jobs`, seeded, TickJobKind, tick.ID, scan.ID,
+		[]string{TickJobKind, IncrementalJobKind, BackfillJobKind, QualifyJobKind, RebuildWakeJobKind}).
+		Scan(&cancelled, &tickSucceeded, &scanDead, &successorTicks, &childQualifications, &deferred, &legacyLive); err != nil {
+		t.Fatal(err)
+	}
+	if cancelled != 3 || tickSucceeded != 1 || scanDead != 1 || successorTicks != 0 || childQualifications != 0 || deferred != 0 || legacyLive != 0 {
+		t.Fatalf("cancelled=%d tick_succeeded=%d scan_dead=%d successor_ticks=%d children=%d deferred=%d live=%d", cancelled, tickSucceeded, scanDead, successorTicks, childQualifications, deferred, legacyLive)
+	}
+	if count, err := s.repo.CountNonterminalLegacyJobs(ctx); err != nil || count != 0 {
+		t.Fatalf("nonterminal=%d err=%v", count, err)
+	}
+}
+
+func TestLegacyCutoverMakesClaimedRebuildWakeupANoop(t *testing.T) {
+	s, _ := discoveryFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now.Add(catalogRebuildDebounce) }
+	userID := uuid.New()
+	if _, err := s.repo.store.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.repo.store.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, uuid.New(), userID); err != nil {
+		t.Fatal(err)
+	}
+	markCatalogDirty(t, s, now)
+	payload, _ := json.Marshal(rebuildWakePayload{Version: 1, UserID: userID, Revision: 1})
+	wakeID, err := s.queue.Enqueue(ctx, jobs.Spec{
+		Lane: jobs.LaneInteractive, Kind: RebuildWakeJobKind, UserID: userID,
+		IdempotencyKey: "legacy-rebuild-wakeup:claimed", Payload: payload, MaxAttempts: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wake := leaseDiscoveryID(t, s, wakeID)
+	if _, err = s.repo.CutOverLegacyDiscovery(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.handleRebuildWakeup(ctx, wake); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.queue.Complete(ctx, wake); err != nil {
+		t.Fatal(err)
+	}
+	var rebuilds int
+	if err = s.repo.store.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind='recommendations.rebuild'`).Scan(&rebuilds); err != nil {
+		t.Fatal(err)
+	}
+	if rebuilds != 0 {
+		t.Fatalf("claimed legacy wakeup published %d recommendation rebuilds after cutover", rebuilds)
+	}
+}
+
+func TestLegacyRebuildWakeupCrashReplayNeverPublishesRecommendationWork(t *testing.T) {
+	s, _ := discoveryFixture(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now.Add(catalogRebuildDebounce) }
+	userID := uuid.New()
+	if _, err := s.repo.store.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.repo.store.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, uuid.New(), userID); err != nil {
+		t.Fatal(err)
+	}
+	markCatalogDirty(t, s, now)
+	payload, _ := json.Marshal(rebuildWakePayload{Version: 1, UserID: userID, Revision: 1})
+	wakeID, err := s.queue.Enqueue(ctx, jobs.Spec{
+		Lane: jobs.LaneInteractive, Kind: RebuildWakeJobKind, UserID: userID,
+		IdempotencyKey: "legacy-rebuild-wakeup:crash-replay", Payload: payload, MaxAttempts: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wake := leaseDiscoveryID(t, s, wakeID)
+	// The first handler return is the crash boundary: queue completion never
+	// happens, so the same fenced lease is replayed. Neither pass may publish.
+	for range 2 {
+		if err = s.handleRebuildWakeup(ctx, wake); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rebuilds int
+	var dirtyRevision, completedRevision int64
+	var pending bool
+	if err = s.repo.store.Pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM sync_jobs WHERE kind='recommendations.rebuild'),
+		dirty_revision,last_completed_revision,pending_job_id IS NOT NULL
+		FROM catalog_rebuild_state WHERE user_id=$1`, userID).
+		Scan(&rebuilds, &dirtyRevision, &completedRevision, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if rebuilds != 0 || dirtyRevision != 1 || completedRevision != 0 || pending {
+		t.Fatalf("rebuilds=%d dirty=%d completed=%d pending=%v", rebuilds, dirtyRevision, completedRevision, pending)
+	}
+	if err = s.queue.Complete(ctx, wake); err != nil {
+		t.Fatal(err)
 	}
 }

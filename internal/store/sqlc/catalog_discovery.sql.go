@@ -51,6 +51,47 @@ func (q *Queries) CountDiscoveryProvenance(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const countNonterminalLegacyDiscovery = `-- name: CountNonterminalLegacyDiscovery :one
+SELECT count(*) FROM sync_jobs
+WHERE kind IN ('catalog.discovery.tick','catalog.discover.incremental','catalog.discover.backfill','catalog.qualify','catalog.rebuild_wakeup')
+  AND status IN ('queued','running','waiting','retryable')
+`
+
+func (q *Queries) CountNonterminalLegacyDiscovery(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countNonterminalLegacyDiscovery)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const deadLetterQueuedLegacyDiscovery = `-- name: DeadLetterQueuedLegacyDiscovery :many
+UPDATE sync_jobs SET status='dead',worker_id=NULL,fencing_token=NULL,lease_until=NULL,
+    last_error='superseded_catalog_workflow',updated_at=now()
+WHERE kind IN ('catalog.discovery.tick','catalog.discover.incremental','catalog.discover.backfill','catalog.qualify','catalog.rebuild_wakeup')
+  AND status IN ('queued','waiting','retryable')
+RETURNING id
+`
+
+func (q *Queries) DeadLetterQueuedLegacyDiscovery(ctx context.Context) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, deadLetterQueuedLegacyDiscovery)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const ensureDiscoveryBudget = `-- name: EnsureDiscoveryBudget :exec
 INSERT INTO catalog_discovery_budget(hour_at) VALUES($1) ON CONFLICT DO NOTHING
 `
@@ -58,6 +99,33 @@ INSERT INTO catalog_discovery_budget(hour_at) VALUES($1) ON CONFLICT DO NOTHING
 func (q *Queries) EnsureDiscoveryBudget(ctx context.Context, hourAt pgtype.Timestamptz) error {
 	_, err := q.db.Exec(ctx, ensureDiscoveryBudget, hourAt)
 	return err
+}
+
+const fenceRunningLegacyDiscovery = `-- name: FenceRunningLegacyDiscovery :many
+UPDATE sync_jobs SET max_attempts=attempts,updated_at=now()
+WHERE kind IN ('catalog.discovery.tick','catalog.discover.incremental','catalog.discover.backfill','catalog.qualify','catalog.rebuild_wakeup')
+  AND status='running'
+RETURNING id
+`
+
+func (q *Queries) FenceRunningLegacyDiscovery(ctx context.Context) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, fenceRunningLegacyDiscovery)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getCatalogDiscoveryState = `-- name: GetCatalogDiscoveryState :one

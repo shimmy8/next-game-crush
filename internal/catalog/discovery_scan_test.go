@@ -28,8 +28,10 @@ func scanLease(t *testing.T, s *DiscoveryService, mode DiscoveryMode, now time.T
 }
 func leaseDiscoveryID(t *testing.T, s *DiscoveryService, id uuid.UUID) jobs.Lease {
 	t.Helper()
-	l := jobs.Lease{Lane: jobs.LaneInteractive, ID: id, WorkerID: uuid.NewString(), FencingToken: uuid.New(), Attempts: 1, MaxAttempts: 3}
-	err := s.repo.store.Pool.QueryRow(context.Background(), `UPDATE sync_jobs SET status='running',worker_id=$2,fencing_token=$3,lease_until=now()+interval '1 minute',attempts=GREATEST(attempts,1) WHERE id=$1 RETURNING kind,payload,idempotency_key,attempts`, id, l.WorkerID, l.FencingToken).Scan(&l.Kind, &l.Payload, &l.IdempotencyKey, &l.Attempts)
+	l := jobs.Lease{ID: id, WorkerID: uuid.NewString(), FencingToken: uuid.New()}
+	err := s.repo.store.Pool.QueryRow(context.Background(), `UPDATE sync_jobs SET status='running',worker_id=$2,fencing_token=$3,lease_until=now()+interval '1 minute',attempts=GREATEST(attempts,1) WHERE id=$1
+		RETURNING lane,kind,payload,idempotency_key,attempts,max_attempts,priority,COALESCE(user_id,'00000000-0000-0000-0000-000000000000'::uuid),result`,
+		id, l.WorkerID, l.FencingToken).Scan(&l.Lane, &l.Kind, &l.Payload, &l.IdempotencyKey, &l.Attempts, &l.MaxAttempts, &l.Priority, &l.UserID, &l.Result)
 	if err != nil {
 		t.Fatal(err)
 	}

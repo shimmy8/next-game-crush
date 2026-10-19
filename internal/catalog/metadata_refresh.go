@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"next-game-crush/internal/jobs"
 	dbgen "next-game-crush/internal/store/sqlc"
 )
 
@@ -28,6 +29,78 @@ type MetadataWorkItem struct {
 	Reservation    MetadataReservation
 	BudgetGranted  bool
 	NextEligibleAt time.Time
+}
+
+// EnqueueUserSyncCandidates routes known Search candidates through the same
+// AppDetails reservation and qualification protocol as scheduled discovery.
+// Apps not observed by Search yet are left for the next Search occurrence.
+func (r *SearchRepository) EnqueueUserSyncCandidates(ctx context.Context, queue *jobs.Queue, cfg DiscoveryConfig, identity string, targets []RefreshTarget, now time.Time) (int, error) {
+	if r == nil || r.store == nil || queue == nil || cfg.Validate() != nil || strings.TrimSpace(identity) == "" || now.IsZero() {
+		return 0, errors.New("invalid user sync catalog ingress")
+	}
+	count := 0
+	for _, target := range targets {
+		var runRevision, ordinal int64
+		var fingerprint string
+		err := r.store.Pool.QueryRow(ctx, `SELECT material_run_revision,material_observation_ordinal,material_fingerprint
+			FROM catalog_metadata_heads WHERE steam_app_id=$1`, target.AppID).Scan(&runRevision, &ordinal, &fingerprint)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return count, err
+		}
+		item, err := r.ReserveIngressMetadata(ctx, MetadataIngress{Kind: "user_sync", Identity: identity}, target.AppID,
+			CandidateRevision{RunRevision: runRevision, ObservationOrdinal: ordinal}, fingerprint, cfg.AppDetailsHourlyBudget, now.UTC())
+		if err != nil {
+			return count, err
+		}
+		if !item.BudgetGranted || !item.Reservation.Granted {
+			continue
+		}
+		payload := SearchQualificationPayload{Version: SearchQualificationPayloadVersion, AppID: target.AppID,
+			CandidateRevision: item.Reservation.Revision, ReservationID: item.Reservation.ID,
+			ReservationToken: item.Reservation.FencingToken, Priority: max(1, min(100, target.Priority))}
+		spec, err := NewSearchQualificationSpec(payload, uuid.Nil)
+		if err != nil {
+			return count, err
+		}
+		if _, err := queue.Enqueue(ctx, spec); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func (r *SearchRepository) EnqueueReadyIngressQualifications(ctx context.Context, queue *jobs.Queue, cfg DiscoveryConfig, now time.Time) (int, error) {
+	if r == nil || queue == nil || cfg.Validate() != nil || now.IsZero() {
+		return 0, errors.New("invalid metadata ingress producer")
+	}
+	count := 0
+	for {
+		item, err := r.ClaimIngressMetadataWork(ctx, cfg.AppDetailsHourlyBudget, now.UTC())
+		if errors.Is(err, ErrNoMetadataWork) {
+			return count, nil
+		}
+		if err != nil {
+			return count, err
+		}
+		if !item.BudgetGranted || !item.Reservation.Granted {
+			continue
+		}
+		payload := SearchQualificationPayload{Version: SearchQualificationPayloadVersion, AppID: item.Reservation.AppID,
+			CandidateRevision: item.Reservation.Revision, ReservationID: item.Reservation.ID,
+			ReservationToken: item.Reservation.FencingToken, Priority: max(1, min(100, item.Priority))}
+		spec, err := NewSearchQualificationSpec(payload, uuid.Nil)
+		if err != nil {
+			return count, err
+		}
+		if _, err := queue.Enqueue(ctx, spec); err != nil {
+			return count, err
+		}
+		count++
+	}
 }
 
 // MetadataRefreshTTL returns the default appdetails freshness interval. Search

@@ -66,6 +66,9 @@ func (s *SearchScheduler) EnsureScheduled(ctx context.Context) error {
 	if !s.cfg.Enabled {
 		return nil
 	}
+	if _, err := s.repo.EnqueueReadyIngressQualifications(ctx, s.queue, s.cfg, now); err != nil {
+		return err
+	}
 	daily, err := latestOccurrence(s.daily, now)
 	if err != nil {
 		return err
@@ -106,6 +109,51 @@ func (s *SearchScheduler) EnsureScheduled(ctx context.Context) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// Nudge is the user-sync seam. It only publishes durable scheduled work and
+// never performs Steam I/O on the interactive worker.
+func (s *SearchScheduler) Nudge(ctx context.Context) error { return s.EnsureScheduled(ctx) }
+
+// Run owns only schedule timing. Work execution remains isolated in the
+// catalog worker, and disabled discovery stays idle until shutdown.
+func (s *SearchScheduler) Run(ctx context.Context) error {
+	if s == nil {
+		return errors.New("search scheduler is required")
+	}
+	if !s.cfg.Enabled {
+		<-ctx.Done()
+		return nil
+	}
+	if err := s.EnsureScheduled(ctx); err != nil {
+		return err
+	}
+	for {
+		now := s.now().UTC()
+		next := s.daily.Next(now)
+		if candidate := s.reconciliation.Next(now); candidate.Before(next) {
+			next = candidate
+		}
+		delay := next.Sub(now)
+		if delay < 0 {
+			delay = 0
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil
+		case <-timer.C:
+			if err := s.EnsureScheduled(ctx); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (s *SearchScheduler) enqueueOccurrence(ctx context.Context, at time.Time, schedule string, kind RunKind) (RunRef, error) {

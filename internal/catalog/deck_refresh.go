@@ -71,6 +71,6 @@ func (s *Service) handleDeckRefresh(ctx context.Context, lease jobs.Lease) error
 	if uuid.UUID(game.ID.Bytes) != payload.Target.GameID {
 		return errors.New("Deck refresh game identity mismatch")
 	}
-	observation := fetchDeckCompatibility(ctx, s.client, payload.Target.SteamAppID)
+	observation := fetchDeckCompatibility(ctx, s.deckClient, payload.Target.SteamAppID)
 	return recordDeckCompatibility(ctx, s.store.Queries, game.ID, observation, s.now().UTC())
 }

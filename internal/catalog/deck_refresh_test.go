@@ -69,6 +69,33 @@ func TestCatalogRefreshDoesNotFetchDeckCompatibility(t *testing.T) {
 	}
 }
 
+func TestDeckRefreshUsesIsolatedCatalogClient(t *testing.T) {
+	db := openCatalogTestStore(t)
+	interactive := &discoveryMetadata{details: modeDetails(), deckStatus: steam.DeckUnsupported, deckAvailability: steam.Available}
+	catalogClient := &discoveryMetadata{details: modeDetails(), deckStatus: steam.DeckVerified, deckAvailability: steam.Available}
+	game := modeGame(t, db, interactive.details, "test", time.Now())
+	service, err := NewService(db, interactive, Seed{Version: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetDeckRefreshClient(catalogClient)
+	payload, _ := json.Marshal(DeckRefreshPayload{Version: 1, Target: DeckRefreshTarget{
+		GameID: uuid.UUID(game.ID.Bytes), SteamAppID: game.SteamAppID, RankingVersion: 1,
+	}})
+	if err = service.handleDeckRefresh(context.Background(), jobs.Lease{Lane: jobs.LaneCatalog, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if interactive.deckCalls != 0 || catalogClient.deckCalls != 1 {
+		t.Fatalf("Deck calls interactive=%d catalog=%d", interactive.deckCalls, catalogClient.deckCalls)
+	}
+	if err = service.RefreshGame(context.Background(), game.SteamAppID); err != nil {
+		t.Fatal(err)
+	}
+	if interactive.calls != 1 || catalogClient.calls != 0 {
+		t.Fatalf("metadata calls interactive=%d catalog=%d", interactive.calls, catalogClient.calls)
+	}
+}
+
 func TestDeckRefreshFailurePreservesLastSuccess(t *testing.T) {
 	for _, test := range []struct {
 		name         string

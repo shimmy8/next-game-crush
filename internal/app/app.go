@@ -31,9 +31,16 @@ import (
 )
 
 type App struct {
-	server *http.Server
-	store  *store.Store
-	worker *jobs.Worker
+	server            *http.Server
+	store             *store.Store
+	queue             *jobs.Queue
+	searchRepo        *catalog.SearchRepository
+	searchScan        *catalog.SearchScanService
+	aiService         *ai.Service
+	interactiveWorker interface{ Run(context.Context) error }
+	catalogWorker     interface{ Run(context.Context) error }
+	scheduler         interface{ Run(context.Context) error }
+	serve             func() error
 }
 
 func New(cfg config.Config) (*App, error) {
@@ -70,10 +77,22 @@ func New(cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	queue := jobs.NewQueue(db)
-	steamClient, err := steam.NewClient(steam.HTTPConfig{APIKey: cfg.SteamWebAPIKey, WebAPIBaseURL: cfg.SteamWebAPIBaseURL, StoreBaseURL: cfg.SteamStoreBaseURL, StoreServiceBaseURL: cfg.SteamStoreServiceBaseURL})
+	steamConfig := steam.HTTPConfig{APIKey: cfg.SteamWebAPIKey, WebAPIBaseURL: cfg.SteamWebAPIBaseURL, StoreBaseURL: cfg.SteamStoreBaseURL, StoreServiceBaseURL: cfg.SteamStoreServiceBaseURL}
+	steamClient, err := steam.NewClient(steamConfig)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure Steam client: %w", err)
+	}
+	hostThrottle, err := catalog.NewPersistentHostThrottle(db, cfg.CatalogDiscovery.WorkerConcurrency)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure catalog throttle: %w", err)
+	}
+	steamConfig.HostThrottle = hostThrottle
+	catalogSteamClient, err := steam.NewClient(steamConfig)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure catalog Steam client: %w", err)
 	}
 	seed, err := catalog.LoadSeed("catalog_seed.json")
 	if err != nil {
@@ -85,6 +104,7 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	catalogService.SetDeckRefreshClient(catalogSteamClient)
 	if err := catalogService.Bootstrap(setupCtx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("bootstrap catalog: %w", err)
@@ -98,8 +118,10 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
-	worker := jobs.NewWorker(queue, jobs.LaneInteractive, workerID, jobs.WithLogger(eventLogger), jobs.WithConcurrency(cfg.WorkerConcurrency))
-	if err := syncService.RegisterHandlers(worker); err != nil {
+	interactiveWorker := jobs.NewWorker(queue, jobs.LaneInteractive, workerID+":interactive", jobs.WithLogger(eventLogger), jobs.WithConcurrency(cfg.WorkerConcurrency))
+	catalogWorker := jobs.NewWorker(queue, jobs.LaneCatalog, workerID+":catalog", jobs.WithLogger(eventLogger),
+		jobs.WithConcurrency(cfg.CatalogDiscovery.WorkerConcurrency), jobs.WithRetrySchedule(time.Minute, 5*time.Minute, 30*time.Minute), jobs.WithRetryAfterCap(24*time.Hour))
+	if err := syncService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register synchronization handlers: %w", err)
 	}
@@ -124,7 +146,7 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("configure completion service: %w", err)
 	}
 	completionService.SetClassificationPublishedHook(completionService.EnqueueProjectionJobsForGame)
-	if err := completionService.RegisterHandlers(worker); err != nil {
+	if err := completionService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register completion handlers: %w", err)
 	}
@@ -135,27 +157,71 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("configure AI jobs: %w", err)
 	}
 	aiService.SetQueue(queue)
-	if err := aiService.RegisterHandlers(worker); err != nil {
+	if err := aiService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register AI handlers: %w", err)
 	}
 	syncService.SetAIJobPlanner(aiService)
-	discoveryService, err := catalog.NewDiscoveryService(catalog.NewDiscoveryRepository(db), steamClient, steamClient, queue, cfg.CatalogDiscovery, eventLogger)
+	discoveryRepo := catalog.NewDiscoveryRepository(db)
+	discoveryService, err := catalog.NewDiscoveryService(discoveryRepo, catalogSteamClient, catalogSteamClient, queue, cfg.CatalogDiscovery, eventLogger)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("configure catalog discovery: %w", err)
 	}
 	discoveryService.SetEnrichmentPlanner(aiService)
+	discoveryService.SetSearchEnrichmentPlanner(aiService)
 	aiService.SetCatalogChangedHook(discoveryService.MarkCatalogChanged)
-	if err := discoveryService.RegisterHandlers(worker); err != nil {
+	if err := discoveryService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register catalog discovery handlers: %w", err)
 	}
-	if err := discoveryService.EnsureScheduled(setupCtx); err != nil {
+	searchRepo := catalog.NewSearchRepository(db)
+	searchScan, err := catalog.NewSearchScanService(searchRepo, catalogSteamClient, queue, cfg.CatalogDiscovery, nil)
+	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("schedule catalog discovery: %w", err)
+		return nil, fmt.Errorf("configure catalog search: %w", err)
 	}
-	syncService.SetDiscoveryNudger(discoveryService)
+	searchScheduler, err := catalog.NewSearchScheduler(searchRepo, queue, cfg.CatalogDiscovery, nil)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure catalog scheduler: %w", err)
+	}
+	// These explicit setters are the production activation points for durable
+	// page qualification and the sole catalog-AI execution budget.
+	searchScan.SetSearchQualificationProducer(searchRepo)
+	aiService.SetCatalogFeatureAdmission(discoveryService)
+	cutover, err := discoveryRepo.CutOverLegacyDiscovery(setupCtx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("cut over legacy catalog discovery: %w", err)
+	}
+	legacyRemaining, err := discoveryRepo.CountNonterminalLegacyJobs(setupCtx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("verify legacy catalog cutover: %w", err)
+	}
+	if err := validateLegacyCutoverDrain(legacyRemaining, cutover); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := aiService.RegisterCatalogHandlers(catalogWorker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register catalog AI handlers: %w", err)
+	}
+	if err := discoveryService.RegisterSearchHandlers(catalogWorker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register search qualification handlers: %w", err)
+	}
+	if err := searchScan.RegisterHandlers(catalogWorker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register catalog search handlers: %w", err)
+	}
+	if err := catalogService.RegisterDeckRefreshHandlers(catalogWorker); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("register Deck refresh handler: %w", err)
+	}
+	syncService.SetDiscoveryNudger(searchScheduler)
+	syncService.SetSearchCandidateRefresher(searchRepo, cfg.CatalogDiscovery)
 	profileRepository, err := profile.NewSQLRepository(db, cfg.OpenAIEmbeddingModel)
 	if err != nil {
 		db.Close()
@@ -167,7 +233,7 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("configure profile service: %w", err)
 	}
 	profileService.SetQueue(queue)
-	if err := profileService.RegisterHandlers(worker); err != nil {
+	if err := profileService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register profile handlers: %w", err)
 	}
@@ -194,10 +260,11 @@ func New(cfg config.Config) (*App, error) {
 	recommendationService.SetQueue(queue)
 	recommendationService.SetExplanationCache(recommendationRepository, cfg.OpenAIModel)
 	recommendationService.SetOverviewSources(recommendationRepository, discoveryService)
-	if err := recommendationService.RegisterHandlers(worker); err != nil {
+	if err := recommendationService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register recommendation handlers: %w", err)
 	}
+	recommendationService.SetDeckRefreshPlanner(catalogService)
 	feedbackRepository, err := feedback.NewSQLRepository(db)
 	if err != nil {
 		db.Close()
@@ -208,7 +275,7 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("configure feedback service: %w", err)
 	}
-	if err := feedbackService.RegisterHandlers(worker); err != nil {
+	if err := feedbackService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register feedback handlers: %w", err)
 	}
@@ -222,7 +289,7 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("configure preference service: %w", err)
 	}
-	if err := preferenceService.RegisterHandlers(worker); err != nil {
+	if err := preferenceService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register preference handlers: %w", err)
 	}
@@ -246,7 +313,7 @@ func New(cfg config.Config) (*App, error) {
 		db.Close()
 		return nil, fmt.Errorf("configure notifications: %w", err)
 	}
-	if err := notificationService.RegisterHandlers(worker); err != nil {
+	if err := notificationService.RegisterHandlers(interactiveWorker); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("register notification handlers: %w", err)
 	}
@@ -267,15 +334,27 @@ func New(cfg config.Config) (*App, error) {
 	deps.Digests = notificationService
 	dataService := httpapi.NewSQLDataService(db, cfg.OpenAI.Enabled, strings.TrimSpace(cfg.SMTPURL) != "")
 	dataService.SetDiscoveryDiagnosticsReader(discoveryService)
+	dataService.SetSearchDiagnosticsReader(catalog.NewSearchDiagnosticsReader(db, catalog.SearchDiagnosticsConfig{
+		Enabled: cfg.CatalogDiscovery.Enabled, StoreBudgetPerHour: cfg.CatalogDiscovery.AppDetailsHourlyBudget,
+		AIBudgetPerHour: cfg.CatalogDiscovery.AIHourlyBudget, StaleAfter: 48 * time.Hour,
+	}))
 	deps.Data = dataService
-	return &App{store: db, worker: worker, server: &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewRouter(deps),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}}, nil
+	return &App{store: db, queue: queue, searchRepo: searchRepo, searchScan: searchScan, aiService: aiService,
+		interactiveWorker: interactiveWorker, catalogWorker: catalogWorker, scheduler: searchScheduler, server: &http.Server{
+			Addr:              cfg.HTTPAddr,
+			Handler:           httpapi.NewRouter(deps),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}}, nil
+}
+
+func validateLegacyCutoverDrain(remaining int64, cutover catalog.LegacyCutoverResult) error {
+	if remaining < 0 || cutover.RunningFenced < 0 || remaining > cutover.RunningFenced {
+		return errors.New("verify legacy catalog cutover: unexpected nonterminal work")
+	}
+	return nil
 }
 
 func waitForDatabase(
@@ -319,43 +398,53 @@ func retryableDatabaseConnectError(err error) bool {
 func (app *App) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	defer app.store.Close()
-	serverError := make(chan error, 1)
-	go func() { serverError <- app.server.ListenAndServe() }()
-	workerError := make(chan error, 1)
-	go func() { workerError <- app.worker.Run(ctx) }()
-	select {
-	case err := <-serverError:
-		cancel()
-		<-workerError
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
-	case err := <-workerError:
-		cancel()
-		shutdownErr := app.shutdownHTTP()
-		<-serverError
-		if err != nil {
-			return fmt.Errorf("run job worker: %w", err)
-		}
-		return shutdownErr
-	case <-ctx.Done():
-		cancel()
-		shutdownErr := app.shutdownHTTP()
-		serverErr := <-serverError
-		workerErr := <-workerError
-		if shutdownErr != nil {
-			return shutdownErr
-		}
-		if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
-			return serverErr
-		}
-		return workerErr
+	if app.store != nil {
+		defer app.store.Close()
 	}
+	type componentResult struct {
+		name string
+		err  error
+	}
+	results := make(chan componentResult, 4)
+	go func() { results <- componentResult{"http server", app.listenAndServe()} }()
+	go func() { results <- componentResult{"interactive job worker", app.interactiveWorker.Run(ctx)} }()
+	go func() { results <- componentResult{"catalog job worker", app.catalogWorker.Run(ctx)} }()
+	go func() { results <- componentResult{"catalog scheduler", app.scheduler.Run(ctx)} }()
+	var first componentResult
+	select {
+	case first = <-results:
+	case <-ctx.Done():
+		first = componentResult{name: "context", err: nil}
+	}
+	cancel()
+	shutdownErr := app.shutdownHTTP()
+	remaining := 4
+	if first.name != "context" {
+		remaining--
+	}
+	for range remaining {
+		result := <-results
+		if (first.err == nil || errors.Is(first.err, http.ErrServerClosed)) && result.err != nil && !errors.Is(result.err, http.ErrServerClosed) {
+			first = result
+		}
+	}
+	if first.err != nil && !errors.Is(first.err, http.ErrServerClosed) {
+		return fmt.Errorf("run %s: %w", first.name, first.err)
+	}
+	return shutdownErr
+}
+
+func (app *App) listenAndServe() error {
+	if app.serve != nil {
+		return app.serve()
+	}
+	return app.server.ListenAndServe()
 }
 
 func (app *App) shutdownHTTP() error {
+	if app.server == nil {
+		return nil
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := app.server.Shutdown(shutdownCtx); err != nil {

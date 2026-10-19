@@ -84,7 +84,7 @@ func (s *DiscoveryService) handleScan(ctx context.Context, lease jobs.Lease) err
 			return err
 		}
 		if remaining == 0 { // No request is spent after another coordinator used the slot.
-			if err = s.queue.DeferUntil(ctx, lease, nextDiscoveryHour(now)); err != nil {
+			if err = s.deferLegacy(ctx, lease, nextDiscoveryHour(now)); err != nil {
 				return err
 			}
 			return jobs.ErrDeferred
@@ -113,7 +113,7 @@ func (s *DiscoveryService) handleScan(ctx context.Context, lease jobs.Lease) err
 		}
 		manifest, err = s.repo.schedulePage(ctx, lease, p, page, s.cfg, s.planner)
 		if errors.Is(err, errDiscoveryBudget) {
-			if err = s.queue.DeferUntil(ctx, lease, nextDiscoveryHour(now)); err != nil {
+			if err = s.deferLegacy(ctx, lease, nextDiscoveryHour(now)); err != nil {
 				return err
 			}
 			return jobs.ErrDeferred
@@ -127,7 +127,7 @@ func (s *DiscoveryService) handleScan(ctx context.Context, lease jobs.Lease) err
 		return err
 	}
 	if !ready {
-		if err = s.queue.DeferUntil(ctx, lease, time.Now().UTC().Add(5*time.Second)); err != nil {
+		if err = s.deferLegacy(ctx, lease, time.Now().UTC().Add(5*time.Second)); err != nil {
 			return err
 		}
 		return jobs.ErrDeferred
@@ -202,6 +202,13 @@ func (r *DiscoveryRepository) schedulePage(ctx context.Context, lease jobs.Lease
 		return manifest, err
 	}
 	defer tx.Rollback(ctx)
+	allowed, err := r.LegacyEnqueueAllowedForUpdate(ctx, tx)
+	if err != nil {
+		return manifest, err
+	}
+	if !allowed {
+		return manifest, legacySupersededError{}
+	}
 	stored, err := lockDiscoveryLease(ctx, tx, lease)
 	if err != nil {
 		return manifest, err
@@ -288,6 +295,13 @@ func (r *DiscoveryRepository) ReconcilePage(ctx context.Context, lease jobs.Leas
 		return false, false, err
 	}
 	defer tx.Rollback(ctx)
+	allowed, err := r.LegacyEnqueueAllowedForUpdate(ctx, tx)
+	if err != nil {
+		return false, false, err
+	}
+	if !allowed {
+		return false, false, legacySupersededError{}
+	}
 	stored, err := lockDiscoveryLease(ctx, tx, lease)
 	if err != nil {
 		return false, false, err

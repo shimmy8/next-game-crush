@@ -61,10 +61,11 @@ func LoadSeed(path string) (Seed, error) {
 }
 
 type Service struct {
-	store  *store.Store
-	client steam.Client
-	seed   Seed
-	now    func() time.Time
+	store      *store.Store
+	client     steam.Client
+	deckClient steam.Client
+	seed       Seed
+	now        func() time.Time
 }
 
 // RefreshTarget is one independently leasable Store metadata refresh.
@@ -80,7 +81,15 @@ func NewService(database *store.Store, client steam.Client, seed Seed) (*Service
 	if seed.Version != 1 {
 		return nil, errors.New("catalog seed schema version 1 is required")
 	}
-	return &Service{store: database, client: client, seed: seed, now: time.Now}, nil
+	return &Service{store: database, client: client, deckClient: client, seed: seed, now: time.Now}, nil
+}
+
+// SetDeckRefreshClient isolates detached presentation refreshes on the
+// catalog transport without changing interactive bulk metadata behavior.
+func (s *Service) SetDeckRefreshClient(client steam.Client) {
+	if client != nil {
+		s.deckClient = client
+	}
 }
 
 func (s *Service) RefreshKnown(ctx context.Context) error {

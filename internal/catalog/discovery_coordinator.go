@@ -27,6 +27,13 @@ func (r *DiscoveryRepository) scheduleScan(ctx context.Context, mode DiscoveryMo
 	}
 	defer tx.Rollback(ctx)
 	q := r.store.Queries.WithTx(tx)
+	allowed, err := r.LegacyEnqueueAllowedForUpdate(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	if !allowed {
+		return false, tx.Commit(ctx)
+	}
 	state, err := q.LockCatalogDiscoveryState(ctx, string(mode))
 	if err != nil {
 		return false, err
@@ -103,6 +110,13 @@ func (r *DiscoveryRepository) ScheduleDueRetries(ctx context.Context, now time.T
 	}
 	defer tx.Rollback(ctx)
 	q := r.store.Queries.WithTx(tx)
+	allowed, err := r.LegacyEnqueueAllowedForUpdate(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	if !allowed {
+		return 0, tx.Commit(ctx)
+	}
 	// Keep hourly accounting bounded while retaining every row still referenced
 	// by unfinished work, including a page paused across process restarts.
 	if _, err = tx.Exec(ctx, `DELETE FROM catalog_discovery_budget b WHERE b.hour_at<$1 AND NOT EXISTS(SELECT 1 FROM sync_jobs j WHERE j.kind IN ('catalog.qualify','catalog.discover.incremental','catalog.discover.backfill') AND j.status NOT IN ('succeeded','dead') AND (j.payload->>'budget_hour')::timestamptz=b.hour_at)`, now.UTC().AddDate(0, 0, -7)); err != nil {
@@ -188,6 +202,13 @@ func (r *DiscoveryRepository) reconcileDeadRetries(ctx context.Context, now time
 		return err
 	}
 	defer tx.Rollback(ctx)
+	allowed, err := r.LegacyEnqueueAllowedForUpdate(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return tx.Commit(ctx)
+	}
 	rows, err := tx.Query(ctx, `SELECT j.payload,j.attempts FROM sync_jobs j WHERE j.kind='catalog.qualify' AND j.status='dead' AND j.parent_job_id IS NULL`)
 	if err != nil {
 		return err

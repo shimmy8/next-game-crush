@@ -2,6 +2,24 @@
 -- Legacy producers must lock/check catalog_workflow_state before enqueueing.
 SELECT * FROM catalog_discovery_state WHERE source='steam' AND mode=$1;
 
+-- name: DeadLetterQueuedLegacyDiscovery :many
+UPDATE sync_jobs SET status='dead',worker_id=NULL,fencing_token=NULL,lease_until=NULL,
+    last_error='superseded_catalog_workflow',updated_at=now()
+WHERE kind IN ('catalog.discovery.tick','catalog.discover.incremental','catalog.discover.backfill','catalog.qualify','catalog.rebuild_wakeup')
+  AND status IN ('queued','waiting','retryable')
+RETURNING id;
+
+-- name: FenceRunningLegacyDiscovery :many
+UPDATE sync_jobs SET max_attempts=attempts,updated_at=now()
+WHERE kind IN ('catalog.discovery.tick','catalog.discover.incremental','catalog.discover.backfill','catalog.qualify','catalog.rebuild_wakeup')
+  AND status='running'
+RETURNING id;
+
+-- name: CountNonterminalLegacyDiscovery :one
+SELECT count(*) FROM sync_jobs
+WHERE kind IN ('catalog.discovery.tick','catalog.discover.incremental','catalog.discover.backfill','catalog.qualify','catalog.rebuild_wakeup')
+  AND status IN ('queued','running','waiting','retryable');
+
 -- name: LockCatalogDiscoveryState :one
 SELECT * FROM catalog_discovery_state WHERE source='steam' AND mode=$1 FOR UPDATE;
 

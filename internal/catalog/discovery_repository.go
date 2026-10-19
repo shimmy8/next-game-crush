@@ -18,8 +18,80 @@ import (
 
 type DiscoveryRepository struct{ store *store.Store }
 
+type LegacyCutoverResult struct {
+	Cancelled     int64
+	RunningFenced int64
+}
+
+type legacySupersededError struct{}
+
+func (legacySupersededError) Error() string   { return "superseded_catalog_workflow" }
+func (legacySupersededError) Retryable() bool { return false }
+
 func NewDiscoveryRepository(s *store.Store) *DiscoveryRepository {
 	return &DiscoveryRepository{store: s}
+}
+
+// LegacyEnqueueAllowedForUpdate serializes every legacy producer with cutover.
+// Callers must invoke it before locking or mutating any job row.
+func (r *DiscoveryRepository) LegacyEnqueueAllowedForUpdate(ctx context.Context, tx pgx.Tx) (bool, error) {
+	if r == nil || r.store == nil || tx == nil {
+		return false, errors.New("legacy discovery persistence is required")
+	}
+	state, err := r.store.Queries.WithTx(tx).LockCatalogWorkflowState(ctx)
+	if err != nil {
+		return false, err
+	}
+	return state.LegacyEnqueueEnabled, nil
+}
+
+func (r *DiscoveryRepository) CutOverLegacyDiscovery(ctx context.Context) (LegacyCutoverResult, error) {
+	result := LegacyCutoverResult{}
+	if r == nil || r.store == nil {
+		return result, errors.New("legacy discovery persistence is required")
+	}
+	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return result, err
+	}
+	defer tx.Rollback(ctx)
+	q := r.store.Queries.WithTx(tx)
+	state, err := q.LockCatalogWorkflowState(ctx)
+	if err != nil {
+		return result, err
+	}
+	if state.LegacyEnqueueEnabled {
+		if _, err := q.CloseLegacyCatalogWorkflow(ctx, pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}); err != nil {
+			return result, err
+		}
+	}
+	cancelled, err := q.DeadLetterQueuedLegacyDiscovery(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.Cancelled = int64(len(cancelled))
+	if len(cancelled) > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE job_attempts SET status='dead',finished_at=now(),error='superseded_catalog_workflow'
+			WHERE job_id=ANY($1::uuid[]) AND finished_at IS NULL`, cancelled); err != nil {
+			return result, err
+		}
+	}
+	running, err := q.FenceRunningLegacyDiscovery(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.RunningFenced = int64(len(running))
+	if err := tx.Commit(ctx); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func (r *DiscoveryRepository) CountNonterminalLegacyJobs(ctx context.Context) (int64, error) {
+	if r == nil || r.store == nil {
+		return 0, errors.New("legacy discovery persistence is required")
+	}
+	return r.store.Queries.CountNonterminalLegacyDiscovery(ctx)
 }
 
 func validDiscoveryMode(mode DiscoveryMode) bool {

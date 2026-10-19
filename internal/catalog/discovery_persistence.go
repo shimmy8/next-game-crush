@@ -61,6 +61,13 @@ func (r *DiscoveryRepository) persistQualification(ctx context.Context, lease jo
 		return err
 	}
 	defer tx.Rollback(ctx)
+	allowed, err := r.LegacyEnqueueAllowedForUpdate(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		planner = nil
+	}
 	if _, err = lockDiscoveryLease(ctx, tx, lease); err != nil {
 		return err
 	}

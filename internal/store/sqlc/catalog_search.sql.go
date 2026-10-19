@@ -345,6 +345,34 @@ func (q *Queries) CommitSearchPage(ctx context.Context, arg CommitSearchPagePara
 	return i, err
 }
 
+const completeMetadataIngressQualificationWork = `-- name: CompleteMetadataIngressQualificationWork :execrows
+UPDATE catalog_metadata_ingress_work SET status='complete',next_eligible_at=NULL,updated_at=$1
+WHERE steam_app_id=$2
+  AND material_run_revision=$3::bigint
+  AND material_observation_ordinal=$4::bigint
+  AND status='reserved'
+`
+
+type CompleteMetadataIngressQualificationWorkParams struct {
+	NowAt              pgtype.Timestamptz `json:"now_at"`
+	SteamAppID         int64              `json:"steam_app_id"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+}
+
+func (q *Queries) CompleteMetadataIngressQualificationWork(ctx context.Context, arg CompleteMetadataIngressQualificationWorkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeMetadataIngressQualificationWork,
+		arg.NowAt,
+		arg.SteamAppID,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const completeSearchQualificationCandidate = `-- name: CompleteSearchQualificationCandidate :execrows
 UPDATE catalog_search_worklist SET status='complete',next_retry_at=NULL
 WHERE run_id=$1 AND steam_app_id=$2 AND status IN ('pending','deferred')
@@ -510,6 +538,36 @@ func (q *Queries) EnsureCatalogHostThrottle(ctx context.Context, arg EnsureCatal
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const failMetadataIngressQualificationWork = `-- name: FailMetadataIngressQualificationWork :execrows
+UPDATE catalog_metadata_ingress_work SET status='reserved',next_eligible_at=$1,updated_at=$2
+WHERE steam_app_id=$3
+  AND material_run_revision=$4::bigint
+  AND material_observation_ordinal=$5::bigint
+  AND status='reserved'
+`
+
+type FailMetadataIngressQualificationWorkParams struct {
+	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
+	NowAt              pgtype.Timestamptz `json:"now_at"`
+	SteamAppID         int64              `json:"steam_app_id"`
+	RunRevision        int64              `json:"run_revision"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+}
+
+func (q *Queries) FailMetadataIngressQualificationWork(ctx context.Context, arg FailMetadataIngressQualificationWorkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failMetadataIngressQualificationWork,
+		arg.NextRetryAt,
+		arg.NowAt,
+		arg.SteamAppID,
+		arg.RunRevision,
+		arg.ObservationOrdinal,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const failSearchFeedAtCursor = `-- name: FailSearchFeedAtCursor :execrows

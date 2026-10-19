@@ -131,6 +131,17 @@ func (worker *Worker) Register(kind string, handler Handler) error {
 	return nil
 }
 
+// Handles and Concurrency expose safe composition metadata for startup tests
+// and diagnostics without exposing handler functions or queue payloads.
+func (worker *Worker) Handles(kind string) bool {
+	worker.mu.RLock()
+	defer worker.mu.RUnlock()
+	_, ok := worker.handlers[kind]
+	return ok
+}
+
+func (worker *Worker) Concurrency() int { return worker.concurrency }
+
 func (worker *Worker) Run(ctx context.Context) error {
 	if !worker.lane.valid() {
 		return errors.New("worker lane must be interactive or catalog")

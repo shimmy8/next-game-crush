@@ -269,6 +269,25 @@ func (q *Queue) DeferUntil(ctx context.Context, lease Lease, availableAt time.Ti
 		return fmt.Errorf("begin deferred polling: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := q.DeferUntilInTx(ctx, tx, lease, availableAt); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit deferred polling: %w", err)
+	}
+	return nil
+}
+
+// DeferUntilInTx releases an owned lease using the caller's transaction. It is
+// used by workflows which must serialize a feature fence before touching the
+// job row. The caller owns commit/rollback.
+func (q *Queue) DeferUntilInTx(ctx context.Context, tx pgx.Tx, lease Lease, availableAt time.Time) error {
+	if q == nil || q.store == nil || tx == nil {
+		return errors.New("queue store and transaction are required")
+	}
+	if !availableAt.After(time.Now()) {
+		return errors.New("deferred availability must be in the future")
+	}
 	queries := q.store.Queries.WithTx(tx)
 	rows, err := queries.DeferJobUntil(ctx, dbgen.DeferJobUntilParams{
 		AvailableAt: timeToPG(availableAt), ID: uuidToPG(lease.ID),
@@ -284,9 +303,6 @@ func (q *Queue) DeferUntil(ctx context.Context, lease Lease, availableAt time.Ti
 		JobID: uuidToPG(lease.ID), WorkerID: lease.WorkerID, FencingToken: uuidToPG(lease.FencingToken),
 	}); err != nil {
 		return fmt.Errorf("finish deferred attempt: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit deferred polling: %w", err)
 	}
 	return nil
 }
@@ -450,9 +466,12 @@ func (q *Queue) Fail(ctx context.Context, lease Lease, cause error, retryAt time
 	if err := requireOwnership(rows); err != nil {
 		return "", err
 	}
-	status := "retryable"
-	if !retryable || lease.Attempts >= lease.MaxAttempts {
-		status = "dead"
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM sync_jobs WHERE id=$1`, lease.ID).Scan(&status); err != nil {
+		return "", fmt.Errorf("read failed job disposition: %w", err)
+	}
+	if status != "retryable" && status != "dead" {
+		return "", errors.New("invalid failed job disposition")
 	}
 	if err := queries.FinishFailedAttempt(ctx, dbgen.FinishFailedAttemptParams{
 		JobID: uuidToPG(lease.ID), WorkerID: lease.WorkerID, FencingToken: uuidToPG(lease.FencingToken),
