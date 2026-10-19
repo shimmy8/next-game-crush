@@ -1,59 +1,49 @@
 # Next Game Crush
 
-Next Game Crush is a local, single-user Steam release recommender. It imports public Steam activity, keeps release-date precision intact, builds deterministic recommendations with optional OpenAI enrichment, collects feedback, and sends a local test digest to Mailpit.
+Next Game Crush — персональный помощник по недавним и будущим релизам Steam. Он собирает доступные данные об игровой истории одного владельца, превращает их в понятный профиль вкуса и помогает находить подходящие игры.
 
-## Prerequisites
+Проект учитывает не только список игр, но и реальную активность, желаемое, достижения, признаки прохождения и явные реакции на рекомендации. В результате пользователь получает персональную подборку с объяснениями, которую можно проверить, уточнить и постепенно сделать точнее.
 
-- Go **1.27.2** (commands run with `GOWORK=off` because a parent workspace may exist)
-- Node.js 26 and pnpm 11
-- Docker with Docker Compose
+## Как это работает
 
-Copy `.env.example` to `.env` and fill only the empty values. Required secrets are `STEAM_WEB_API_KEY`, `EMAIL_ACTION_SECRET`, and `SESSION_SECRET`; `OPENAI_API_KEY` is optional. Generate signing/session secrets locally and never commit `.env`. `ALLOWED_STEAM_ID` must be the one 17-digit SteamID allowed to log in.
+1. Пользователь подключает свой Steam-профиль и запускает обновление данных.
+2. Next Game Crush анализирует библиотеку, игровую активность, желаемое и доступные достижения, чтобы собрать профиль предпочтений.
+3. Приложение сопоставляет этот профиль с ограниченной подборкой недавних и будущих релизов, а также с играми из желаемого.
+4. Рекомендации получают понятный порядок и объяснения. Когда данных достаточно, приложение показывает конкретные совпадения со вкусами пользователя и сигналы, на которых основан вывод.
+5. Реакции «Нравится» и «Не моё» уточняют предпочтения, после чего следующие рекомендации пересчитываются. Действие «Напомнить» сохраняет отметку о намерении вернуться к игре.
 
-`APP_BASE_URL` must exactly match the browser-visible origin because it anchors Steam callbacks, signed links, and CSRF origin checks. Use the Go origin (`http://localhost:8080`) for `make dev`; for split development opened through Vite, set it to the Vite URL (`http://localhost:5173`) and let Vite proxy `/api`, `/auth`, and `/actions` to Go.
+## Как используется ИИ
 
-Steam OpenID proves account ownership but does not unlock private data. Set Steam **Game details** and wishlist visibility to Public if you want them imported. Private or unavailable resources appear as unavailable/stale while the last successful snapshot remains usable.
+ИИ в Next Game Crush — вспомогательный слой: он помогает понять содержание игр и объяснить выводы, а итоговый порядок рекомендаций остаётся детерминированным.
 
-Completed games are inferred automatically from Steam achievements; there is no manual “completed” control. A first unlocked ending or full achievement completion is a durable historical taste signal, and distinct additional endings strengthen it up to a bounded maximum. This lets a short completed story game count at least as strongly as the maximum two-week activity signal, without pretending that historical completion is recent play. Direct Dislike/Exclude feedback can suppress its positive use without deleting the history.
+- Из доступных описаний и метаданных ИИ выделяет темы, механики, режимы и тон игры, а семантическое сходство становится одним из нескольких сигналов рекомендации.
+- По фактам об игровой активности ИИ может составить краткую сводку профиля, не подменяя исторические данные предположениями о текущих интересах.
+- Объяснения формулируются только из сохранённых оснований рекомендации. Если данных недостаточно или ответ не проходит проверку, приложение показывает объяснение по правилам или нейтральную формулировку.
+- Свободный текст отзывов разбирается по ограниченному набору тем, а неоднозначные формулировки достижений — по фиксированным классам. Только достаточно уверенный и поддерживаемый вывод может изменить предпочтения; неопределённые случаи остаются неопределёнными.
 
-The import first uses localized English metadata returned with `GetPlayerAchievements`; when a successful response lacks names or descriptions it asks `GetSchemaForGame` only for that game. Literal completion/ending wording is classified locally before optional OpenAI semantic classification. Steam or OpenAI failure preserves the last successful achievement snapshot, semantic generation, completion projection, profile, and ranking; unresolved new metadata remains unknown instead of being treated as “not completed”.
+ИИ не задаёт даты релизов и не управляет итоговой оценкой. Если он недоступен, продукт и рейтинг продолжают работать на сохранённых данных и правилах, а невалидные ответы не подменяют факты.
 
-## Run locally
+## Что получает пользователь
 
-```bash
-cp .env.example .env
-# edit .env without committing it
-make dev
-```
+- персональную подборку новых находок отдельно от уже добавленных в желаемое игр;
+- профиль вкуса, собранный из игровой истории и последних действий;
+- календарь недавних и будущих релизов с фильтрами по рекомендациям, желаемому, оценке совпадения и точности даты;
+- карточки игр с оценкой совпадения и объяснением, а когда данных достаточно — с конкретными основаниями рекомендации;
+- возможность влиять на будущую выдачу с помощью реакций и явно видеть учтённые корректировки предпочтений;
+- тестовый дайджест с рекомендациями и релизами из желаемого.
 
-Open <http://localhost:8080>. Mailpit is at <http://localhost:8025>. The production Docker image builds the frontend, copies it into `/app/web/dist`, and embeds SQL migrations in the Go binary, so the same container serves assets and migrates the database at startup.
+## Принципы продукта
 
-To expose a public read-only view of the saved allowlisted account, set `DEMO_MODE_ENABLED=1` and restart the app. The login screen then shows a separate dark demo button. A demo session reads the owner's current data but cannot synchronize, change preferences, submit reactions or reminders, send a digest, or delete data; the server rejects those mutations even if a client bypasses the UI. Demo login is unavailable until the owner has signed in at least once.
+- **Объяснимость и контроль.** Пользователь видит, почему игра попала в подборку, и может поправить выводы приложения.
+- **Честность в датах.** Точная дата, месяц, квартал, год, Coming Soon и неизвестный срок остаются разными типами информации. Приложение не придумывает конкретный день там, где его нет.
+- **Предсказуемое ранжирование.** Итоговый порядок определяется сохранёнными игровыми сигналами и понятными правилами; роль ИИ ограничена вспомогательными задачами.
+- **Устойчивость к недоступным источникам.** Временный сбой Steam или ИИ не превращается в пустой профиль: последнее успешное состояние остаётся доступным, а неопределённость показывается явно.
+- **Приватность по умолчанию.** Используются только доступные данные Steam, а импортированную информацию можно удалить.
 
-For split development, start PostgreSQL and Mailpit with `docker compose up -d db mailpit`, set `APP_BASE_URL=http://localhost:5173` when running `GOWORK=off go run ./cmd/next-game-crush`, then run `pnpm --dir web dev` and open <http://localhost:5173>.
+## Границы текущей версии
 
-The reviewed bounded fallback catalog lives in `catalog_seed.json`. Edit AppIDs, source URLs, and observed dates together; do not replace review with HTML scraping. Optional Steam Search discovery is disabled by default (`CATALOG_DISCOVERY_ENABLED=0`). When enabled, it searches the 30-day lookback/30-day horizon window, processes popular feeds first, rejects released games rated Mixed or below, and incrementally adds qualified games to the same shared candidate union. The seed remains available as a fallback. Store metadata and AI enrichment have independent hourly budgets; supported bounds are documented in `.env.example`.
+Next Game Crush рассчитан на одного владельца Steam-аккаунта и не является публичным многопользовательским сервисом. Он работает только с доступными данными Steam: закрытые или недоступные части профиля не обходятся и не трактуются как пустые.
 
-The scheduler is embedded in the application process. `docker compose up` starts HTTP, both PostgreSQL-backed worker lanes, and the scheduler together; no host crontab or CI schedule is required. `CATALOG_REFRESH_CRON`, `CATALOG_RECONCILIATION_CRON`, and `CATALOG_REFRESH_TIMEZONE` control durable run creation. Daily discovery uses Steam Search; the low-priority weekly reconciliation uses `IStoreService/GetAppList` with a durable cursor and routes changed AppIDs through the same AppDetails reservation and budget gates. `CATALOG_RECONCILIATION_PAGE_SIZE` bounds each reconciliation page; the standard page and new-AppID caps also bound each reconciliation occurrence, and a partial scan resumes at the next occurrence. Restarts catch up the latest missed occurrence without blocking HTTP readiness, and idempotency prevents already-processed games from being re-enriched. Safe aggregate progress, review coverage, budgets, adaptive throttle state, and retries appear in Diagnostics; raw upstream bodies and keys do not. Disabling discovery stops new work without deleting the last successful shared candidates.
+Каталог намеренно ограничен недавними и будущими релизами из проверяемой подборки, доступного поиска Steam и желаемого пользователя. Проект не заявляет о полном охвате всего каталога Steam. Дайджест в текущей версии остаётся тестовым и не заменяет полноценные уведомления о релизах.
 
-For production, follow [docs/vps-setup.md](docs/vps-setup.md) once to prepare the Ubuntu VPS and GitHub `production` Environment. Use [docs/deployment.md](docs/deployment.md) for routine deployments, status checks, rollback behavior, and guarded database recovery.
-
-## Verify and diagnose
-
-```bash
-make verify
-```
-
-This starts a disposable PostgreSQL test service, creates a separate E2E database, applies migrations, checks pinned sqlc output, runs Go race tests, frontend tests/typecheck/lint/build, installs the pinned Playwright Chromium when needed, and runs the product-loop, presentation-state, catalog-discovery, and completion-signal browser suites against fake Steam/OpenAI services. The completion suite also runs once with OpenAI disabled. Fixture upstream controls live only in the separate E2E fake executable. Catalog run/state/restart routes are compiled into the application, but are registered only with `TEST_HARNESS_MODE=1`; mutations still require the authenticated allowlisted owner and CSRF protection, and the routes fail closed outside harness mode. Application fixture authentication and upstream URL overrides also fail startup unless harness mode is enabled.
-
-If the Playwright browser CDN is unavailable, an already-installed Chromium-family executable can be used explicitly for local verification with `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/absolute/path/to/chromium make verify`; the default path still installs Playwright's pinned Chromium.
-
-The diagnostics card and `GET /api/health` show component state and freshness. Authenticated `GET /api/jobs` shows status and sanitized errors—never payloads, prompts, tokens, achievement text, IDs, or secrets. Achievement diagnostics remain aggregate: a schema fallback or classifier outage may leave the saved completion state unchanged, which is intentional last-known-good behavior. Use the diagnostics deletion confirmation to remove the local user’s imported library, wishlist, achievement unlocks/completion projections, profiles/vectors, recommendations, feedback, jobs, deliveries, and sessions; shared catalog and shared achievement definitions/classifications remain.
-
-Explicit negative feedback can create a visible preference correction only when the saved classifier result is actionable and sufficiently confident. The UI first confirms that feedback was saved, then reports whether a rule was applied after the ranking rebuild. Active corrections are listed in the taste profile; “Не учитывать” schedules another deterministic rebuild and keeps the immutable correction history visible in Diagnostics.
-
-## Cleanup
-
-`make down` stops services. To remove the persistent local application database too, run `docker compose down -v` only when you intend to erase it. Browser-test data is disposable and recreated by `make verify`.
-
-See [docs/local-demo.md](docs/local-demo.md) for the demo/runbook and real-account limitations.
+Инструкция находится в [руководстве по запуску и разработке](docs/local-demo.md).
