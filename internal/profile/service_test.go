@@ -83,7 +83,7 @@ func TestLoadSignalsIncludesLastPlayedAt(t *testing.T) {
 	}
 }
 
-func TestLoadSignalsLatestDirectActionOverridesCompletionOnly(t *testing.T) {
+func TestLoadActivitySignalsIgnoreDirectActionsAndPreserveCompletion(t *testing.T) {
 	database := openProfileStore(t)
 	ctx := context.Background()
 	userID, gameID, profileID := uuid.New(), uuid.New(), uuid.New()
@@ -118,7 +118,7 @@ func TestLoadSignalsLatestDirectActionOverridesCompletionOnly(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	assertSignal := func(wantOverridden bool, wantLikes, wantDislikes int) {
+	assertSignal := func() {
 		t.Helper()
 		signals, err := repository.LoadSignals(ctx, userID)
 		if err != nil {
@@ -128,8 +128,8 @@ func TestLoadSignalsLatestDirectActionOverridesCompletionOnly(t *testing.T) {
 			t.Fatalf("signals = %#v, want one", signals)
 		}
 		got := signals[0]
-		if got.CompletionWeight != 1.85 || got.CompletionOverridden != wantOverridden || got.Likes != wantLikes || got.Dislikes != wantDislikes {
-			t.Fatalf("signal = %#v, want completion=1.85 overridden=%v likes=%d dislikes=%d", got, wantOverridden, wantLikes, wantDislikes)
+		if got.CompletionWeight != 1.85 || got.CompletionOverridden || got.Likes != 0 || got.Dislikes != 0 {
+			t.Fatalf("activity signal leaked direct feedback: %#v", got)
 		}
 		var weight float64
 		if err := database.Pool.QueryRow(ctx, `SELECT weight FROM user_game_completion_projections WHERE user_id=$1 AND game_id=$2`, userID, gameID).Scan(&weight); err != nil || weight != 1.85 {
@@ -140,13 +140,13 @@ func TestLoadSignalsLatestDirectActionOverridesCompletionOnly(t *testing.T) {
 	base := time.Date(2026, time.October, 18, 12, 0, 0, 0, time.UTC)
 	insertFeedback("dislike", base)
 	insertFeedback("like", base.Add(time.Minute))
-	assertSignal(false, 1, 1)
+	assertSignal()
 	insertFeedback("dislike", base.Add(2*time.Minute))
-	assertSignal(true, 1, 2)
+	assertSignal()
 	insertFeedback("like", base.Add(3*time.Minute))
-	assertSignal(false, 2, 2)
+	assertSignal()
 	insertFeedback("exclude", base.Add(4*time.Minute))
-	assertSignal(true, 2, 3)
+	assertSignal()
 }
 
 func TestProfileCompletionVersionMetadataAndBuildIdentity(t *testing.T) {
@@ -175,7 +175,7 @@ func TestProfileCompletionVersionMetadataAndBuildIdentity(t *testing.T) {
 	if got.ID == legacyID || got.Version != 2 {
 		t.Fatalf("completion build reused legacy profile: %#v", got)
 	}
-	if AlgorithmVersion != "profile-v4-achievement-completion" {
+	if AlgorithmVersion != "activity-profile-v5" {
 		t.Fatalf("algorithm version = %q", AlgorithmVersion)
 	}
 	var metadata []byte
@@ -205,10 +205,8 @@ func TestProfileCompletionVersionMetadataAndBuildIdentity(t *testing.T) {
 func TestLaterRebuildEnqueuesFreshIdempotentSummaryAfterDeadAttempt(t *testing.T) {
 	database := openProfileStore(t)
 	ctx := context.Background()
-	userID := uuid.New()
-	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
-		t.Fatal(err)
-	}
+	userID, gameID := uuid.New(), uuid.New()
+	seedActivityGame(t, database, userID, gameID, true)
 	repository, err := NewSQLRepository(database, "embed")
 	if err != nil {
 		t.Fatal(err)
@@ -243,6 +241,22 @@ func TestLaterRebuildEnqueuesFreshIdempotentSummaryAfterDeadAttempt(t *testing.T
 			t.Fatal(err)
 		}
 		waitForProfileJobs(t, database, key)
+		var encoded []byte
+		if err := database.Pool.QueryRow(ctx, `SELECT result FROM sync_jobs WHERE idempotency_key=$1`, key).Scan(&encoded); err != nil {
+			t.Fatal(err)
+		}
+		var result struct {
+			ProfileID        uuid.UUID        `json:"profileId"`
+			ProfileVersion   int64            `json:"profileVersion"`
+			PublicationState PublicationState `json:"publicationState"`
+			SummaryRequired  bool             `json:"summaryRequired"`
+		}
+		if err := json.Unmarshal(encoded, &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.ProfileID == uuid.Nil || result.ProfileVersion == 0 || result.PublicationState != PublicationBuilding || !result.SummaryRequired {
+			t.Fatalf("profile job result = %s", encoded)
+		}
 	}
 
 	var profiles, summaries, distinctSummaryKeys int
@@ -254,6 +268,73 @@ func TestLaterRebuildEnqueuesFreshIdempotentSummaryAfterDeadAttempt(t *testing.T
 	}
 	if profiles != 2 || summaries != 2 || distinctSummaryKeys != 2 {
 		t.Fatalf("profiles/summaries/distinct keys = %d/%d/%d, want 2/2/2", profiles, summaries, distinctSummaryKeys)
+	}
+}
+
+func TestProfileWorkerRecordsInsufficientWithoutSummaryJob(t *testing.T) {
+	database := openProfileStore(t)
+	ctx := context.Background()
+	userID := uuid.New()
+	if _, err := database.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := NewSQLRepository(database, "embed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := jobs.NewQueue(database)
+	service.SetQueue(queue)
+	worker := jobs.NewWorker(queue, jobs.LaneInteractive, "profile-insufficient-test", jobs.WithPollInterval(5*time.Millisecond), jobs.WithLeaseDuration(time.Second), jobs.WithRetryBase(time.Millisecond))
+	if err := service.RegisterHandlers(worker); err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(runCtx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("worker: %v", err)
+		}
+	})
+	payload, _ := json.Marshal(JobPayload{Version: JobPayloadVersion, UserID: userID})
+	key := "sync:empty:profile:v1"
+	if _, err := queue.Enqueue(ctx, jobs.Spec{Lane: jobs.LaneInteractive, Kind: JobKind, IdempotencyKey: key, Payload: payload, UserID: userID}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var status string
+		var result []byte
+		err := database.Pool.QueryRow(ctx, `SELECT status,result FROM sync_jobs WHERE idempotency_key=$1`, key).Scan(&status, &result)
+		if err == nil && status == "succeeded" {
+			var decoded struct {
+				PublicationState PublicationState `json:"publicationState"`
+				SummaryRequired  bool             `json:"summaryRequired"`
+			}
+			if err := json.Unmarshal(result, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.PublicationState != PublicationInsufficient || decoded.SummaryRequired {
+				t.Fatalf("job result = %s", result)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("insufficient profile job did not succeed: status=%q err=%v", status, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var summaries int
+	if err := database.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind='ai.profile_summary' AND user_id=$1`, userID).Scan(&summaries); err != nil {
+		t.Fatal(err)
+	}
+	if summaries != 0 {
+		t.Fatalf("insufficient profile summary jobs = %d, want 0", summaries)
 	}
 }
 
