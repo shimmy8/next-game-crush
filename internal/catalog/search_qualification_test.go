@@ -489,16 +489,19 @@ func TestSearchQualificationPersistsCanonicalAndReviewState(t *testing.T) {
 	}
 }
 
-func TestStaleCandidateResultCannotPublish(t *testing.T) {
+func TestStaleCandidateDoesNotCallStoreOrPublish(t *testing.T) {
 	observation := testObservation(621, "20 Oct, 2026", steam.ReviewPositive, "Positive")
 	details := steam.GameDetails{AppID: 621, Type: "game", Name: "Stale", ShortDescription: "old",
 		ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "20 Oct, 2026"}}
-	service, _, repo, lease := searchQualificationFixture(t, observation, details)
+	service, metadata, repo, lease := searchQualificationFixture(t, observation, details)
 	if _, err := repo.store.Pool.Exec(context.Background(), `UPDATE catalog_metadata_heads SET material_run_revision=material_run_revision+1,
 		material_observation_ordinal=material_observation_ordinal+1,material_fingerprint='newer' WHERE steam_app_id=621`); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.handleSearchQualification(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.queue.Complete(context.Background(), lease); err != nil {
 		t.Fatal(err)
 	}
 	var games int
@@ -507,6 +510,16 @@ func TestStaleCandidateResultCannotPublish(t *testing.T) {
 	}
 	if games != 0 {
 		t.Fatal("stale candidate published canonical game")
+	}
+	if metadata.calls != 0 {
+		t.Fatalf("stale candidate made %d Store calls", metadata.calls)
+	}
+	var jobStatus string
+	if err := repo.store.Pool.QueryRow(context.Background(), `SELECT status FROM sync_jobs WHERE id=$1`, lease.ID).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != "succeeded" {
+		t.Fatalf("stale qualification status=%q", jobStatus)
 	}
 }
 

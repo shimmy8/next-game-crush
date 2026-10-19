@@ -437,6 +437,30 @@ func lockSearchQualificationState(ctx context.Context, tx pgx.Tx, payload Search
 	return current, current, nil
 }
 
+// preflightSearchQualification rejects work that was already superseded before
+// execution. It intentionally commits no catalog changes: the worker completes
+// the stale queue lease, while the current reservation/head remains untouched.
+// persistSearchQualification and persistSearchQualificationFailure repeat the
+// same fence after the external request to cover concurrent supersession.
+func (r *DiscoveryRepository) preflightSearchQualification(ctx context.Context, lease jobs.Lease, payload SearchQualificationPayload) (bool, error) {
+	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := lockDiscoveryLease(ctx, tx, lease); err != nil {
+		return false, err
+	}
+	owned, _, err := lockSearchQualificationState(ctx, tx, payload)
+	if err != nil {
+		return false, err
+	}
+	if err := commitDiscoveryLease(ctx, tx, lease); err != nil {
+		return false, err
+	}
+	return owned, nil
+}
+
 func (r *DiscoveryRepository) persistSearchQualification(ctx context.Context, lease jobs.Lease, payload SearchQualificationPayload, details steam.GameDetails, now time.Time, cfg DiscoveryConfig, planner SearchDiscoveryEnrichmentPlanner) error {
 	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {

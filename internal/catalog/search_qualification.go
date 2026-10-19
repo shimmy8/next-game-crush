@@ -111,6 +111,16 @@ func (s *DiscoveryService) handleSearchQualification(ctx context.Context, lease 
 		lease.IdempotencyKey != SearchQualificationKey(payload) || lease.Lane != jobs.LaneCatalog || lease.MaxAttempts != 4 {
 		return errors.New("invalid search qualification payload")
 	}
+	owned, err := s.repo.preflightSearchQualification(ctx, lease, payload)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		// The queue item was superseded before execution. Treat it as a clean
+		// no-op so the worker can terminate it without spending a Store call;
+		// persistence repeats this fence after the fetch to cover races.
+		return nil
+	}
 	details, err := s.metadata.GameDetails(ctx, payload.AppID)
 	if err != nil {
 		reason := "request_failed"

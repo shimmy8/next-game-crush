@@ -1,7 +1,7 @@
 # Steam Search Release-Window Catalog Design
 
 **Date:** 2026-10-18
-**Status:** Ready for user review
+**Status:** Implemented; final release verification pending
 **Related designs:**
 
 - `docs/superpowers/specs/2026-10-17-next-game-crush-mvp-design.md`
@@ -744,7 +744,8 @@ Diagnostics expose aggregate state for each source and worker lane:
 - Store and AI budget used/remaining, deferred count, current adaptive
   concurrency, and next eligible time;
 - active candidates by source and release phase;
-- metadata/AI cache hits and deduplication counts;
+- current metadata/AI cache entry counts and per-feed deduplicated candidate
+  counts (the system does not persist historical cache-hit events);
 - dirty rebuild revision and pending wakeup state;
 - last successful App List reconciliation and catalog freshness.
 

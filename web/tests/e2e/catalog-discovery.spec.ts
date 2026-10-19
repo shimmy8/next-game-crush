@@ -157,7 +157,7 @@ test('Steam Search publishes popular results first and applies the released revi
 
   await expect.poll(async () => {
     const run = await loadCatalogRun(page, runId)
-    return run.publishedAppIds.includes(520001) && run.feeds.recent?.status !== 'succeeded'
+    return run.publishedAppIds.includes(520001) && run.feeds.recent?.status !== 'complete'
   }, { timeout: 120_000 }).toBeTruthy()
   await runSync(page, csrfToken)
   const early = await loadRecommendations(page)
