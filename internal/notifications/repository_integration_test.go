@@ -135,6 +135,8 @@ func TestDigestDeliveryIdempotencySuppressionOwnershipAndActionReplay(t *testing
 		{`INSERT INTO users(id)VALUES($1)`, []any{userID}},
 		{`INSERT INTO steam_accounts(user_id,steam_id,display_name)VALUES($1,'76561198000000000','Player <unsafe>')`, []any{userID}},
 		{`INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at)VALUES($1,9001,'Game & One','test',$2)`, []any{gameID, now}},
+		{`INSERT INTO catalog_search_current(steam_app_id,run_revision,observation_ordinal,review_band,review_label,positive_percent,review_total,last_successful_appdetails_at,active)
+			VALUES(9001,1,1,'positive','Very Positive',91,1284,$1,true)`, []any{now}},
 		{`INSERT INTO preference_profiles(id,user_id,version)VALUES($1,$2,1)`, []any{profileID, userID}},
 		{`INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key,published)VALUES($1,$2,$3,1,'ranking-v1','build',true)`, []any{uuid.New(), userID, profileID}},
 		{`INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score,explanation,ranking_version)VALUES($1,$2,$3,$4,'ranking-v1',95,'Because <facts>',1)`, []any{recommendationID, userID, gameID, profileID}},
@@ -147,6 +149,14 @@ func TestDigestDeliveryIdempotencySuppressionOwnershipAndActionReplay(t *testing
 		}
 	}
 	repository, _ := NewSQLRepository(db, allowAllNotificationEligibility{}, func() time.Time { return now })
+	projected, err := repository.DigestInput(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.Recommendations) != 1 || projected.Recommendations[0].Reviews == nil || projected.Recommendations[0].Reviews.Band != "positive" ||
+		projected.Recommendations[0].Reviews.PositivePercent == nil || *projected.Recommendations[0].Reviews.PositivePercent != 91 || projected.Recommendations[0].Reviews.Total != 1284 {
+		t.Fatalf("projected reviews=%#v", projected.Recommendations)
+	}
 	signer, _ := NewSigner([]byte(strings.Repeat("x", 32)), actionPurpose)
 	scheduler := &schedulerStub{}
 	service, err := NewService(repository, scheduler, SenderFunc(func(context.Context, Message) (bool, error) { return true, nil }), signer, "http://localhost:8080")

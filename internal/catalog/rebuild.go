@@ -191,12 +191,6 @@ func (f eligibilityDueFence) resolve(current *time.Time, succeeded bool) (*time.
 	return &next, true
 }
 
-type rebuildWakePayload struct {
-	Version  int       `json:"version"`
-	UserID   uuid.UUID `json:"user_id"`
-	Revision int64     `json:"revision"`
-}
-
 type dirtyRow struct {
 	userID                                                 uuid.UUID
 	dirtyRevision, enqueuedRevision, lastCompletedRevision int64
@@ -405,7 +399,7 @@ func scheduleDueRebuilds(ctx context.Context, database *store.Store, cfg Discove
 		if err != nil {
 			return err
 		}
-		var cutoff any
+		var cutoff any = row.dueAt
 		if len(due) > 0 {
 			cutoff = now
 		}
@@ -430,26 +424,6 @@ func isCatalogRebuildV2Key(key string, userID uuid.UUID) bool {
 	revision, revisionErr := strconv.ParseInt(parts[1], 10, 64)
 	retry, retryErr := strconv.Atoi(parts[3])
 	return revisionErr == nil && revision > 0 && retryErr == nil && retry >= 0
-}
-
-func (s *DiscoveryService) handleRebuildWakeup(ctx context.Context, lease jobs.Lease) error {
-	var payload rebuildWakePayload
-	if strictDiscoveryPayload(lease.Payload, &payload) != nil || payload.Version != 1 || payload.UserID == uuid.Nil || payload.Revision < 1 || lease.UserID != payload.UserID {
-		return errors.New("unsupported catalog rebuild wakeup payload schema")
-	}
-	// Task 12 owns all new rebuild publication. The retained v1 handler only
-	// drains an already-claimed row: it serializes with cutover, then succeeds
-	// without enqueueing or deferring anything. Dirty state remains for the
-	// Search scheduler, including after a crash before queue completion.
-	tx, err := s.repo.store.Pool.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if _, err := s.repo.LegacyEnqueueAllowedForUpdate(ctx, tx); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
 }
 
 // CatalogRebuildFinished is called by the recommendation handler only after a

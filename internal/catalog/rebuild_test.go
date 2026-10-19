@@ -393,7 +393,7 @@ func TestCatalogRebuildDebounceAndNoop(t *testing.T) {
 	if err := service.ScheduleDueRebuilds(ctx, base.Add(20*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.repo.store.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind=$1`, RebuildWakeJobKind).Scan(&count); err != nil || count != 0 {
+	if err := service.repo.store.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind=$1`, "catalog.rebuild_wakeup").Scan(&count); err != nil || count != 0 {
 		t.Fatalf("legacy wakeups=%d err=%v", count, err)
 	}
 	if err := service.CatalogRebuildFinished(ctx, userID, key, true); err != nil {
@@ -455,6 +455,49 @@ func TestCatalogRebuildFailureRetriesAreBoundedAndKeepPublishedRanking(t *testin
 	}
 	if jobsCount != catalogRebuildMaxRetryGenerations+1 || completed != 0 {
 		t.Fatalf("jobs=%d completed=%d", jobsCount, completed)
+	}
+}
+
+func TestCatalogRebuildRetryPreservesEligibilityCutoffBeforeItIsDueAgain(t *testing.T) {
+	service, _ := discoveryFixture(t)
+	ctx := context.Background()
+	userID := uuid.New()
+	base := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	clock := base.Add(-time.Hour)
+	service.now = func() time.Time { return clock }
+	if _, err := service.repo.store.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.repo.store.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, uuid.New(), userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.repo.store.Pool.Exec(ctx, `INSERT INTO catalog_search_current(
+		steam_app_id,run_revision,observation_ordinal,release_text,precision,release_date,coming_soon,
+		review_band,review_label,positive_percent,review_total,last_successful_appdetails_at,active,next_eligibility_at)
+		VALUES(991220,1,1,'17 Sep, 2026','day','2026-09-17',false,'positive','Positive',90,100,$1,true,$1)`, base); err != nil {
+		t.Fatal(err)
+	}
+	markCatalogDirty(t, service, base.Add(-catalogRebuildDebounce))
+	if err := service.ScheduleDueRebuilds(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	var firstKey string
+	if err := service.repo.store.Pool.QueryRow(ctx, `SELECT idempotency_key FROM sync_jobs
+		WHERE kind='recommendations.rebuild' ORDER BY created_at DESC,id DESC LIMIT 1`).Scan(&firstKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.CatalogRebuildFinished(ctx, userID, firstKey, false); err != nil {
+		t.Fatal(err)
+	}
+	var cutoff *time.Time
+	var retryKey string
+	if err := service.repo.store.Pool.QueryRow(ctx, `SELECT state.due_at,job.idempotency_key
+		FROM catalog_rebuild_state state JOIN sync_jobs job ON job.id=state.pending_job_id
+		WHERE state.user_id=$1`, userID).Scan(&cutoff, &retryKey); err != nil {
+		t.Fatal(err)
+	}
+	if cutoff == nil || !cutoff.Equal(base) || !strings.HasSuffix(retryKey, ":2:retry:1") {
+		t.Fatalf("retry cutoff=%v key=%q", cutoff, retryKey)
 	}
 }
 

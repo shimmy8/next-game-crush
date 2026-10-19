@@ -2,10 +2,7 @@ package notifications
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
@@ -61,9 +58,11 @@ func (r *SQLRepository) DigestInput(ctx context.Context, userID uuid.UUID) (Dige
 		return DigestInput{}, err
 	}
 	rows.Close()
-	rows, err = r.store.Pool.Query(ctx, `SELECT r.id,r.game_id,g.name,r.score,COALESCE(r.explanation,''),d.precision,d.release_date,d.raw_text
+	rows, err = r.store.Pool.Query(ctx, `SELECT r.id,r.game_id,g.name,r.score,COALESCE(r.explanation,''),d.precision,d.release_date,d.raw_text,
+		c.review_band,c.review_label,c.positive_percent,c.review_total
 		FROM recommendations r JOIN games g ON g.id=r.game_id
 		LEFT JOIN LATERAL (SELECT precision,release_date,raw_text FROM game_release_dates WHERE game_id=g.id ORDER BY observed_at DESC,id DESC LIMIT 1) d ON true
+		LEFT JOIN catalog_search_current c ON c.steam_app_id=g.steam_app_id
 		WHERE r.user_id=$1 AND r.ranking_version=(SELECT max(ranking_version) FROM recommendation_runs WHERE user_id=$1 AND published)
 		ORDER BY r.score DESC,lower(g.name),g.id`, userID)
 	if err != nil {
@@ -75,11 +74,16 @@ func (r *SQLRepository) DigestInput(ctx context.Context, userID uuid.UUID) (Dige
 		var precision *string
 		var date *time.Time
 		var raw *string
-		if err := rows.Scan(&item.ID, &item.GameID, &item.Name, &item.Score, &item.Explanation, &precision, &date, &raw); err != nil {
+		var reviewBand, reviewLabel *string
+		var reviewPercent *int32
+		var reviewTotal *int64
+		if err := rows.Scan(&item.ID, &item.GameID, &item.Name, &item.Score, &item.Explanation, &precision, &date, &raw,
+			&reviewBand, &reviewLabel, &reviewPercent, &reviewTotal); err != nil {
 			rows.Close()
 			return DigestInput{}, err
 		}
 		item.Release = formatRelease(precision, date, raw)
+		item.Reviews = validDigestReviewSummary(reviewBand, reviewLabel, reviewPercent, reviewTotal)
 		recommendationCandidates = append(recommendationCandidates, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -99,8 +103,7 @@ func (r *SQLRepository) DigestInput(ctx context.Context, userID uuid.UUID) (Dige
 		if !allowed[item.GameID] {
 			continue
 		}
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%.6f\x00%s\x00%s", item.GameID, item.Name, item.Score, item.Explanation, item.Release)))
-		item.ContentHash = hex.EncodeToString(h[:])
+		item.ContentHash = digestRecommendationContentHash(item)
 		if !sent[item.GameID][item.ContentHash] && len(input.Recommendations) < 5 {
 			input.Recommendations = append(input.Recommendations, item)
 		}
@@ -141,6 +144,17 @@ func (r *SQLRepository) DigestInput(ctx context.Context, userID uuid.UUID) (Dige
 		}
 	}
 	return input, nil
+}
+
+func validDigestReviewSummary(band, label *string, percent *int32, total *int64) *DigestReviewSummary {
+	if band == nil || label == nil || total == nil || strings.TrimSpace(*label) == "" || *total < 0 {
+		return nil
+	}
+	reviews := &DigestReviewSummary{Band: *band, Label: strings.TrimSpace(*label), PositivePercent: percent, Total: *total}
+	if digestReviewLabel(reviews) == "" {
+		return nil
+	}
+	return reviews
 }
 
 func formatRelease(precision *string, date *time.Time, raw *string) string {

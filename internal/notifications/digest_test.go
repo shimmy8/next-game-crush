@@ -14,9 +14,10 @@ import (
 func TestComposeDigestIsDeterministicEscapedAndMultipart(t *testing.T) {
 	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 	signer, _ := NewSigner([]byte(strings.Repeat("x", 32)), "recommendation-feedback")
+	positivePercent := int32(91)
 	input := DigestInput{UserID: uuid.New(), DisplayName: `<script>alert("x")</script>`, Recommendations: []DigestRecommendation{
-		{ID: uuid.MustParse("00000000-0000-0000-0000-000000000002"), GameID: uuid.MustParse("10000000-0000-0000-0000-000000000002"), Name: "Zulu & <bad>", Score: 91, Explanation: `<img src=x onerror=alert(1)>`, Release: "Coming Soon"},
-		{ID: uuid.MustParse("00000000-0000-0000-0000-000000000001"), GameID: uuid.MustParse("10000000-0000-0000-0000-000000000001"), Name: "Alpha", Score: 91, Explanation: "Grounded", Release: "October 2026"},
+		{ID: uuid.MustParse("00000000-0000-0000-0000-000000000002"), GameID: uuid.MustParse("10000000-0000-0000-0000-000000000002"), Name: "Zulu & <bad>", Score: 91, Explanation: `<img src=x onerror=alert(1)>`, Release: "Coming Soon", Reviews: &DigestReviewSummary{Band: "unrated", Label: "No user reviews"}},
+		{ID: uuid.MustParse("00000000-0000-0000-0000-000000000001"), GameID: uuid.MustParse("10000000-0000-0000-0000-000000000001"), Name: "Alpha", Score: 91, Explanation: "Grounded", Release: "October 2026", Reviews: &DigestReviewSummary{Band: "positive", Label: "Very Positive", PositivePercent: &positivePercent, Total: 1284}},
 	}, Wishlist: []DigestWishlist{{GameID: uuid.New(), Name: "Wish <one>", Release: "18 Oct 2026"}}}
 	one, err := ComposeDigest(input, signer, "http://localhost:8080", now)
 	if err != nil {
@@ -46,10 +47,22 @@ func TestComposeDigestIsDeterministicEscapedAndMultipart(t *testing.T) {
 			t.Fatalf("HTML contains unsafe %q", unsafe)
 		}
 	}
-	for _, text := range []string{"Alpha", "Like", "Dislike", "Remind me", "Upcoming from your wishlist"} {
+	for _, text := range []string{"Alpha", "Like", "Dislike", "Remind me", "Upcoming from your wishlist", "91% положительных · 1 284 отзыва", "Пока нет отзывов"} {
 		if !strings.Contains(one.Text, text) {
 			t.Fatalf("plain part missing %q", text)
 		}
+		if !strings.Contains(one.HTML, text) {
+			t.Fatalf("HTML part missing %q", text)
+		}
+	}
+	changedPercent := int32(92)
+	input.Recommendations[1].Reviews.PositivePercent = &changedPercent
+	changed, err := ComposeDigest(input, signer, "http://localhost:8080", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ContentHash == one.ContentHash || changed.Recommendations[0].ContentHash == one.Recommendations[0].ContentHash {
+		t.Fatal("rendered review change did not change digest identities")
 	}
 }
 

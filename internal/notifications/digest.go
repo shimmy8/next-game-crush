@@ -10,6 +10,7 @@ import (
 	"html"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,12 @@ type DigestRecommendation struct {
 	Name                              string
 	Score                             float64
 	Explanation, Release, ContentHash string
+	Reviews                           *DigestReviewSummary
+}
+type DigestReviewSummary struct {
+	Band, Label     string
+	PositivePercent *int32
+	Total           int64
 }
 type DigestWishlist struct {
 	GameID        uuid.UUID
@@ -214,10 +221,11 @@ func ComposeDigest(input DigestInput, signer *Signer, baseURL string, now time.T
 		Score       float64   `json:"score"`
 		Explanation string    `json:"explanation"`
 		Release     string    `json:"release"`
+		Reviews     string    `json:"reviews,omitempty"`
 	}
 	stable := make([]stableRecommendation, 0, len(recommendations))
 	for _, item := range recommendations {
-		stable = append(stable, stableRecommendation{item.GameID, item.Name, item.Score, item.Explanation, item.Release})
+		stable = append(stable, stableRecommendation{item.GameID, item.Name, item.Score, item.Explanation, item.Release, digestReviewLabel(item.Reviews)})
 	}
 	canonical, _ := json.Marshal(struct {
 		DisplayName     string                 `json:"display_name"`
@@ -238,12 +246,18 @@ func ComposeDigest(input DigestInput, signer *Signer, baseURL string, now time.T
 	for _, item := range recommendations {
 		hash := item.ContentHash
 		if hash == "" {
-			h := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%.6f\x00%s\x00%s", item.GameID, item.Name, item.Score, item.Explanation, item.Release)))
-			hash = hex.EncodeToString(h[:])
+			hash = digestRecommendationContentHash(item)
 		}
 		digest.Recommendations = append(digest.Recommendations, DeliveryRecommendation{RecommendationID: item.ID, GameID: item.GameID, ContentHash: hash})
-		body.WriteString("<article><h3>" + html.EscapeString(item.Name) + "</h3><p>" + html.EscapeString(item.Release) + " · " + fmt.Sprintf("%.0f", item.Score) + "/100</p><p>" + html.EscapeString(item.Explanation) + "</p><p>")
-		text.WriteString(fmt.Sprintf("- %s (%s, %.0f/100)\n  %s\n", item.Name, item.Release, item.Score, item.Explanation))
+		reviews := digestReviewLabel(item.Reviews)
+		body.WriteString("<article><h3>" + html.EscapeString(item.Name) + "</h3><p>" + html.EscapeString(item.Release) + " · " + fmt.Sprintf("%.0f", item.Score) + "/100</p>")
+		text.WriteString(fmt.Sprintf("- %s (%s, %.0f/100)\n", item.Name, item.Release, item.Score))
+		if reviews != "" {
+			body.WriteString("<p>" + html.EscapeString(reviews) + "</p>")
+			text.WriteString("  " + reviews + "\n")
+		}
+		body.WriteString("<p>" + html.EscapeString(item.Explanation) + "</p><p>")
+		text.WriteString("  " + item.Explanation + "\n")
 		for _, actionName := range []string{"like", "dislike", "remind_me"} {
 			action := Action{UserID: input.UserID, RecommendationID: item.ID, Action: actionName, IssuedAt: now, ExpiresAt: now.Add(14 * 24 * time.Hour), Nonce: uuid.New()}
 			token, err := signer.Sign(action)
@@ -262,4 +276,49 @@ func ComposeDigest(input DigestInput, signer *Signer, baseURL string, now time.T
 	digest.Text = text.String()
 	digest.HTML = body.String()
 	return digest, nil
+}
+
+func digestRecommendationContentHash(item DigestRecommendation) string {
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%.6f\x00%s\x00%s\x00%s", item.GameID, item.Name, item.Score, item.Explanation, item.Release, digestReviewLabel(item.Reviews))))
+	return hex.EncodeToString(h[:])
+}
+
+func digestReviewLabel(reviews *DigestReviewSummary) string {
+	if reviews == nil {
+		return ""
+	}
+	switch reviews.Band {
+	case "unrated":
+		if reviews.PositivePercent == nil && reviews.Total == 0 {
+			return "Пока нет отзывов"
+		}
+	case "positive", "mixed_or_below":
+		if reviews.PositivePercent != nil && *reviews.PositivePercent >= 0 && *reviews.PositivePercent <= 100 && reviews.Total > 0 {
+			return fmt.Sprintf("%d%% положительных · %s %s", *reviews.PositivePercent, formatReviewCount(reviews.Total), russianReviewNoun(reviews.Total))
+		}
+	}
+	return ""
+}
+
+func formatReviewCount(total int64) string {
+	digits := strconv.FormatInt(total, 10)
+	for index := len(digits) - 3; index > 0; index -= 3 {
+		digits = digits[:index] + " " + digits[index:]
+	}
+	return digits
+}
+
+func russianReviewNoun(total int64) string {
+	lastTwo := total % 100
+	if lastTwo >= 11 && lastTwo <= 14 {
+		return "отзывов"
+	}
+	switch total % 10 {
+	case 1:
+		return "отзыв"
+	case 2, 3, 4:
+		return "отзыва"
+	default:
+		return "отзывов"
+	}
 }
