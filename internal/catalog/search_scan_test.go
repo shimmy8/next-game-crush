@@ -25,6 +25,37 @@ type terminalSearchStub struct {
 	failures int
 }
 
+type resumableSearchStub struct {
+	mu            sync.Mutex
+	requests      map[int]int
+	failStart     int
+	failRemaining int
+	pages         map[int]steam.SearchPage
+}
+
+type blockingSearchStub struct {
+	started chan struct{}
+	release chan struct{}
+	page    steam.SearchPage
+}
+
+func (s *blockingSearchStub) Search(context.Context, steam.SearchRequest) (steam.SearchPage, error) {
+	close(s.started)
+	<-s.release
+	return s.page, nil
+}
+
+func (s *resumableSearchStub) Search(_ context.Context, req steam.SearchRequest) (steam.SearchPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests[req.Start]++
+	if req.Start == s.failStart && s.failRemaining > 0 {
+		s.failRemaining--
+		return steam.SearchPage{}, steam.ErrInvalidResponse
+	}
+	return s.pages[req.Start], nil
+}
+
 type concurrentSearchStub struct {
 	arrived chan struct{}
 	release chan struct{}
@@ -144,6 +175,80 @@ func TestSearchPageReplayAfterCrash(t *testing.T) {
 	}
 	if cursor != 0 {
 		t.Fatalf("cursor advanced to %d", cursor)
+	}
+}
+
+func TestSearchResponseAfterWatchdogFenceIsDiscardedWithoutSuccessors(t *testing.T) {
+	cfg := DefaultDiscoveryConfig()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	source := &blockingSearchStub{started: make(chan struct{}), release: make(chan struct{}), page: steam.SearchPage{
+		Start: 0, Count: 1, Total: 1, Items: []steam.SearchObservation{testObservation(91, "18 Oct, 2026", steam.ReviewPositive, "Positive")},
+	}}
+	service, repo := newSearchScanForTest(t, source, cfg)
+	enableSearchQualificationProducer(t, service, repo)
+	run := searchTestRun(t, repo, cfg, now.Add(-time.Minute))
+	ctx := context.Background()
+	done := make(chan error, 1)
+	go func() {
+		done <- service.ProcessPage(ctx, SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming})
+	}()
+	<-source.started
+	if _, err := repo.store.Pool.Exec(ctx, `UPDATE sync_jobs SET status='dead',updated_at=$2
+		WHERE kind='catalog.search.run' AND payload->>'run_id'=$1`, run.ID.String(), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := NewSearchScheduler(repo, service.queue, cfg, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.EnsureScheduled(ctx); err != nil {
+		t.Fatal(err)
+	}
+	close(source.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	var generation, pages, observations, work, pageJobs, qualifications, reservations, aiJobs int
+	if err := repo.store.Pool.QueryRow(ctx, `SELECT retry_generation,
+		(SELECT count(*) FROM catalog_search_pages WHERE run_id=$1),
+		(SELECT count(*) FROM catalog_search_observations WHERE run_id=$1),
+		(SELECT count(*) FROM catalog_search_worklist WHERE run_id=$1),
+		(SELECT count(*) FROM sync_jobs WHERE kind='catalog.search.page' AND payload->>'run_id'=$1::text),
+		(SELECT count(*) FROM sync_jobs WHERE kind='catalog.search.qualify'),
+		(SELECT count(*) FROM catalog_store_reservations),
+		(SELECT count(*) FROM sync_jobs WHERE kind IN ('ai.features','ai.embedding'))
+		FROM catalog_search_runs WHERE id=$1`, run.ID).
+		Scan(&generation, &pages, &observations, &work, &pageJobs, &qualifications, &reservations, &aiJobs); err != nil {
+		t.Fatal(err)
+	}
+	if generation != 1 || pages != 0 || observations != 0 || work != 0 || pageJobs != 0 || qualifications != 0 || reservations != 0 || aiJobs != 0 {
+		t.Fatalf("generation=%d pages=%d observations=%d work=%d page_jobs=%d qualifications=%d reservations=%d ai=%d",
+			generation, pages, observations, work, pageJobs, qualifications, reservations, aiJobs)
+	}
+}
+
+func TestNewAppCapCountsDistinctWorklistAcrossFeeds(t *testing.T) {
+	cfg := DefaultDiscoveryConfig()
+	cfg.SearchMaxNewAppsPerRun = 2
+	service, repo := newSearchScanForTest(t, &searchStub{}, cfg)
+	run := searchTestRun(t, repo, cfg, time.Date(2026, 10, 18, 13, 0, 0, 0, time.UTC))
+	a := testObservation(101, "18 Oct, 2026", steam.ReviewPositive, "Positive")
+	b := testObservation(102, "19 Oct, 2026", steam.ReviewPositive, "Positive")
+	if err := service.CommitPage(context.Background(), run, steam.FeedPopularUpcoming, 0, 0,
+		steam.SearchPage{Start: 0, Count: 1, Total: 1, Items: []steam.SearchObservation{a}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.CommitPage(context.Background(), run, steam.FeedPopularNew, 0, 0,
+		steam.SearchPage{Start: 0, Count: 2, Total: 2, Items: []steam.SearchObservation{a, b}}); err != nil {
+		t.Fatal(err)
+	}
+	var work, hasB int
+	if err := repo.store.Pool.QueryRow(context.Background(), `SELECT count(*),count(*) FILTER(WHERE steam_app_id=102)
+		FROM catalog_search_worklist WHERE run_id=$1`, run.ID).Scan(&work, &hasB); err != nil {
+		t.Fatal(err)
+	}
+	if work != 2 || hasB != 1 {
+		t.Fatalf("work=%d app_b=%d", work, hasB)
 	}
 }
 

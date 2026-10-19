@@ -3,13 +3,17 @@ package catalog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
+	dbgen "next-game-crush/internal/store/sqlc"
 )
 
 func searchSchedulerFixture(t *testing.T) (*SearchScheduler, *store.Store) {
@@ -135,6 +139,178 @@ func TestDeadOccurrenceCreatesOneFencedRetryGeneration(t *testing.T) {
 	}
 	if status != "dead" {
 		t.Fatal("historical dead row mutated")
+	}
+}
+
+func TestWatchdogResumesTerminalSearchPageWithoutRefetchingCommittedPage(t *testing.T) {
+	ctx := context.Background()
+	db := openCatalogTestStore(t)
+	repo := NewSearchRepository(db)
+	queue := jobs.NewQueue(db)
+	cfg := DefaultDiscoveryConfig()
+	now := searchClock()
+	source := &resumableSearchStub{requests: map[int]int{}, failStart: 1, failRemaining: 4, pages: map[int]steam.SearchPage{
+		0: {Start: 0, Count: 1, Total: 2, HasMore: true, Items: []steam.SearchObservation{testObservation(71, "18 Oct, 2026", steam.ReviewPositive, "Positive")}},
+		1: {Start: 1, Count: 1, Total: 2, HasMore: false, Items: []steam.SearchObservation{testObservation(72, "19 Oct, 2026", steam.ReviewPositive, "Positive")}},
+	}}
+	service, err := NewSearchScanService(repo, source, queue, cfg, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := searchTestRun(t, repo, cfg, now.Add(-time.Minute))
+	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET status='succeeded' WHERE kind='catalog.search.run' AND payload->>'run_id'=$1`, run.ID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ProcessPage(ctx, SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}); err != nil {
+		t.Fatal(err)
+	}
+	pagePayload := SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming, Start: 1}
+	pageID, err := queue.Enqueue(ctx, searchPageSpec(pagePayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= 4; attempt++ {
+		lease, claimErr := queue.Claim(ctx, jobs.LaneCatalog, "resume-test", time.Minute)
+		if claimErr != nil || lease == nil || lease.ID != pageID {
+			t.Fatalf("attempt %d lease=%v err=%v", attempt, lease, claimErr)
+		}
+		handlerErr := service.handlePage(ctx, *lease)
+		if attempt < 4 {
+			if _, failErr := queue.Fail(ctx, *lease, handlerErr, now.Add(-time.Second)); failErr != nil {
+				t.Fatal(failErr)
+			}
+		} else if !errors.Is(handlerErr, jobs.ErrDeferred) {
+			t.Fatalf("terminal error=%v", handlerErr)
+		}
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE catalog_search_feeds SET status='complete',natural_end=true,completed_at=$2
+		WHERE run_id=$1 AND feed<>'popular_upcoming'`, run.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Queries.FinishSearchRunIfTerminal(ctx, dbgen.FinishSearchRunIfTerminalParams{RunID: catalogUUID(run.ID), CompletedAt: pgtype.Timestamptz{Time: now, Valid: true}}); err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := NewSearchScheduler(repo, queue, cfg, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.EnsureScheduled(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Hour)
+	if err := scheduler.EnsureScheduled(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var generation int
+	if err := db.Pool.QueryRow(ctx, `SELECT retry_generation FROM catalog_search_runs WHERE id=$1`, run.ID).Scan(&generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ProcessRun(ctx, SearchRunPayload{Version: 1, RunID: run.ID, RunRevision: run.Revision, Generation: generation}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ProcessPage(ctx, SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming, Start: 1, PageGeneration: generation}); err != nil {
+		t.Fatal(err)
+	}
+	enableSearchQualificationProducer(t, service, repo)
+	if _, err := repo.EnqueueReadySearchQualifications(ctx, queue, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	// A delayed generation-0 replay is an idempotent no-op: it neither calls
+	// Steam nor creates another Store/AI qualification chain.
+	if err := service.ProcessPage(ctx, SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.EnqueueReadySearchQualifications(ctx, queue, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	var committed, duplicate, observations, work, qualificationJobs, qualificationApps, reservations, aiJobs int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE start_offset=0 AND page_generation>0),
+		(SELECT count(*) FROM catalog_search_observations WHERE run_id=$1 AND feed='popular_upcoming'),
+		(SELECT count(*) FROM catalog_search_worklist WHERE run_id=$1),
+		(SELECT count(*) FROM sync_jobs WHERE kind='catalog.search.qualify'),
+		(SELECT count(DISTINCT payload->>'app_id') FROM sync_jobs WHERE kind='catalog.search.qualify'),
+		(SELECT count(*) FROM catalog_store_reservations),
+		(SELECT count(*) FROM sync_jobs WHERE kind IN ('ai.features','ai.embedding'))
+		FROM catalog_search_pages WHERE run_id=$1 AND feed='popular_upcoming'`, run.ID).
+		Scan(&committed, &duplicate, &observations, &work, &qualificationJobs, &qualificationApps, &reservations, &aiJobs); err != nil {
+		t.Fatal(err)
+	}
+	if generation != 1 || source.requests[0] != 1 || source.requests[1] != 5 || committed != 2 || duplicate != 0 || observations != 2 || work != 2 ||
+		qualificationJobs != 2 || qualificationApps != 2 || reservations != 2 || aiJobs != 0 {
+		t.Fatalf("generation=%d requests=%v committed=%d duplicate=%d observations=%d work=%d qualification_jobs=%d apps=%d reservations=%d ai=%d",
+			generation, source.requests, committed, duplicate, observations, work, qualificationJobs, qualificationApps, reservations, aiJobs)
+	}
+}
+
+func TestSearchSafetyCapIsTerminalForLogicalRun(t *testing.T) {
+	ctx := context.Background()
+	db := openCatalogTestStore(t)
+	repo := NewSearchRepository(db)
+	queue := jobs.NewQueue(db)
+	cfg := DefaultDiscoveryConfig()
+	cfg.SearchMaxPagesPerFeed = 1
+	now := searchClock()
+	source := &resumableSearchStub{requests: map[int]int{}, failStart: -1, pages: map[int]steam.SearchPage{
+		0: {Start: 0, Count: 1, Total: 2, HasMore: true, Items: []steam.SearchObservation{testObservation(81, "18 Oct, 2026", steam.ReviewPositive, "Positive")}},
+		1: {Start: 1, Count: 1, Total: 2, HasMore: false, Items: []steam.SearchObservation{testObservation(82, "19 Oct, 2026", steam.ReviewPositive, "Positive")}},
+	}}
+	service, err := NewSearchScanService(repo, source, queue, cfg, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := searchTestRun(t, repo, cfg, now.Add(-time.Minute))
+	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET status='succeeded' WHERE kind='catalog.search.run' AND payload->>'run_id'=$1`, run.ID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ProcessPage(ctx, SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE catalog_search_feeds SET status='complete',natural_end=true,completed_at=$2
+		WHERE run_id=$1 AND feed<>'popular_upcoming'`, run.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Queries.FinishSearchRunIfTerminal(ctx, dbgen.FinishSearchRunIfTerminalParams{RunID: catalogUUID(run.ID), CompletedAt: pgtype.Timestamptz{Time: now, Valid: true}}); err != nil {
+		t.Fatal(err)
+	}
+	// Neither a dead root nor a dead replay of the already committed page may
+	// reinterpret a bounded partial result as a retryable failure.
+	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET status='dead',updated_at=$2
+		WHERE kind='catalog.search.run' AND payload->>'run_id'=$1`, run.ID.String(), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	committedReplay, err := queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET status='dead',updated_at=$2 WHERE id=$1`, committedReplay, now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := NewSearchScheduler(repo, queue, cfg, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.EnsureScheduled(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Hour)
+	if err := scheduler.EnsureScheduled(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var generation, cursor, pages, committed, observations, work, retryRoots int
+	if err := db.Pool.QueryRow(ctx, `SELECT status,retry_generation,
+		(SELECT cursor_offset FROM catalog_search_feeds WHERE run_id=$1 AND feed='popular_upcoming'),
+		(SELECT pages FROM catalog_search_feeds WHERE run_id=$1 AND feed='popular_upcoming'),
+		(SELECT count(*) FROM catalog_search_pages WHERE run_id=$1 AND feed='popular_upcoming'),
+		(SELECT count(*) FROM catalog_search_observations WHERE run_id=$1 AND feed='popular_upcoming'),
+		(SELECT count(*) FROM catalog_search_worklist WHERE run_id=$1),
+		(SELECT count(*) FROM sync_jobs WHERE kind='catalog.search.run' AND payload->>'run_id'=$1::text AND payload->>'generation'='1')
+		FROM catalog_search_runs WHERE id=$1`, run.ID).Scan(&status, &generation, &cursor, &pages, &committed, &observations, &work, &retryRoots); err != nil {
+		t.Fatal(err)
+	}
+	if status != "partial" || generation != 0 || cursor != 1 || pages != 1 || committed != 1 || observations != 1 || work != 1 || retryRoots != 0 || source.requests[0] != 1 || source.requests[1] != 0 {
+		t.Fatalf("status=%s generation=%d cursor=%d pages=%d committed=%d observations=%d work=%d retries=%d requests=%v",
+			status, generation, cursor, pages, committed, observations, work, retryRoots, source.requests)
 	}
 }
 
@@ -331,7 +507,7 @@ func TestDeadOccurrencePreservesPersistedRetryDueTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	due := searchClock().Add(2 * time.Hour)
-	if _, err := db.Pool.Exec(ctx, `UPDATE catalog_search_runs SET status='partial',next_retry_at=$2 WHERE id=$1`, run.ID, due); err != nil {
+	if _, err := db.Pool.Exec(ctx, `UPDATE catalog_search_runs SET status='failed',next_retry_at=$2 WHERE id=$1`, run.ID, due); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Pool.Exec(ctx, `UPDATE sync_jobs SET status='dead',updated_at=$2 WHERE idempotency_key=$1`, searchRunKey("manual", run.OccurredAt, 0), searchClock()); err != nil {

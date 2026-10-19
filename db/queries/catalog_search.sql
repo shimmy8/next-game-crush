@@ -15,16 +15,21 @@ SELECT (NOT EXISTS(SELECT 1 FROM catalog_search_runs
 -- The workflow singleton lock serializes coordinators; the row lock also fences
 -- future page/run completion transactions using the same logical occurrence.
 -- name: ListTerminalSearchRuns :many
-SELECT r.*,(CASE WHEN root.status='dead' THEN root.updated_at ELSE page.updated_at END)::timestamptz AS job_updated_at FROM catalog_search_runs r
+SELECT r.*,COALESCE(
+    CASE WHEN root.status='dead' THEN root.updated_at END,
+    page.updated_at,
+    r.completed_at,
+    r.occurrence_at
+)::timestamptz AS job_updated_at FROM catalog_search_runs r
 LEFT JOIN sync_jobs root ON root.idempotency_key='catalog.search.run:v1:'||r.schedule_name||':'||
     extract(epoch FROM r.occurrence_at)::bigint::text||':retry:'||r.retry_generation::text
 LEFT JOIN LATERAL (
     SELECT updated_at FROM sync_jobs
-    WHERE kind='catalog.reconciliation.page' AND payload->>'run_id'=r.id::text
+    WHERE kind IN ('catalog.search.page','catalog.reconciliation.page') AND payload->>'run_id'=r.id::text
       AND (payload->>'page_generation')::integer=r.retry_generation AND status='dead'
     ORDER BY updated_at DESC LIMIT 1
 ) page ON true
-WHERE r.status IN ('queued','running','failed','partial')
+WHERE r.status IN ('queued','running','failed')
   AND (root.status='dead' OR page.updated_at IS NOT NULL)
 ORDER BY r.run_revision FOR UPDATE OF r;
 
@@ -33,11 +38,20 @@ UPDATE catalog_search_runs SET status='failed',safe_error='retry_exhausted',next
 WHERE id=$1 AND status IN ('queued','running','failed','partial');
 
 -- name: AdvanceSearchRunGeneration :one
-UPDATE catalog_search_runs SET retry_generation=retry_generation+1,status='queued',next_retry_at=NULL,
-    safe_error='',completed_at=NULL
-WHERE id=sqlc.arg(id) AND retry_generation=sqlc.arg(retry_generation)
-    AND status='failed' AND next_retry_at<=sqlc.arg(due_at)
-RETURNING *;
+WITH advanced AS (
+    UPDATE catalog_search_runs SET retry_generation=retry_generation+1,status='queued',next_retry_at=NULL,
+        safe_error='',completed_at=NULL
+    WHERE id=sqlc.arg(id) AND retry_generation=sqlc.arg(retry_generation)
+        AND status='failed' AND next_retry_at<=sqlc.arg(due_at)
+    RETURNING *
+), reset_feeds AS (
+    UPDATE catalog_search_feeds f SET status='queued',page_generation=a.retry_generation,
+        completed_at=NULL,natural_end=false,boundary_stop=false,safety_cap_reason='',safe_error=''
+    FROM advanced a
+    WHERE f.run_id=a.id AND f.status<>'complete'
+    RETURNING f.run_id
+)
+SELECT advanced.* FROM advanced;
 
 -- name: AllocateObservationOrdinal :one
 UPDATE catalog_search_runs SET observation_ordinal=observation_ordinal+1
@@ -55,6 +69,9 @@ ON CONFLICT(run_id,feed) DO NOTHING;
 
 -- name: GetSearchRun :one
 SELECT * FROM catalog_search_runs WHERE id=$1;
+
+-- name: LockSearchRun :one
+SELECT * FROM catalog_search_runs WHERE id=$1 FOR UPDATE;
 
 -- name: GetCommittedSearchPage :one
 SELECT * FROM catalog_search_pages

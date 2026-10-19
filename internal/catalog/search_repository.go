@@ -155,11 +155,12 @@ func (r *SearchRepository) finalizePageFailure(ctx context.Context, lease jobs.L
 			}
 			nextFeed := searchFeedOrder[index+1]
 			var status string
-			if err := tx.QueryRow(ctx, `SELECT status FROM catalog_search_feeds WHERE run_id=$1 AND feed=$2`, payload.RunID, nextFeed).Scan(&status); err != nil {
+			var cursor, generation int
+			if err := tx.QueryRow(ctx, `SELECT status,cursor_offset,page_generation FROM catalog_search_feeds WHERE run_id=$1 AND feed=$2`, payload.RunID, nextFeed).Scan(&status, &cursor, &generation); err != nil {
 				return err
 			}
 			if status == "queued" {
-				if _, err := jobs.EnqueueInTx(ctx, q, searchPageSpec(SearchPagePayload{Version: 1, RunID: payload.RunID, Feed: nextFeed})); err != nil {
+				if _, err := jobs.EnqueueInTx(ctx, q, searchPageSpec(SearchPagePayload{Version: 1, RunID: payload.RunID, Feed: nextFeed, Start: cursor, PageGeneration: generation})); err != nil {
 					return err
 				}
 			}
@@ -249,7 +250,14 @@ func (r *SearchRepository) rearmTerminalRuns(ctx context.Context, tx pgx.Tx, now
 		if err != nil {
 			return err
 		}
-		if err := enqueueSearchRun(ctx, q, run); err != nil {
+		if err := enqueueSearchRun(ctx, q, dbgen.CatalogSearchRun{
+			ID: run.ID, RunRevision: run.RunRevision, ScheduleName: run.ScheduleName,
+			OccurrenceAt: run.OccurrenceAt, Kind: run.Kind, ConfigSnapshot: run.ConfigSnapshot,
+			Status: run.Status, RetryGeneration: run.RetryGeneration, NextRetryAt: run.NextRetryAt,
+			ObservationOrdinal: run.ObservationOrdinal, NewAppCount: run.NewAppCount,
+			CreatedAt: run.CreatedAt, StartedAt: run.StartedAt, CompletedAt: run.CompletedAt,
+			LastSuccessfulAt: run.LastSuccessfulAt, SafeError: run.SafeError,
+		}); err != nil {
 			return err
 		}
 	}

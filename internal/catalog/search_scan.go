@@ -21,6 +21,8 @@ var searchFeedOrder = []steam.SearchFeed{
 	steam.FeedPopularUpcoming, steam.FeedPopularNew, steam.FeedRecent, steam.FeedComingSoon,
 }
 
+var errStaleSearchPage = errors.New("stale search page")
+
 type SearchScanService struct {
 	repo                             *SearchRepository
 	source                           steam.SearchCatalog
@@ -315,7 +317,19 @@ func (s *SearchScanService) ProcessRun(ctx context.Context, payload SearchRunPay
 	if err := s.repo.PrepareRun(ctx, run); err != nil {
 		return err
 	}
-	_, err = s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: run.ID, Feed: steam.FeedPopularUpcoming}))
+	var feed steam.SearchFeed
+	var cursor, generation int
+	err = s.repo.store.Pool.QueryRow(ctx, `SELECT feed,cursor_offset,page_generation FROM catalog_search_feeds
+		WHERE run_id=$1 AND status IN ('queued','running')
+		ORDER BY array_position(ARRAY['popular_upcoming','popular_new','recent','coming_soon']::text[],feed) LIMIT 1`, run.ID).
+		Scan(&feed, &cursor, &generation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: run.ID, Feed: feed, Start: cursor, PageGeneration: generation}))
 	return err
 }
 
@@ -324,10 +338,35 @@ func (s *SearchScanService) ProcessPage(ctx context.Context, payload SearchPageP
 		return errors.New("invalid search page payload")
 	}
 	pageKey := dbgen.GetCommittedSearchPageParams{RunID: catalogUUID(payload.RunID), Feed: string(payload.Feed), StartOffset: int32(payload.Start), PageGeneration: int32(payload.PageGeneration)}
-	if _, err := s.repo.store.Queries.GetCommittedSearchPage(ctx, pageKey); err == nil {
+	if manifest, err := s.repo.store.Queries.GetCommittedSearchPage(ctx, pageKey); err == nil {
+		var cursor, feedGeneration, runGeneration int
+		if stateErr := s.repo.store.Pool.QueryRow(ctx, `SELECT f.cursor_offset,f.page_generation,r.retry_generation
+			FROM catalog_search_feeds f JOIN catalog_search_runs r ON r.id=f.run_id
+			WHERE f.run_id=$1 AND f.feed=$2`, payload.RunID, payload.Feed).
+			Scan(&cursor, &feedGeneration, &runGeneration); stateErr != nil {
+			return stateErr
+		}
+		if cursor != int(manifest.NextOffset) || feedGeneration != payload.PageGeneration || runGeneration != payload.PageGeneration {
+			return nil
+		}
 		return s.afterPageCommit(ctx, payload.RunID, payload.Feed)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return err
+	}
+	var feedStatus, runStatus string
+	var cursor, feedGeneration, runGeneration int
+	if err := s.repo.store.Pool.QueryRow(ctx, `SELECT f.status,f.cursor_offset,f.page_generation,r.status,r.retry_generation
+		FROM catalog_search_feeds f JOIN catalog_search_runs r ON r.id=f.run_id
+		WHERE f.run_id=$1 AND f.feed=$2`, payload.RunID, payload.Feed).
+		Scan(&feedStatus, &cursor, &feedGeneration, &runStatus, &runGeneration); err != nil {
+		return err
+	}
+	if (feedStatus != "queued" && feedStatus != "running") || (runStatus != "queued" && runStatus != "running") ||
+		cursor != payload.Start || feedGeneration != payload.PageGeneration || feedGeneration != runGeneration {
+		// A prior occurrence generation already superseded this durable job.
+		// Completing it as an idempotent no-op prevents stale queue rows from
+		// consuming their retry budget while the current generation resumes.
+		return nil
 	}
 	runRow, err := s.repo.store.Queries.GetSearchRun(ctx, catalogUUID(payload.RunID))
 	if err != nil {
@@ -345,7 +384,9 @@ func (s *SearchScanService) ProcessPage(ctx context.Context, payload SearchPageP
 		return classifyCatalogSearchFailure(steam.ErrInvalidResponse)
 	}
 	run := searchRunRef(runRow)
-	if err := s.commitPage(ctx, run, payload.Feed, payload.Start, payload.PageGeneration, page, runConfig); err != nil {
+	if err := s.commitPage(ctx, run, payload.Feed, payload.Start, payload.PageGeneration, page, runConfig); errors.Is(err, errStaleSearchPage) {
+		return nil
+	} else if err != nil {
 		return err
 	}
 	return nil
@@ -358,7 +399,7 @@ func (s *SearchScanService) CommitPage(ctx context.Context, run RunRef, feed ste
 }
 
 func (s *SearchScanService) commitPage(ctx context.Context, run RunRef, feed steam.SearchFeed, start, generation int, page steam.SearchPage, cfg DiscoveryConfig) error {
-	if run.ID == uuid.Nil || run.Revision < 1 || !validSearchFeed(feed) || start < 0 || generation < 0 || page.Start != start || page.Count < 0 || len(page.Items) > page.Count || (page.HasMore && page.Count == 0) {
+	if run.ID == uuid.Nil || run.Revision < 1 || run.Generation < 0 || run.Generation != generation || !validSearchFeed(feed) || start < 0 || generation < 0 || page.Start != start || page.Count < 0 || len(page.Items) > page.Count || (page.HasMore && page.Count == 0) {
 		return errors.New("invalid search page")
 	}
 	now := s.now().UTC()
@@ -368,11 +409,15 @@ func (s *SearchScanService) commitPage(ctx context.Context, run RunRef, feed ste
 	}
 	defer tx.Rollback(ctx)
 	q := s.repo.store.Queries.WithTx(tx)
-	state, err := q.LockSearchFeed(ctx, dbgen.LockSearchFeedParams{RunID: catalogUUID(run.ID), Feed: string(feed)})
+	runRow, err := q.LockSearchRun(ctx, catalogUUID(run.ID))
 	if err != nil {
 		return err
 	}
-	runRow, err := q.GetSearchRun(ctx, catalogUUID(run.ID))
+	if runRow.RunRevision != run.Revision || int(runRow.RetryGeneration) != generation ||
+		(runRow.Status != "queued" && runRow.Status != "running") {
+		return errStaleSearchPage
+	}
+	state, err := q.LockSearchFeed(ctx, dbgen.LockSearchFeedParams{RunID: catalogUUID(run.ID), Feed: string(feed)})
 	if err != nil {
 		return err
 	}
@@ -566,10 +611,10 @@ func (s *SearchScanService) afterPageCommit(ctx context.Context, runID uuid.UUID
 	}
 	run := searchRunRef(runRow)
 	var status string
-	var cursor int
+	var cursor, pageGeneration int
 	var naturalEnd, monotonic, boundaryStop bool
 	var capReason string
-	if err := s.repo.store.Pool.QueryRow(ctx, `SELECT status,cursor_offset,natural_end,monotonic,boundary_stop,safety_cap_reason FROM catalog_search_feeds WHERE run_id=$1 AND feed=$2`, runID, feed).Scan(&status, &cursor, &naturalEnd, &monotonic, &boundaryStop, &capReason); err != nil {
+	if err := s.repo.store.Pool.QueryRow(ctx, `SELECT status,cursor_offset,page_generation,natural_end,monotonic,boundary_stop,safety_cap_reason FROM catalog_search_feeds WHERE run_id=$1 AND feed=$2`, runID, feed).Scan(&status, &cursor, &pageGeneration, &naturalEnd, &monotonic, &boundaryStop, &capReason); err != nil {
 		return err
 	}
 	// These candidates do not depend on Popular New/TBA authority, so they can
@@ -581,7 +626,7 @@ func (s *SearchScanService) afterPageCommit(ctx context.Context, runID uuid.UUID
 		}
 	}
 	if status == "running" {
-		if _, err = s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: runID, Feed: feed, Start: cursor, PageGeneration: 0})); err != nil {
+		if _, err = s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: runID, Feed: feed, Start: cursor, PageGeneration: pageGeneration})); err != nil {
 			return err
 		}
 		return nil
@@ -596,11 +641,12 @@ func (s *SearchScanService) afterPageCommit(ctx context.Context, runID uuid.UUID
 			continue
 		}
 		var nextStatus string
-		if err := s.repo.store.Pool.QueryRow(ctx, `SELECT status FROM catalog_search_feeds WHERE run_id=$1 AND feed=$2`, runID, searchFeedOrder[index+1]).Scan(&nextStatus); err != nil {
+		var nextCursor, nextGeneration int
+		if err := s.repo.store.Pool.QueryRow(ctx, `SELECT status,cursor_offset,page_generation FROM catalog_search_feeds WHERE run_id=$1 AND feed=$2`, runID, searchFeedOrder[index+1]).Scan(&nextStatus, &nextCursor, &nextGeneration); err != nil {
 			return err
 		}
 		if nextStatus == "queued" {
-			_, err = s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: runID, Feed: searchFeedOrder[index+1]}))
+			_, err = s.queue.Enqueue(ctx, searchPageSpec(SearchPagePayload{Version: 1, RunID: runID, Feed: searchFeedOrder[index+1], Start: nextCursor, PageGeneration: nextGeneration}))
 			if err != nil {
 				return err
 			}

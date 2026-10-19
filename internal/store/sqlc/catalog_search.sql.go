@@ -122,11 +122,20 @@ func (q *Queries) AcquireStoreReservation(ctx context.Context, arg AcquireStoreR
 }
 
 const advanceSearchRunGeneration = `-- name: AdvanceSearchRunGeneration :one
-UPDATE catalog_search_runs SET retry_generation=retry_generation+1,status='queued',next_retry_at=NULL,
-    safe_error='',completed_at=NULL
-WHERE id=$1 AND retry_generation=$2
-    AND status='failed' AND next_retry_at<=$3
-RETURNING id, run_revision, schedule_name, occurrence_at, kind, config_snapshot, status, retry_generation, next_retry_at, observation_ordinal, new_app_count, created_at, started_at, completed_at, last_successful_at, safe_error
+WITH advanced AS (
+    UPDATE catalog_search_runs SET retry_generation=retry_generation+1,status='queued',next_retry_at=NULL,
+        safe_error='',completed_at=NULL
+    WHERE id=$1 AND retry_generation=$2
+        AND status='failed' AND next_retry_at<=$3
+    RETURNING id, run_revision, schedule_name, occurrence_at, kind, config_snapshot, status, retry_generation, next_retry_at, observation_ordinal, new_app_count, created_at, started_at, completed_at, last_successful_at, safe_error
+), reset_feeds AS (
+    UPDATE catalog_search_feeds f SET status='queued',page_generation=a.retry_generation,
+        completed_at=NULL,natural_end=false,boundary_stop=false,safety_cap_reason='',safe_error=''
+    FROM advanced a
+    WHERE f.run_id=a.id AND f.status<>'complete'
+    RETURNING f.run_id
+)
+SELECT advanced.id, advanced.run_revision, advanced.schedule_name, advanced.occurrence_at, advanced.kind, advanced.config_snapshot, advanced.status, advanced.retry_generation, advanced.next_retry_at, advanced.observation_ordinal, advanced.new_app_count, advanced.created_at, advanced.started_at, advanced.completed_at, advanced.last_successful_at, advanced.safe_error FROM advanced
 `
 
 type AdvanceSearchRunGenerationParams struct {
@@ -135,9 +144,28 @@ type AdvanceSearchRunGenerationParams struct {
 	DueAt           pgtype.Timestamptz `json:"due_at"`
 }
 
-func (q *Queries) AdvanceSearchRunGeneration(ctx context.Context, arg AdvanceSearchRunGenerationParams) (CatalogSearchRun, error) {
+type AdvanceSearchRunGenerationRow struct {
+	ID                 pgtype.UUID        `json:"id"`
+	RunRevision        int64              `json:"run_revision"`
+	ScheduleName       string             `json:"schedule_name"`
+	OccurrenceAt       pgtype.Timestamptz `json:"occurrence_at"`
+	Kind               string             `json:"kind"`
+	ConfigSnapshot     []byte             `json:"config_snapshot"`
+	Status             string             `json:"status"`
+	RetryGeneration    int32              `json:"retry_generation"`
+	NextRetryAt        pgtype.Timestamptz `json:"next_retry_at"`
+	ObservationOrdinal int64              `json:"observation_ordinal"`
+	NewAppCount        int32              `json:"new_app_count"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	StartedAt          pgtype.Timestamptz `json:"started_at"`
+	CompletedAt        pgtype.Timestamptz `json:"completed_at"`
+	LastSuccessfulAt   pgtype.Timestamptz `json:"last_successful_at"`
+	SafeError          string             `json:"safe_error"`
+}
+
+func (q *Queries) AdvanceSearchRunGeneration(ctx context.Context, arg AdvanceSearchRunGenerationParams) (AdvanceSearchRunGenerationRow, error) {
 	row := q.db.QueryRow(ctx, advanceSearchRunGeneration, arg.ID, arg.RetryGeneration, arg.DueAt)
-	var i CatalogSearchRun
+	var i AdvanceSearchRunGenerationRow
 	err := row.Scan(
 		&i.ID,
 		&i.RunRevision,
@@ -937,16 +965,21 @@ func (q *Queries) ListDueEligibilityChanges(ctx context.Context, arg ListDueElig
 }
 
 const listTerminalSearchRuns = `-- name: ListTerminalSearchRuns :many
-SELECT r.id, r.run_revision, r.schedule_name, r.occurrence_at, r.kind, r.config_snapshot, r.status, r.retry_generation, r.next_retry_at, r.observation_ordinal, r.new_app_count, r.created_at, r.started_at, r.completed_at, r.last_successful_at, r.safe_error,(CASE WHEN root.status='dead' THEN root.updated_at ELSE page.updated_at END)::timestamptz AS job_updated_at FROM catalog_search_runs r
+SELECT r.id, r.run_revision, r.schedule_name, r.occurrence_at, r.kind, r.config_snapshot, r.status, r.retry_generation, r.next_retry_at, r.observation_ordinal, r.new_app_count, r.created_at, r.started_at, r.completed_at, r.last_successful_at, r.safe_error,COALESCE(
+    CASE WHEN root.status='dead' THEN root.updated_at END,
+    page.updated_at,
+    r.completed_at,
+    r.occurrence_at
+)::timestamptz AS job_updated_at FROM catalog_search_runs r
 LEFT JOIN sync_jobs root ON root.idempotency_key='catalog.search.run:v1:'||r.schedule_name||':'||
     extract(epoch FROM r.occurrence_at)::bigint::text||':retry:'||r.retry_generation::text
 LEFT JOIN LATERAL (
     SELECT updated_at FROM sync_jobs
-    WHERE kind='catalog.reconciliation.page' AND payload->>'run_id'=r.id::text
+    WHERE kind IN ('catalog.search.page','catalog.reconciliation.page') AND payload->>'run_id'=r.id::text
       AND (payload->>'page_generation')::integer=r.retry_generation AND status='dead'
     ORDER BY updated_at DESC LIMIT 1
 ) page ON true
-WHERE r.status IN ('queued','running','failed','partial')
+WHERE r.status IN ('queued','running','failed')
   AND (root.status='dead' OR page.updated_at IS NOT NULL)
 ORDER BY r.run_revision FOR UPDATE OF r
 `
@@ -1188,6 +1221,34 @@ func (q *Queries) LockSearchQualificationReservation(ctx context.Context, steamA
 		&i.UpdatedAt,
 		&i.BudgetHour,
 		&i.BudgetIdentityHash,
+	)
+	return i, err
+}
+
+const lockSearchRun = `-- name: LockSearchRun :one
+SELECT id, run_revision, schedule_name, occurrence_at, kind, config_snapshot, status, retry_generation, next_retry_at, observation_ordinal, new_app_count, created_at, started_at, completed_at, last_successful_at, safe_error FROM catalog_search_runs WHERE id=$1 FOR UPDATE
+`
+
+func (q *Queries) LockSearchRun(ctx context.Context, id pgtype.UUID) (CatalogSearchRun, error) {
+	row := q.db.QueryRow(ctx, lockSearchRun, id)
+	var i CatalogSearchRun
+	err := row.Scan(
+		&i.ID,
+		&i.RunRevision,
+		&i.ScheduleName,
+		&i.OccurrenceAt,
+		&i.Kind,
+		&i.ConfigSnapshot,
+		&i.Status,
+		&i.RetryGeneration,
+		&i.NextRetryAt,
+		&i.ObservationOrdinal,
+		&i.NewAppCount,
+		&i.CreatedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.LastSuccessfulAt,
+		&i.SafeError,
 	)
 	return i, err
 }
