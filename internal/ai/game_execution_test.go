@@ -83,9 +83,9 @@ func TestCatalogCachedFeaturesStillRequireExecutionTimeAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.SetQueue(queue)
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Second).Add(123456789 * time.Nanosecond)
 	service.now = func() time.Time { return now }
-	admission := &cacheAdmissionSequence{retryAt: now.Add(time.Hour)}
+	admission := &cacheAdmissionSequence{retryAt: now.Add(time.Hour).Truncate(time.Microsecond)}
 	service.SetCatalogFeatureAdmission(admission)
 
 	gameID := uuid.New()
