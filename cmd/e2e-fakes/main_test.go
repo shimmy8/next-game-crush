@@ -28,6 +28,86 @@ func TestMutableFixtureControlsAreUnavailableOutsideHarness(t *testing.T) {
 	}
 }
 
+func TestProfileSummaryFixtureCanDelayReleaseAndFail(t *testing.T) {
+	handler := newE2EFakeHandler(true)
+	body := `{"text":{"format":{"name":"profile_summary_v5"}},"input":"{\"evidence\":[{\"key\":\"played\",\"value\":\"Fixture Short Story\"}]}"}`
+	postNoContent(t, handler, "/__test/openai-profile-mode?mode=delayed")
+	done := make(chan int, 1)
+	go func() { done <- fixtureJSONRequest(handler, "/v1/responses", body).Code }()
+
+	var counters struct {
+		ProfileSummaries int    `json:"profileSummaries"`
+		Mode             string `json:"profileSummaryMode"`
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		decodeGET(t, handler, "/__test/catalog-counters", &counters)
+		if counters.ProfileSummaries == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if counters.ProfileSummaries != 1 || counters.Mode != "delayed" {
+		t.Fatalf("delayed counters = %+v", counters)
+	}
+	select {
+	case <-done:
+		t.Fatal("delayed summary returned before release")
+	default:
+	}
+
+	postNoContent(t, handler, "/__test/openai-profile-mode?mode=healthy")
+	select {
+	case status := <-done:
+		if status != http.StatusOK {
+			t.Fatalf("released summary status = %d", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("released summary did not resume")
+	}
+
+	postNoContent(t, handler, "/__test/openai-profile-mode?mode=provider_unavailable")
+	if response := fixtureJSONRequest(handler, "/v1/responses", body); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("provider unavailable status = %d", response.Code)
+	}
+}
+
+func TestSteamActivityFixtureCanHoldAnActiveRefresh(t *testing.T) {
+	handler := newE2EFakeHandler(true)
+	postNoContent(t, handler, "/__test/steam-activity-mode?mode=delayed")
+	done := make(chan int, 1)
+	go func() { done <- fixtureRequest(handler, http.MethodGet, "/IPlayerService/GetOwnedGames/v1/").Code }()
+	var counters struct {
+		ActivityRequests int    `json:"activityRequests"`
+		Mode             string `json:"activityMode"`
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		decodeGET(t, handler, "/__test/catalog-counters", &counters)
+		if counters.ActivityRequests == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if counters.ActivityRequests != 1 || counters.Mode != "delayed" {
+		t.Fatalf("activity counters = %+v", counters)
+	}
+	select {
+	case <-done:
+		t.Fatal("activity request returned before release")
+	default:
+	}
+	postNoContent(t, handler, "/__test/steam-activity-mode?mode=healthy")
+	select {
+	case status := <-done:
+		if status != http.StatusOK {
+			t.Fatalf("released activity status = %d", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("released activity request did not resume")
+	}
+}
+
 func TestCatalogSearchFixturesCoverFourFeedsAndReviewTransition(t *testing.T) {
 	fixtureDay := time.Date(2032, time.March, 15, 0, 0, 0, 0, time.UTC)
 	handler := newE2EFakeHandlerAt(true, fixtureDay)

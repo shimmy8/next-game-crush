@@ -50,6 +50,12 @@ type catalogFixtureState struct {
 	activeSearch       int
 	maxActiveSearch    int
 	searchRelease      chan struct{}
+	profileSummaryMode string
+	profileSummaryHits int
+	profileRelease     chan struct{}
+	activityMode       string
+	activityHits       int
+	activityRelease    chan struct{}
 }
 
 func newCatalogFixtureState(now time.Time) *catalogFixtureState {
@@ -73,6 +79,8 @@ func newCatalogFixtureState(now time.Time) *catalogFixtureState {
 		searchRequests:     make(map[string]int),
 		appDetailsRequests: make(map[int64]int),
 		aiByApp:            make(map[int64]int),
+		profileSummaryMode: "healthy",
+		activityMode:       "healthy",
 	}
 }
 
@@ -83,6 +91,14 @@ func (s *catalogFixtureState) reset() {
 		close(s.searchRelease)
 		s.searchRelease = nil
 	}
+	if s.profileRelease != nil {
+		close(s.profileRelease)
+		s.profileRelease = nil
+	}
+	if s.activityRelease != nil {
+		close(s.activityRelease)
+		s.activityRelease = nil
+	}
 	s.searchMode = "healthy"
 	s.reviewMode = "initial"
 	s.searchRequests = make(map[string]int)
@@ -92,6 +108,10 @@ func (s *catalogFixtureState) reset() {
 	s.parserBrokenCalls = 0
 	s.activeSearch = 0
 	s.maxActiveSearch = 0
+	s.profileSummaryMode = "healthy"
+	s.profileSummaryHits = 0
+	s.activityMode = "healthy"
+	s.activityHits = 0
 }
 
 func newE2EFakeHandler(testHarness bool) http.Handler {
@@ -180,7 +200,7 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		for appID, count := range catalogFixture.aiByApp {
 			aiByApp[strconv.FormatInt(appID, 10)] = count
 		}
-		writeJSON(w, map[string]any{"fixtureDate": catalogFixture.fixtureDay.Format(time.DateOnly), "search": search, "appdetails": appDetails, "ai": catalogFixture.aiRequests, "aiByApp": aiByApp, "appList": catalogRequests.Load(), "activeSearch": catalogFixture.activeSearch, "maxActiveSearch": catalogFixture.maxActiveSearch, "anchors": map[string]int64{"daySeven": catalogFixture.daySevenAppID, "restart": catalogFixture.restartAppID, "duplicate": catalogFixture.duplicateAppID}})
+		writeJSON(w, map[string]any{"fixtureDate": catalogFixture.fixtureDay.Format(time.DateOnly), "search": search, "appdetails": appDetails, "ai": catalogFixture.aiRequests, "aiByApp": aiByApp, "profileSummaries": catalogFixture.profileSummaryHits, "profileSummaryMode": catalogFixture.profileSummaryMode, "activityRequests": catalogFixture.activityHits, "activityMode": catalogFixture.activityMode, "appList": catalogRequests.Load(), "activeSearch": catalogFixture.activeSearch, "maxActiveSearch": catalogFixture.maxActiveSearch, "anchors": map[string]int64{"daySeven": catalogFixture.daySevenAppID, "restart": catalogFixture.restartAppID, "duplicate": catalogFixture.duplicateAppID}})
 	})
 	mux.HandleFunc("/__test/openai-explanation-mode", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -202,6 +222,50 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 			http.Error(w, "unknown fixture mode", http.StatusBadRequest)
 			return
 		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/__test/openai-profile-mode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		mode := r.URL.Query().Get("mode")
+		if mode != "healthy" && mode != "delayed" && mode != "provider_unavailable" {
+			http.Error(w, "unknown fixture mode", http.StatusBadRequest)
+			return
+		}
+		catalogFixture.mu.Lock()
+		if catalogFixture.profileSummaryMode == "delayed" && mode != "delayed" && catalogFixture.profileRelease != nil {
+			close(catalogFixture.profileRelease)
+			catalogFixture.profileRelease = nil
+		}
+		if mode == "delayed" && catalogFixture.profileSummaryMode != "delayed" {
+			catalogFixture.profileRelease = make(chan struct{})
+		}
+		catalogFixture.profileSummaryMode = mode
+		catalogFixture.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/__test/steam-activity-mode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		mode := r.URL.Query().Get("mode")
+		if mode != "healthy" && mode != "delayed" {
+			http.Error(w, "unknown fixture mode", http.StatusBadRequest)
+			return
+		}
+		catalogFixture.mu.Lock()
+		if catalogFixture.activityMode == "delayed" && mode != "delayed" && catalogFixture.activityRelease != nil {
+			close(catalogFixture.activityRelease)
+			catalogFixture.activityRelease = nil
+		}
+		if mode == "delayed" && catalogFixture.activityMode != "delayed" {
+			catalogFixture.activityRelease = make(chan struct{})
+		}
+		catalogFixture.activityMode = mode
+		catalogFixture.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/__test/openai-achievement-mode", func(w http.ResponseWriter, r *http.Request) {
@@ -292,6 +356,14 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		}}}})
 	})
 	mux.HandleFunc("/IPlayerService/GetOwnedGames/v1/", func(w http.ResponseWriter, _ *http.Request) {
+		catalogFixture.mu.Lock()
+		catalogFixture.activityHits++
+		mode := catalogFixture.activityMode
+		release := catalogFixture.activityRelease
+		catalogFixture.mu.Unlock()
+		if mode == "delayed" && release != nil {
+			<-release
+		}
 		if steamPrivacy.Load() == 2 {
 			writeJSON(w, map[string]any{"response": map[string]any{"game_count": 0, "games": []any{}}})
 			return
@@ -601,6 +673,18 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		case "game_features_v1":
 			out = map[string]any{"themes": []string{"exploration"}, "mechanics": []string{"cooperation"}, "modes": []string{"single-player"}, "tone": []string{"hopeful"}, "evidence_keys": []string{key}}
 		case "profile_summary_v5":
+			catalogFixture.mu.Lock()
+			catalogFixture.profileSummaryHits++
+			mode := catalogFixture.profileSummaryMode
+			release := catalogFixture.profileRelease
+			catalogFixture.mu.Unlock()
+			if mode == "delayed" && release != nil {
+				<-release
+			}
+			if mode == "provider_unavailable" {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
 			out = map[string]any{"summary": "Fixture Short Story — сильный исторический сигнал: игра пройдена, хотя времени в ней немного и недавней активности нет. Fixture Endless Realm отражает большой накопленный опыт и отдельную активность за последние две недели. Эти признаки учитываются независимо: прохождение короткой игры не слабее одних только часов в долгой игре. Данных пока немного, поэтому новые реакции помогут точнее определить темы и темп.", "preferences": []string{"Завершённые сюжетные игры и исследование"}, "avoidances": []string{}, "uncertainty": "Историческое прохождение не означает недавний интерес.", "evidence_keys": []string{key}}
 		case "recommendation-explanation-v2":
 			switch explanationMode.Load() {
