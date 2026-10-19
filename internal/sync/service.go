@@ -23,6 +23,24 @@ import (
 
 const PayloadVersion = 1
 
+const refreshFreshnessWindow = 24 * time.Hour
+
+type RefreshReason string
+
+const (
+	RefreshReasonMissing RefreshReason = "missing"
+	RefreshReasonStale   RefreshReason = "stale"
+	RefreshReasonFresh   RefreshReason = "fresh"
+	RefreshReasonActive  RefreshReason = "active"
+)
+
+type RefreshDecision struct {
+	Enqueued         bool          `json:"enqueued"`
+	Reason           RefreshReason `json:"reason"`
+	JobID            *uuid.UUID    `json:"jobId,omitempty"`
+	LastSuccessfulAt *time.Time    `json:"lastSuccessfulAt,omitempty"`
+}
+
 var (
 	ErrPreflightBlocked = errors.New("Steam synchronization blocked by privacy preflight")
 	ErrPreflightFailed  = errors.New("Steam privacy preflight failed")
@@ -136,35 +154,87 @@ func (s *Service) Start(ctx context.Context, userID uuid.UUID) (uuid.UUID, error
 	if !preflight.CanSync {
 		return uuid.Nil, ErrPreflightBlocked
 	}
+	jobID, _, err := s.enqueueSync(ctx, userID)
+	return jobID, err
+}
+
+// RefreshIfStale starts a Steam synchronization only when there is no active
+// workflow and the most recent successful root workflow is at least 24 hours
+// old. The server clock is authoritative for the freshness boundary.
+func (s *Service) RefreshIfStale(ctx context.Context, userID uuid.UUID) (RefreshDecision, error) {
+	if userID == uuid.Nil {
+		return RefreshDecision{}, errors.New("user ID is required")
+	}
+	active, err := s.store.Queries.GetActiveRootSteamSync(ctx, uuidPG(userID))
+	if err == nil {
+		jobID := uuid.UUID(active.ID.Bytes)
+		return RefreshDecision{Reason: RefreshReasonActive, JobID: &jobID}, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return RefreshDecision{}, fmt.Errorf("find active sync: %w", err)
+	}
+
+	reason := RefreshReasonMissing
+	var lastSuccessfulAt *time.Time
+	latest, err := s.store.Queries.GetLatestSucceededRootSteamSync(ctx, uuidPG(userID))
+	if err == nil {
+		last := latest.UpdatedAt.Time
+		lastSuccessfulAt = &last
+		if last.After(s.now().Add(-refreshFreshnessWindow)) {
+			return RefreshDecision{Reason: RefreshReasonFresh, LastSuccessfulAt: lastSuccessfulAt}, nil
+		}
+		reason = RefreshReasonStale
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return RefreshDecision{}, fmt.Errorf("load latest successful sync: %w", err)
+	}
+
+	preflight, err := s.Preflight(ctx, userID)
+	if err != nil {
+		return RefreshDecision{}, err
+	}
+	if !preflight.CanSync {
+		return RefreshDecision{}, ErrPreflightBlocked
+	}
+	jobID, created, err := s.enqueueSync(ctx, userID)
+	if err != nil {
+		return RefreshDecision{}, err
+	}
+	if !created {
+		return RefreshDecision{Reason: RefreshReasonActive, JobID: &jobID, LastSuccessfulAt: lastSuccessfulAt}, nil
+	}
+	return RefreshDecision{Enqueued: true, Reason: reason, JobID: &jobID, LastSuccessfulAt: lastSuccessfulAt}, nil
+}
+
+func (s *Service) enqueueSync(ctx context.Context, userID uuid.UUID) (uuid.UUID, bool, error) {
 	tx, err := s.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("begin sync workflow: %w", err)
+		return uuid.Nil, false, fmt.Errorf("begin sync workflow: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "steam.sync:"+userID.String()); err != nil {
-		return uuid.Nil, fmt.Errorf("lock sync workflow: %w", err)
+		return uuid.Nil, false, fmt.Errorf("lock sync workflow: %w", err)
 	}
 	var existing uuid.UUID
-	err = tx.QueryRow(ctx, `SELECT id FROM sync_jobs WHERE kind='steam.sync' AND payload->>'user_id'=$1 AND status IN ('queued','running','waiting','retryable') ORDER BY created_at DESC LIMIT 1`, userID.String()).Scan(&existing)
+	err = tx.QueryRow(ctx, `SELECT id FROM sync_jobs WHERE kind='steam.sync' AND user_id=$1 AND parent_job_id IS NULL AND status IN ('queued','running','waiting','retryable') ORDER BY created_at,id LIMIT 1`, userID).Scan(&existing)
 	if err == nil {
 		if err := tx.Commit(ctx); err != nil {
-			return uuid.Nil, err
+			return uuid.Nil, false, err
 		}
-		return existing, nil
+		return existing, false, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, fmt.Errorf("find active sync: %w", err)
+		return uuid.Nil, false, fmt.Errorf("find active sync: %w", err)
 	}
 	payload, _ := json.Marshal(Payload{Version: PayloadVersion, UserID: userID})
 	id := uuid.New()
 	key := fmt.Sprintf("steam.sync:%s:%s", userID, id)
 	if _, err := tx.Exec(ctx, `INSERT INTO sync_jobs (id,kind,idempotency_key,payload,max_attempts,stage,required,user_id,priority) VALUES ($1,'steam.sync',$2,$3,5,'steam',true,$4,100)`, id, key, payload, userID); err != nil {
-		return uuid.Nil, fmt.Errorf("enqueue sync workflow: %w", err)
+		return uuid.Nil, false, fmt.Errorf("enqueue sync workflow: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return uuid.Nil, fmt.Errorf("commit sync workflow: %w", err)
+		return uuid.Nil, false, fmt.Errorf("commit sync workflow: %w", err)
 	}
-	return id, nil
+	return id, true, nil
 }
 
 func (s *Service) Preflight(ctx context.Context, userID uuid.UUID) (PreflightResult, error) {

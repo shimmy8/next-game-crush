@@ -48,6 +48,7 @@ func TestDemoSessionIsForbiddenFromEveryBrowserMutation(t *testing.T) {
 	for _, test := range []struct{ method, path, body string }{
 		{http.MethodPost, "/api/sync/preflight", ""},
 		{http.MethodPost, "/api/sync", ""},
+		{http.MethodPost, "/api/sync/refresh-if-stale", ""},
 		{http.MethodDelete, "/api/preference-adjustments/" + id, ""},
 		{http.MethodPost, "/api/recommendations/" + id + "/feedback", `{"action":"like","idempotencyKey":"demo"}`},
 		{http.MethodPost, "/api/recommendations/" + id + "/reminder", `{"idempotencyKey":"demo"}`},

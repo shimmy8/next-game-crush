@@ -107,6 +107,21 @@ func TestLoggerAllowsSafeAIReasons(t *testing.T) {
 	}
 }
 
+func TestLoggerAllowsSafeRefreshReasons(t *testing.T) {
+	for _, reason := range []Reason{ReasonRefreshMissing, ReasonRefreshStale, ReasonRefreshFresh, ReasonRefreshActive} {
+		t.Run(string(reason), func(t *testing.T) {
+			var output bytes.Buffer
+			logger := New(slog.New(slog.NewJSONHandler(&output, nil)))
+			logger.SyncRequest(context.Background(), SyncRequestEvent{Outcome: RequestAccepted, HTTPStatus: 202, Reason: reason})
+
+			event := decodeEvents(t, output.String())[0]
+			if got := event["reason"]; got != string(reason) {
+				t.Fatalf("reason = %v, want %q", got, reason)
+			}
+		})
+	}
+}
+
 func TestAchievementClassificationJobObservabilityIsAllowlistedAndSanitized(t *testing.T) {
 	var output bytes.Buffer
 	logger := New(slog.New(slog.NewJSONHandler(&output, nil)))

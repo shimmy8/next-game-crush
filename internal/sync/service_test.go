@@ -692,6 +692,221 @@ func TestStartRequiresPreflight(t *testing.T) {
 	}
 }
 
+func TestRefreshIfStaleAtTwentyThreeFiftyNineIsFresh(t *testing.T) {
+	service, fake, db, userID := newTestService(t)
+	now := service.now()
+	lastSuccessfulAt := now.Add(-23*time.Hour - 59*time.Minute)
+	insertSucceededRootSync(t, db, userID, lastSuccessfulAt)
+
+	decision, err := service.RefreshIfStale(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Enqueued || decision.Reason != RefreshReasonFresh || decision.JobID != nil || decision.LastSuccessfulAt == nil || !decision.LastSuccessfulAt.Equal(lastSuccessfulAt) {
+		t.Fatalf("decision = %#v", decision)
+	}
+	if fake.summaryCalls != 0 || fake.probeOwnedCalls != 0 {
+		t.Fatalf("fresh entry performed preflight: summary/probe=%d/%d", fake.summaryCalls, fake.probeOwnedCalls)
+	}
+}
+
+func TestRefreshIfStaleAtExactlyTwentyFourHoursEnqueues(t *testing.T) {
+	service, _, db, userID := newTestService(t)
+	now := service.now()
+	lastSuccessfulAt := now.Add(-24 * time.Hour)
+	insertSucceededRootSync(t, db, userID, lastSuccessfulAt)
+
+	decision, err := service.RefreshIfStale(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Enqueued || decision.Reason != RefreshReasonStale || decision.JobID == nil || decision.LastSuccessfulAt == nil || !decision.LastSuccessfulAt.Equal(lastSuccessfulAt) {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
+func TestRefreshIfStaleWithoutSuccessEnqueues(t *testing.T) {
+	service, _, _, userID := newTestService(t)
+	decision, err := service.RefreshIfStale(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Enqueued || decision.Reason != RefreshReasonMissing || decision.JobID == nil || decision.LastSuccessfulAt != nil {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
+func TestRefreshIfStaleReusesActiveWorkflow(t *testing.T) {
+	service, fake, _, userID := newTestService(t)
+	jobID, err := service.Start(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := service.RefreshIfStale(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Enqueued || decision.Reason != RefreshReasonActive || decision.JobID == nil || *decision.JobID != jobID || decision.LastSuccessfulAt != nil {
+		t.Fatalf("decision = %#v", decision)
+	}
+	if fake.summaryCalls != 1 || fake.probeOwnedCalls != 1 {
+		t.Fatalf("active refresh repeated preflight: summary/probe=%d/%d", fake.summaryCalls, fake.probeOwnedCalls)
+	}
+}
+
+func TestManualStartIgnoresFreshness(t *testing.T) {
+	service, fake, db, userID := newTestService(t)
+	insertSucceededRootSync(t, db, userID, service.now())
+	jobID, err := service.Start(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobID == uuid.Nil {
+		t.Fatal("manual Start returned nil job ID")
+	}
+	if fake.summaryCalls != 1 || fake.probeOwnedCalls != 1 {
+		t.Fatalf("manual Start preflight calls=%d/%d", fake.summaryCalls, fake.probeOwnedCalls)
+	}
+}
+
+func TestRefreshIfStaleBoundaryConcurrentTabsAndPreflightFailure(t *testing.T) {
+	t.Run("concurrent tabs coalesce after preflight", func(t *testing.T) {
+		service, _, db, userID := newTestService(t)
+		before := seedSavedProfileAndRecommendation(t, db, userID)
+		insertSucceededRootSync(t, db, userID, service.now().Add(-24*time.Hour))
+		const callers = 8
+		results := make(chan RefreshDecision, callers)
+		errors := make(chan error, callers)
+		var group sync.WaitGroup
+		for range callers {
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				decision, err := service.RefreshIfStale(context.Background(), userID)
+				results <- decision
+				errors <- err
+			}()
+		}
+		group.Wait()
+		close(results)
+		close(errors)
+		for err := range errors {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		var shared uuid.UUID
+		created := 0
+		for decision := range results {
+			if decision.JobID == nil || decision.Reason != RefreshReasonStale && decision.Reason != RefreshReasonActive {
+				t.Fatalf("decision = %#v", decision)
+			}
+			if shared == uuid.Nil {
+				shared = *decision.JobID
+			} else if *decision.JobID != shared {
+				t.Fatalf("job IDs differ: %s != %s", *decision.JobID, shared)
+			}
+			if decision.Enqueued {
+				created++
+			}
+		}
+		if created != 1 {
+			t.Fatalf("created decisions = %d, want 1", created)
+		}
+		var jobs int
+		if err := db.Pool.QueryRow(context.Background(), `SELECT count(*) FROM sync_jobs WHERE user_id=$1 AND kind='steam.sync' AND status IN ('queued','running','retryable','waiting')`, userID).Scan(&jobs); err != nil {
+			t.Fatal(err)
+		}
+		if jobs != 1 {
+			t.Fatalf("active root jobs = %d, want 1", jobs)
+		}
+		if after := readSavedProfileAndRecommendation(t, db, userID); after != before {
+			t.Fatalf("application-entry refresh changed saved reads: before=%#v after=%#v", before, after)
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		set  func(*fakeSteam)
+		want error
+	}{
+		{name: "blocked", set: func(fake *fakeSteam) { fake.summary.Visibility = steam.VisibilityPrivate }, want: ErrPreflightBlocked},
+		{name: "failed", set: func(fake *fakeSteam) { fake.summaryErr = errors.New("private-upstream-canary") }, want: ErrPreflightFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, fake, db, userID := newTestService(t)
+			before := seedSavedProfileAndRecommendation(t, db, userID)
+			test.set(fake)
+			if _, err := service.RefreshIfStale(context.Background(), userID); !errors.Is(err, test.want) {
+				t.Fatalf("RefreshIfStale error = %v, want %v", err, test.want)
+			}
+			var jobs int
+			if err := db.Pool.QueryRow(context.Background(), `SELECT count(*) FROM sync_jobs WHERE user_id=$1 AND kind='steam.sync'`, userID).Scan(&jobs); err != nil {
+				t.Fatal(err)
+			}
+			if jobs != 0 {
+				t.Fatalf("failed preflight enqueued %d jobs", jobs)
+			}
+			if after := readSavedProfileAndRecommendation(t, db, userID); after != before {
+				t.Fatalf("failed preflight changed saved reads: before=%#v after=%#v", before, after)
+			}
+		})
+	}
+}
+
+type savedReadSnapshot struct {
+	ProfileID        uuid.UUID
+	PublicationState string
+	RecommendationID uuid.UUID
+	Score            float64
+}
+
+func seedSavedProfileAndRecommendation(t *testing.T, db *store.Store, userID uuid.UUID) savedReadSnapshot {
+	t.Helper()
+	gameID, profileID, recommendationID := uuid.New(), uuid.New(), uuid.New()
+	if _, err := db.Pool.Exec(context.Background(), `INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at)
+		VALUES($1,909090,'Saved recommendation','test',now())`, gameID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(context.Background(), `INSERT INTO preference_profiles(id,user_id,version,publication_state)
+		VALUES($1,$2,1,'failed')`, profileID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(context.Background(), `INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score)
+		VALUES($1,$2,$3,$4,'saved-read-fixture',87.5)`, recommendationID, userID, gameID, profileID); err != nil {
+		t.Fatal(err)
+	}
+	return readSavedProfileAndRecommendation(t, db, userID)
+}
+
+func readSavedProfileAndRecommendation(t *testing.T, db *store.Store, userID uuid.UUID) savedReadSnapshot {
+	t.Helper()
+	var snapshot savedReadSnapshot
+	if err := db.Pool.QueryRow(context.Background(), `SELECT p.id,p.publication_state,r.id,r.score
+		FROM preference_profiles p JOIN recommendations r ON r.profile_id=p.id
+		WHERE p.user_id=$1 AND r.user_id=$1 AND r.algorithm_version='saved-read-fixture'`, userID).
+		Scan(&snapshot.ProfileID, &snapshot.PublicationState, &snapshot.RecommendationID, &snapshot.Score); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func insertSucceededRootSync(t *testing.T, db *store.Store, userID uuid.UUID, updatedAt time.Time) uuid.UUID {
+	t.Helper()
+	jobID := uuid.New()
+	payload, err := json.Marshal(Payload{Version: PayloadVersion, UserID: userID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(context.Background(), `INSERT INTO sync_jobs
+		(id,kind,idempotency_key,payload,status,stage,required,user_id,priority,lane,created_at,updated_at)
+		VALUES($1,'steam.sync',$2,$3,'succeeded','steam',true,$4,100,'interactive',$5,$5)`,
+		jobID, "succeeded-sync:"+jobID.String(), payload, userID, updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	return jobID
+}
+
 func TestSyncAddsWishlistGameToCatalog(t *testing.T) {
 	service, _, db, userID := newTestService(t)
 	if err := service.Run(context.Background(), userID); err != nil {

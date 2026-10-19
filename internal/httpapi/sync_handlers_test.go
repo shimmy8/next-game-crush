@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"next-game-crush/internal/auth"
@@ -330,17 +331,159 @@ func TestDirectSyncStartMapsBlockedPreflight(t *testing.T) {
 	}
 }
 
+func TestSyncRefreshContract(t *testing.T) {
+	authService, repo := handlerService(t, "http://localhost:8080")
+	session := repo.addSession()
+	jobID := uuid.New()
+	lastSuccessfulAt := time.Date(2026, 10, 18, 12, 30, 0, 0, time.UTC)
+
+	for _, test := range []struct {
+		name       string
+		decision   syncservice.RefreshDecision
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name: "fresh",
+			decision: syncservice.RefreshDecision{
+				Reason: syncservice.RefreshReasonFresh, LastSuccessfulAt: &lastSuccessfulAt,
+			},
+			wantStatus: http.StatusOK,
+			wantBody:   `{"enqueued":false,"reason":"fresh","lastSuccessfulAt":"2026-10-18T12:30:00Z"}`,
+		},
+		{
+			name: "created stale",
+			decision: syncservice.RefreshDecision{
+				Enqueued: true, Reason: syncservice.RefreshReasonStale, JobID: &jobID, LastSuccessfulAt: &lastSuccessfulAt,
+			},
+			wantStatus: http.StatusAccepted,
+			wantBody:   `{"enqueued":true,"reason":"stale","jobId":"` + jobID.String() + `","lastSuccessfulAt":"2026-10-18T12:30:00Z"}`,
+		},
+		{
+			name:       "active",
+			decision:   syncservice.RefreshDecision{Reason: syncservice.RefreshReasonActive, JobID: &jobID},
+			wantStatus: http.StatusAccepted,
+			wantBody:   `{"enqueued":false,"reason":"active","jobId":"` + jobID.String() + `"}`,
+		},
+		{
+			name:       "created missing",
+			decision:   syncservice.RefreshDecision{Enqueued: true, Reason: syncservice.RefreshReasonMissing, JobID: &jobID},
+			wantStatus: http.StatusAccepted,
+			wantBody:   `{"enqueued":true,"reason":"missing","jobId":"` + jobID.String() + `"}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeSyncService{refreshDecision: test.decision}
+			var logs bytes.Buffer
+			router := NewRouter(Dependencies{Auth: authService, Sync: fake, Observability: observability.New(slog.New(slog.NewJSONHandler(&logs, nil)))})
+			req := httptest.NewRequest(http.MethodPost, "/api/sync/refresh-if-stale", nil)
+			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+			req.Header.Set("X-CSRF-Token", session.CSRFToken)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+			if recorder.Code != test.wantStatus || strings.TrimSpace(recorder.Body.String()) != test.wantBody {
+				t.Fatalf("status=%d body=%q", recorder.Code, strings.TrimSpace(recorder.Body.String()))
+			}
+			if fake.refreshUser != session.UserID {
+				t.Fatalf("refresh user=%s want=%s", fake.refreshUser, session.UserID)
+			}
+			records := decodeLogRecords(t, logs.String())
+			if len(records) != 1 || records[0]["event"] != "sync_request" || records[0]["outcome"] != "accepted" || records[0]["http_status"] != float64(test.wantStatus) || records[0]["reason"] != string(test.decision.Reason) {
+				t.Fatalf("refresh log=%#v", records)
+			}
+			if test.decision.JobID != nil && records[0]["workflow_id"] != test.decision.JobID.String() {
+				t.Fatalf("refresh workflow log=%#v", records[0])
+			}
+			if strings.Contains(logs.String(), session.UserID.String()) {
+				t.Fatalf("refresh log leaked user: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestSyncRefreshRequiresAuthenticationOwnerAndCSRF(t *testing.T) {
+	authService, repo := handlerService(t, "http://localhost:8080")
+	owner := repo.addSession()
+	fake := &fakeSyncService{refreshDecision: syncservice.RefreshDecision{Reason: syncservice.RefreshReasonFresh}}
+	router := NewRouter(Dependencies{Auth: authService, Sync: fake})
+
+	unauthenticated := httptest.NewRecorder()
+	router.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodPost, "/api/sync/refresh-if-stale", nil))
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status=%d", unauthenticated.Code)
+	}
+
+	missingCSRF := httptest.NewRequest(http.MethodPost, "/api/sync/refresh-if-stale", nil)
+	missingCSRF.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: owner.Token})
+	missingRecorder := httptest.NewRecorder()
+	router.ServeHTTP(missingRecorder, missingCSRF)
+	if missingRecorder.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF status=%d", missingRecorder.Code)
+	}
+	if fake.refreshCalls != 0 {
+		t.Fatalf("refresh called before middleware authorization: %d", fake.refreshCalls)
+	}
+
+	demo := repo.addSession()
+	demo.AccessMode = auth.AccessModeDemo
+	repo.sessions[demo.ID] = demo
+	demoRequest := httptest.NewRequest(http.MethodPost, "/api/sync/refresh-if-stale", nil)
+	demoRequest.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: demo.Token})
+	demoRequest.Header.Set("X-CSRF-Token", demo.CSRFToken)
+	demoRecorder := httptest.NewRecorder()
+	router.ServeHTTP(demoRecorder, demoRequest)
+	if demoRecorder.Code != http.StatusForbidden || fake.refreshCalls != 0 {
+		t.Fatalf("demo status=%d refresh calls=%d", demoRecorder.Code, fake.refreshCalls)
+	}
+}
+
+func TestSyncRefreshFailuresAreSanitized(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "blocked", err: fmt.Errorf("%w: private-canary", syncservice.ErrPreflightBlocked), wantStatus: http.StatusConflict, wantBody: "synchronization blocked\n"},
+		{name: "failed", err: fmt.Errorf("%w: upstream-canary", syncservice.ErrPreflightFailed), wantStatus: http.StatusBadGateway, wantBody: "synchronization unavailable\n"},
+		{name: "internal", err: errors.New("database-canary"), wantStatus: http.StatusInternalServerError, wantBody: "synchronization unavailable\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authService, repo := handlerService(t, "http://localhost:8080")
+			session := repo.addSession()
+			var logs bytes.Buffer
+			fake := &fakeSyncService{refreshErr: test.err}
+			router := NewRouter(Dependencies{Auth: authService, Sync: fake, Observability: observability.New(slog.New(slog.NewJSONHandler(&logs, nil)))})
+			req := httptest.NewRequest(http.MethodPost, "/api/sync/refresh-if-stale", nil)
+			req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Token})
+			req.Header.Set("X-CSRF-Token", session.CSRFToken)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+			if recorder.Code != test.wantStatus || recorder.Body.String() != test.wantBody {
+				t.Fatalf("status=%d body=%q", recorder.Code, recorder.Body.String())
+			}
+			if strings.Contains(recorder.Body.String(), "canary") || strings.Contains(logs.String(), "canary") {
+				t.Fatalf("raw error leaked: body=%q logs=%q", recorder.Body.String(), logs.String())
+			}
+		})
+	}
+}
+
 type fakeSyncService struct {
-	jobID         uuid.UUID
-	status        syncservice.Status
-	statusUser    uuid.UUID
-	currentStatus syncservice.Status
-	currentFound  bool
-	currentErr    error
-	currentUser   uuid.UUID
-	preflight     syncservice.PreflightResult
-	preflightErr  error
-	startErr      error
+	jobID           uuid.UUID
+	status          syncservice.Status
+	statusUser      uuid.UUID
+	currentStatus   syncservice.Status
+	currentFound    bool
+	currentErr      error
+	currentUser     uuid.UUID
+	preflight       syncservice.PreflightResult
+	preflightErr    error
+	startErr        error
+	refreshDecision syncservice.RefreshDecision
+	refreshErr      error
+	refreshUser     uuid.UUID
+	refreshCalls    int
 }
 
 func (f *fakeSyncService) Start(_ context.Context, _ uuid.UUID) (uuid.UUID, error) {
@@ -348,6 +491,11 @@ func (f *fakeSyncService) Start(_ context.Context, _ uuid.UUID) (uuid.UUID, erro
 }
 func (f *fakeSyncService) Preflight(_ context.Context, _ uuid.UUID) (syncservice.PreflightResult, error) {
 	return f.preflight, f.preflightErr
+}
+func (f *fakeSyncService) RefreshIfStale(_ context.Context, userID uuid.UUID) (syncservice.RefreshDecision, error) {
+	f.refreshUser = userID
+	f.refreshCalls++
+	return f.refreshDecision, f.refreshErr
 }
 func (f *fakeSyncService) GetStatus(_ context.Context, userID, _ uuid.UUID) (syncservice.Status, error) {
 	f.statusUser = userID

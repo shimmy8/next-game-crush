@@ -62,6 +62,10 @@ const (
 	ReasonLeaseLost           Reason = "lease_lost"
 	ReasonPersistenceFailed   Reason = "persistence_failed"
 	ReasonInternalError       Reason = "internal_error"
+	ReasonRefreshMissing      Reason = "missing"
+	ReasonRefreshStale        Reason = "stale"
+	ReasonRefreshFresh        Reason = "fresh"
+	ReasonRefreshActive       Reason = "active"
 )
 
 type Correlation struct {
@@ -408,7 +412,7 @@ var requestOutcomes = values("accepted", "failed")
 var jobStages = values("started", "heartbeat", "deferred", "succeeded", "retry_scheduled", "dead", "cancelled", "lease_lost")
 var sourceStages = values("started", "finished")
 var workerStages = values("started", "stopped", "claim_failed", "completion_failed", "failure_record_failed", "renewal_failed")
-var reasons = values("timeout", "rate_limited", "upstream_unavailable", "upstream_rejected", "malformed_response", "invalid_evidence", "invalid_output", "lease_lost", "persistence_failed", "internal_error")
+var reasons = values("timeout", "rate_limited", "upstream_unavailable", "upstream_rejected", "malformed_response", "invalid_evidence", "invalid_output", "lease_lost", "persistence_failed", "internal_error", "missing", "stale", "fresh", "active")
 var jobKinds = values("steam.sync", "catalog.refresh", "catalog.refresh_game", "catalog.search.run", "catalog.search.page", "catalog.reconciliation.page", "catalog.search.qualify", "catalog.deck_refresh", "achievements.sync", "achievement.classify", "completion.project", "ai.features", "ai.embedding", "ai.profile_summary", "profile.rebuild", "recommendations.rebuild", "feedback.classify", "notifications.digest.send")
 var logicalStages = values("steam", "catalog", "catalog_search_run", "catalog_search_page", "catalog_reconciliation_page", "catalog_search_qualify", "catalog_deck_refresh", "achievements", "achievement_classification", "completion_projection", "ai_features", "ai_embedding", "profile_summary", "profile", "recommendations", "feedback", "digest")
 var sources = values("owned_games", "recently_played", "wishlist", "achievements")

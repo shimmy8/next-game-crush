@@ -55,6 +55,7 @@ func NewRouter(deps Dependencies) http.Handler {
 		if deps.Sync != nil {
 			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/sync/preflight", syncPreflight(deps.Sync))
 			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/sync", startSync(deps.Sync, deps.Observability))
+			router.With(deps.Auth.Middleware, deps.Auth.RequireOwner, deps.Auth.RequireCSRF).Post("/api/sync/refresh-if-stale", refreshSyncIfStale(deps.Sync, deps.Observability))
 			router.With(deps.Auth.Middleware).Get("/api/sync/current", currentSyncStatus(deps.Sync))
 			router.With(deps.Auth.Middleware).Get("/api/sync/{id}", syncStatus(deps.Sync))
 		}

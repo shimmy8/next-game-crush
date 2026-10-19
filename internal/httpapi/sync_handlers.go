@@ -18,8 +18,50 @@ import (
 type SyncService interface {
 	Preflight(context.Context, uuid.UUID) (syncservice.PreflightResult, error)
 	Start(context.Context, uuid.UUID) (uuid.UUID, error)
+	RefreshIfStale(context.Context, uuid.UUID) (syncservice.RefreshDecision, error)
 	GetStatus(context.Context, uuid.UUID, uuid.UUID) (syncservice.Status, error)
 	GetCurrentStatus(context.Context, uuid.UUID) (syncservice.Status, bool, error)
+}
+
+func refreshSyncIfStale(service SyncService, logger *observability.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session, ok := auth.SessionFromContext(r.Context())
+		if !ok {
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		started := time.Now()
+		decision, err := service.RefreshIfStale(r.Context(), session.UserID)
+		if err != nil {
+			status, reason, message := syncRequestFailure(err)
+			logger.SyncRequest(r.Context(), observability.SyncRequestEvent{Outcome: observability.RequestFailed, RequestID: requestIDFromContext(r.Context()), HTTPStatus: status, Duration: time.Since(started), Reason: reason})
+			http.Error(w, message, status)
+			return
+		}
+		status := http.StatusOK
+		workflowID := uuid.Nil
+		if decision.JobID != nil {
+			workflowID = *decision.JobID
+			status = http.StatusAccepted
+		}
+		logger.SyncRequest(r.Context(), observability.SyncRequestEvent{Outcome: observability.RequestAccepted, RequestID: requestIDFromContext(r.Context()), WorkflowID: workflowID, HTTPStatus: status, Duration: time.Since(started), Reason: refreshReason(decision.Reason)})
+		writeJSONStatus(w, status, decision)
+	}
+}
+
+func refreshReason(reason syncservice.RefreshReason) observability.Reason {
+	switch reason {
+	case syncservice.RefreshReasonMissing:
+		return observability.ReasonRefreshMissing
+	case syncservice.RefreshReasonStale:
+		return observability.ReasonRefreshStale
+	case syncservice.RefreshReasonFresh:
+		return observability.ReasonRefreshFresh
+	case syncservice.RefreshReasonActive:
+		return observability.ReasonRefreshActive
+	default:
+		return observability.ReasonInternalError
+	}
 }
 
 func syncPreflight(service SyncService) http.HandlerFunc {
