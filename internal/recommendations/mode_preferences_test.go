@@ -10,15 +10,9 @@ import (
 )
 
 func TestModePreferenceLegacyJSONDefaultsToZero(t *testing.T) {
-	var factors Factors
-	var weights Weights
-	if err := json.Unmarshal([]byte(`{"positiveSimilarity":0.4,"novelty":1}`), &factors); err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal([]byte(`{"semanticSimilarity":25,"novelty":5}`), &weights); err != nil {
-		t.Fatal(err)
-	}
-	if factors.NegativeModePreference != 0 || weights.NegativeModePreferenceWeight != 0 || Score(factors, weights).Score != 15 {
+	factors := decodeFactors([]byte(`{"positiveSimilarity":0.4,"novelty":1}`))
+	weights := decodeWeights([]byte(`{"semanticSimilarity":25,"novelty":5}`))
+	if factors.NegativeModePreference != 0 || weights.NegativeModePreference != 0 || Score(factors, weights).Score != 15 {
 		t.Fatalf("legacy factors=%#v weights=%#v", factors, weights)
 	}
 }
@@ -54,7 +48,7 @@ func TestModePreferenceFactorUsesMaxAfterSourceExclusion(t *testing.T) {
 	}
 }
 func TestModePenaltyIsSoftAndCalibrated(t *testing.T) {
-	f := Factors{PositiveSimilarity: .4, Novelty: 1}
+	f := Factors{ActivitySimilarity: .4, Novelty: 1}
 	w := DefaultWeights()
 	if got := Score(f, w).Score; got != 15 {
 		t.Fatalf("baseline=%v", got)
@@ -160,7 +154,7 @@ func TestActiveAdjustmentsDigestAndRankingBuildIdentity(t *testing.T) {
 	if before == ActiveAdjustmentsDigest([]preferences.Adjustment{a}) {
 		t.Fatal("disable omitted")
 	}
-	if RankingBuildKey("request", AlgorithmVersion, before) == RankingBuildKey("request2", AlgorithmVersion, before) {
+	if RankingBuildKey("request", AlgorithmVersion, RankingSource{}) == RankingBuildKey("request2", AlgorithmVersion, RankingSource{}) {
 		t.Fatal("request omitted")
 	}
 }

@@ -13,9 +13,13 @@ import (
 )
 
 type RankingInputs struct {
-	Candidates        []Candidate
+	Source               RankingSource
+	Candidates           []Candidate
+	EffectiveAdjustments []preferences.Adjustment
+	Corpus               EvidenceCorpus
+	// ActiveAdjustments is retained for intermediate callers; new ranking code
+	// uses EffectiveAdjustments from the same repeatable-read snapshot.
 	ActiveAdjustments []preferences.Adjustment
-	Corpus            EvidenceCorpus
 }
 
 func modeStrength(candidateID uuid.UUID, modes []preferences.Mode, a preferences.Adjustment) float64 {
@@ -68,16 +72,37 @@ func ActiveAdjustmentsDigest(active []preferences.Adjustment) string {
 	encoded, _ := json.Marshal(values)
 	return fmt.Sprintf("%x", sha256.Sum256(encoded))
 }
-func RankingBuildKey(requestKey, algorithmVersion, adjustmentDigest string) string {
-	return fmt.Sprintf("mode-v1:%x:%s:%s", sha256.Sum256([]byte(requestKey)), algorithmVersion, adjustmentDigest)
+func RankingBuildKey(requestKey, algorithmVersion string, source RankingSource) string {
+	digest := rankingSourceDigest(source)
+	return fmt.Sprintf("pair-v2:%x:%s:%s", sha256.Sum256([]byte(requestKey)), algorithmVersion, digest)
+}
+
+func rankingSourceDigest(source RankingSource) string {
+	payload, _ := json.Marshal(struct {
+		ProfileID, ProfileAlgorithm, ProfileBuildKey, ProfileInputHash string
+		ProfileVersion                                                 int64
+		OverlayID, OverlayAlgorithm, OverlayBuildKey, OverlayInputHash string
+		OverlayVersion                                                 int64
+	}{source.Activity.ID.String(), source.ProfileAlgorithmVersion, source.ProfileBuildKey, source.ProfileInputContentHash, source.Activity.Version,
+		source.Overlay.ID.String(), source.Overlay.AlgorithmVersion, source.Overlay.BuildKey, source.Overlay.InputContentHash, source.Overlay.Version})
+	return fmt.Sprintf("%x", sha256.Sum256(payload))
+}
+
+func noVectorProfileIdentity(id uuid.UUID, version int64, algorithmVersion, buildKey string) string {
+	payload, _ := json.Marshal(struct {
+		ID, AlgorithmVersion, BuildKey string
+		Version                        int64
+	}{id.String(), algorithmVersion, buildKey, version})
+	return "no-vector-v1:" + fmt.Sprintf("%x", sha256.Sum256(payload))
 }
 func rankingRequestPrefix(key string) string {
 	fields := strings.Split(key, ":")
-	if len(fields) == 4 && fields[0] == "mode-v1" && len(fields[1]) == 64 {
+	if len(fields) == 4 && strings.HasPrefix(fields[0], "pair-v") && len(fields[1]) == 64 {
 		return strings.Join(fields[:3], ":") + ":"
 	}
 	return ""
 }
+
 func modeEvidence(r Recommendation) *Evidence {
 	if clamp(r.Factors.NegativeModePreference) == 0 {
 		return nil

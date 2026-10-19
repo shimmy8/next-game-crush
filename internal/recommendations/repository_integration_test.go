@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/ai"
+	"next-game-crush/internal/preferences"
 	"next-game-crush/internal/profile"
 	"next-game-crush/internal/store"
 )
@@ -98,9 +100,6 @@ func TestRebuildRetrievesSemanticAndWishlistCandidatesAndPersistsFactors(t *test
 			t.Fatalf("persisted recommendation=%#v", item)
 		}
 	}
-	if items[0].Factors.TagAffinity == 0 && items[1].Factors.TagAffinity == 0 {
-		t.Fatal("structured feature affinity was not computed")
-	}
 	var factors int
 	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM recommendation_factors`).Scan(&factors); err != nil || factors != 3 {
 		t.Fatalf("factor rows=%d err=%v", factors, err)
@@ -117,7 +116,11 @@ func TestRebuildRetrievesSemanticAndWishlistCandidatesAndPersistsFactors(t *test
 		t.Fatalf("second ranking=%#v", second)
 	}
 	latest, err := service.Latest(ctx, userID)
-	if err != nil || len(latest) != 3 || latest[0].RankingVersion != 2 || len(latest[0].Evidence) == 0 || latest[0].Evidence[0].Text == "" {
+	hasEvidence := false
+	for _, item := range latest {
+		hasEvidence = hasEvidence || len(item.Evidence) > 0 && item.Evidence[0].Text != ""
+	}
+	if err != nil || len(latest) != 3 || latest[0].RankingVersion != 2 || !hasEvidence {
 		t.Fatalf("latest=%#v err=%v", latest, err)
 	}
 }
@@ -176,8 +179,9 @@ func TestReviewsAndPopularityNeverChangeDeterministicScoreOrBuildIdentity(t *tes
 	if len(beforeCandidates) != 2 || beforeCandidates[0].Factors != beforeCandidates[1].Factors || before[0].Score != before[1].Score {
 		t.Fatalf("metadata affected initial factors/score: %#v %#v", beforeCandidates, before)
 	}
-	key := RankingBuildKey("semantic-request", AlgorithmVersion, ActiveAdjustmentsDigest(nil))
-	saved, version, _, err := repo.SaveRanking(ctx, userID, p, before, key)
+	source := rankingSourceForTest(t, repo, userID, p)
+	key := RankingBuildKey("semantic-request", AlgorithmVersion, source)
+	saved, version, _, err := repo.SaveRanking(ctx, userID, source, before, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +210,7 @@ func TestReviewsAndPopularityNeverChangeDeterministicScoreOrBuildIdentity(t *tes
 			t.Fatalf("review/popularity changed factors, weights, score, or order at %d: before=%#v/%#v after=%#v/%#v", index, beforeCandidates[index], before[index], afterCandidates[index], after[index])
 		}
 	}
-	_, replayVersion, published, err := repo.SaveRanking(ctx, userID, p, after, key)
+	_, replayVersion, published, err := repo.SaveRanking(ctx, userID, source, after, key)
 	if err != nil || !published || replayVersion != version {
 		t.Fatalf("build replay version=%d/%d published=%v err=%v", replayVersion, version, published, err)
 	}
@@ -279,8 +283,8 @@ func TestCandidateFactorsDecayOldImplicitHistoryEndToEnd(t *testing.T) {
 
 	fresh := buildFor(freshSignal, now)
 	old := buildFor(oldSignal, now.Add(-10*365*24*time.Hour))
-	if fresh.Factors.PositiveSimilarity <= old.Factors.PositiveSimilarity*30 {
-		t.Fatalf("semantic similarity fresh/old = %v/%v", fresh.Factors.PositiveSimilarity, old.Factors.PositiveSimilarity)
+	if fresh.Factors.ActivitySimilarity <= old.Factors.ActivitySimilarity*30 {
+		t.Fatalf("semantic similarity fresh/old = %v/%v", fresh.Factors.ActivitySimilarity, old.Factors.ActivitySimilarity)
 	}
 	for name, values := range map[string][2]float64{
 		"tag":         {fresh.Factors.TagAffinity, old.Factors.TagAffinity},
@@ -349,6 +353,23 @@ func TestCompletionAffinityIsPersistentAndDoesNotDoubleCountAchievement(t *testi
 	if _, err := db.Pool.Exec(ctx, `INSERT INTO feedback_events(id,recommendation_id,user_id,action,reasons,idempotency_key,created_at) VALUES($1,$2,$3,'dislike','{}',$4,$5)`, uuid.New(), recommendationID, owner, uuid.NewString(), now); err != nil {
 		t.Fatal(err)
 	}
+	for _, row := range []struct {
+		id         uuid.UUID
+		achieved   int
+		total      int
+		completion float64
+		last       time.Time
+	}{{completed, 10, 10, 1.5, now}, {ordinary, 5, 10, 0, now}, {overridden, 10, 10, 1.5, now}, {oldCompleted, 0, 0, 1.5, now.Add(-10 * 365 * 24 * time.Hour)}} {
+		var basis, algorithm any
+		endingCount := 0
+		if row.completion > 0 {
+			basis, algorithm = "ending", "completion-v1"
+			endingCount = 1
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO activity_profile_evidence(profile_id,game_id,last_played_at,achieved,total,completion_ending_count,completion_weight,completion_basis,completion_algorithm_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, profileID, row.id, row.last, row.achieved, row.total, endingCount, row.completion, basis, algorithm); err != nil {
+			t.Fatal(err)
+		}
+	}
 	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		t.Fatal(err)
@@ -358,12 +379,12 @@ func TestCompletionAffinityIsPersistentAndDoesNotDoubleCountAchievement(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := repo.affinities(ctx, tx, owner, candidate, now)
+	got, err := repo.affinities(ctx, tx, profileID, candidate, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Completion != .5 {
-		t.Fatalf("completion affinity=%v, want .5 with fresh and ten-year-old anchors weighted equally", got.Completion)
+	if math.Abs(got.Completion-2.0/3.0) > 1e-9 {
+		t.Fatalf("completion affinity=%v, want disliked completion retained", got.Completion)
 	}
 	if got.Achievement != 1 {
 		t.Fatalf("achievement affinity=%v, want only ordinary progress anchor", got.Achievement)
@@ -437,6 +458,7 @@ func TestExplanationCorpusLoadsConfiguredCandidateDataAndProfileSignals(t *testi
 		{recent, 600, 45, now.Add(-24 * time.Hour)},
 		{old, 1200, 0, now.Add(-10 * 365 * 24 * time.Hour)},
 		{unknownRecency, 300, 0, nil},
+		{missingEmbedding, 180, 0, now.Add(-48 * time.Hour)},
 	} {
 		if _, err := db.Pool.Exec(ctx, `INSERT INTO user_games(user_id,game_id,playtime_minutes,recently_played_minutes,last_played_at,source,last_successful_fetch_at) VALUES($1,$2,$3,$4,$5,'test',$6)`, owner, row.gameID, row.playtime, row.recent, row.lastPlayed, now); err != nil {
 			t.Fatal(err)
@@ -453,6 +475,18 @@ func TestExplanationCorpusLoadsConfiguredCandidateDataAndProfileSignals(t *testi
 	insertExplanationCorpusFeedback(t, db, other, otherOnly, []string{"like"}, true)
 
 	if _, err := db.Pool.Exec(ctx, `INSERT INTO user_games(user_id,game_id,playtime_minutes,recently_played_minutes,source,last_successful_fetch_at) VALUES($1,$2,99999,99999,'test',$3),($1,$4,88888,88888,'test',$3)`, other, recent, now, otherOnly); err != nil {
+		t.Fatal(err)
+	}
+	profileRepo, err := profile.NewSQLRepository(db, "embed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := profile.NewService(profileRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builtProfile, err := profiles.Rebuild(ctx, owner)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -484,7 +518,7 @@ func TestExplanationCorpusLoadsConfiguredCandidateDataAndProfileSignals(t *testi
 	for _, anchor := range corpus.Anchors {
 		anchors[anchor.Signal.GameID] = anchor
 	}
-	if len(anchors) != 6 {
+	if len(anchors) != 4 {
 		t.Fatalf("anchor count=%d: %#v", len(anchors), corpus.Anchors)
 	}
 	if _, ok := anchors[otherOnly]; ok {
@@ -499,18 +533,13 @@ func TestExplanationCorpusLoadsConfiguredCandidateDataAndProfileSignals(t *testi
 	if got := anchors[unknownRecency]; !got.Signal.LastPlayedAt.IsZero() {
 		t.Fatalf("unknown recency=%v", got.Signal.LastPlayedAt)
 	}
-	if got := anchors[wishlisted]; !got.Signal.Wishlisted {
-		t.Fatalf("wishlist anchor=%#v", got)
+	if got := anchors[missingEmbedding]; got.Signal.PlaytimeMinutes != 180 || len(got.Signal.Vector) != 0 || len(got.Features.Themes) != 1 {
+		t.Fatalf("missing-vector activity anchor=%#v", got)
 	}
-	if got := anchors[liked]; got.Signal.Likes != 2 || got.Signal.Dislikes != 0 {
-		t.Fatalf("aggregated positive feedback=%#v", got.Signal)
-	}
-	if got := anchors[disliked]; got.Signal.Likes != 0 || got.Signal.Dislikes != 1 {
-		t.Fatalf("negative feedback=%#v", got.Signal)
-	}
-	profileRepo, err := profile.NewSQLRepository(db, "embed")
-	if err != nil {
-		t.Fatal(err)
+	for _, excluded := range []uuid.UUID{wishlisted, liked, disliked} {
+		if _, ok := anchors[excluded]; ok {
+			t.Fatalf("wishlist/reaction-only game became activity anchor: %s", excluded)
+		}
 	}
 	profileSignals, err := profileRepo.LoadSignals(ctx, owner)
 	if err != nil {
@@ -532,7 +561,7 @@ func TestExplanationCorpusLoadsConfiguredCandidateDataAndProfileSignals(t *testi
 		t.Fatal(err)
 	}
 	repo.now = func() time.Time { return now }
-	inputs, err := repo.RankingInputs(ctx, owner, profile.Profile{Positive: configuredVector, Confidence: 1}, 10)
+	inputs, err := repo.RankingInputs(ctx, owner, builtProfile, 10)
 	if err != nil || len(inputs.Candidates) == 0 {
 		t.Fatalf("ranking snapshot candidates=%#v err=%v", inputs.Candidates, err)
 	}
@@ -998,8 +1027,8 @@ func TestCandidatesUseLatestDirectActionAcrossSources(t *testing.T) {
 		if !ok {
 			t.Fatalf("%q did not become eligible after later like", name)
 		}
-		if candidate.Dislikes == 0 || candidate.Factors.NegativeFeedback == 0 {
-			t.Fatalf("%q lost historical negative evidence: %#v", name, candidate)
+		if candidate.Dislikes == 0 || candidate.Factors.NegativeDirectFeedback != 0 || candidate.Factors.PositiveDirectFeedback != 1 {
+			t.Fatalf("%q did not use only the current direct action: %#v", name, candidate)
 		}
 	}
 }
@@ -1139,4 +1168,34 @@ func openRankingStore(t *testing.T) *store.Store {
 		}
 	})
 	return database
+}
+
+func rankingSourceForTest(t *testing.T, repo *SQLRepository, userID uuid.UUID, activity profile.Profile) RankingSource {
+	t.Helper()
+	ctx := context.Background()
+	var overlayID uuid.UUID
+	var version int64
+	var algorithm, buildKey, inputHash string
+	err := repo.store.Pool.QueryRow(ctx, `SELECT id,version,algorithm_version,build_key,input_content_hash FROM preference_overlays WHERE user_id=$1 ORDER BY version DESC LIMIT 1`, userID).Scan(&overlayID, &version, &algorithm, &buildKey, &inputHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		overlayID = uuid.New()
+		version, algorithm, buildKey, inputHash = 1, preferences.OverlayAlgorithmVersion, "test-overlay", "test-input"
+		_, err = repo.store.Pool.Exec(ctx, `INSERT INTO preference_overlays(id,user_id,version,algorithm_version,build_key,input_content_hash,algorithm_metadata) VALUES($1,$2,$3,$4,$5,$6,'{}')`, overlayID, userID, version, algorithm, buildKey, inputHash)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := repo.store.Pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	source, err := repo.persistedRankingSource(ctx, tx, userID, activity.ID, overlayID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return source
 }

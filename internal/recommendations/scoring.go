@@ -7,16 +7,20 @@ import (
 )
 
 func DefaultWeights() Weights {
-	return Weights{SemanticSimilarity: 25, Wishlist: 0, TagAffinity: 15, PlaytimeAffinity: 10, AchievementAffinity: 5, RecentActivityAffinity: 5, CompletionAffinity: 5, PositiveFeedback: 20, Novelty: 5, NegativeFeedback: -30, DateUncertainty: -5, NegativeSimilarityMultiplier: .5, NegativeModePreferenceWeight: -5}
+	return Weights{
+		ActivitySimilarity: 25, PositivePreferenceSimilarity: 10, NegativePreferenceSimilarity: -10,
+		PositiveDirectFeedback: 20, NegativeDirectFeedback: -30, NegativeModePreference: -5,
+		Wishlist: 0, TagAffinity: 15, PlaytimeAffinity: 10, AchievementAffinity: 5,
+		RecentActivityAffinity: 5, CompletionAffinity: 5, Novelty: 5, DateUncertainty: -5,
+	}
 }
 
 func Score(f Factors, w Weights) Result {
-	affinity := clamp(f.PositiveSimilarity) - w.NegativeSimilarityMultiplier*clamp(f.NegativeSimilarity)
-	if affinity < 0 {
-		affinity = 0
-	}
-	raw := affinity*w.SemanticSimilarity + clamp(f.Wishlist)*w.Wishlist + clamp(f.TagAffinity)*w.TagAffinity + clamp(f.PlaytimeAffinity)*w.PlaytimeAffinity + clamp(f.AchievementAffinity)*w.AchievementAffinity + clamp(f.RecentActivityAffinity)*w.RecentActivityAffinity + clamp(f.CompletionAffinity)*w.CompletionAffinity + clamp(f.PositiveFeedback)*w.PositiveFeedback + clamp(f.Novelty)*w.Novelty + clamp(f.NegativeFeedback)*w.NegativeFeedback + clamp(f.DateUncertainty)*w.DateUncertainty
-	raw += clamp(f.NegativeModePreference) * w.NegativeModePreferenceWeight
+	activity, positivePreference, negativePreference := f.ActivitySimilarity, f.PositivePreferenceSimilarity, f.NegativePreferenceSimilarity
+	raw := clamp(activity)*w.ActivitySimilarity + clamp(positivePreference)*w.PositivePreferenceSimilarity + clamp(negativePreference)*w.NegativePreferenceSimilarity
+	raw += clamp(f.PositiveDirectFeedback)*w.PositiveDirectFeedback + clamp(f.NegativeDirectFeedback)*w.NegativeDirectFeedback
+	raw += clamp(f.Wishlist)*w.Wishlist + clamp(f.TagAffinity)*w.TagAffinity + clamp(f.PlaytimeAffinity)*w.PlaytimeAffinity + clamp(f.AchievementAffinity)*w.AchievementAffinity + clamp(f.RecentActivityAffinity)*w.RecentActivityAffinity + clamp(f.CompletionAffinity)*w.CompletionAffinity + clamp(f.Novelty)*w.Novelty + clamp(f.DateUncertainty)*w.DateUncertainty
+	raw += clamp(f.NegativeModePreference) * w.NegativeModePreference
 	if math.IsNaN(raw) || math.IsInf(raw, 0) {
 		raw = 0
 	}
@@ -26,6 +30,7 @@ func Score(f Factors, w Weights) Result {
 	if raw > 100 {
 		raw = 100
 	}
+	affinity := clamp(activity) + clamp(positivePreference) - clamp(negativePreference)
 	return Result{Score: math.Round(raw*1000) / 1000, SemanticAffinity: affinity}
 }
 func Eligible(candidate Candidate) bool {

@@ -320,17 +320,17 @@ func TestPublicEvidenceUsesTopThreePositiveContributions(t *testing.T) {
 	r := Recommendation{
 		Score: 99.125,
 		Factors: Factors{
-			PositiveSimilarity:     0.8,
-			NegativeSimilarity:     0.2,
-			Wishlist:               1,
-			TagAffinity:            0.9,
-			PlaytimeAffinity:       0.7,
-			AchievementAffinity:    0.6,
-			RecentActivityAffinity: 0.5,
-			PositiveFeedback:       0.75,
-			Novelty:                1,
-			NegativeFeedback:       1,
-			DateUncertainty:        1,
+			ActivitySimilarity:           0.8,
+			NegativePreferenceSimilarity: 0.2,
+			Wishlist:                     1,
+			TagAffinity:                  0.9,
+			PlaytimeAffinity:             0.7,
+			AchievementAffinity:          0.6,
+			RecentActivityAffinity:       0.5,
+			PositiveDirectFeedback:       0.75,
+			Novelty:                      1,
+			NegativeDirectFeedback:       1,
+			DateUncertainty:              1,
 		},
 		Weights: DefaultWeights(),
 		Release: ReleaseWindow{Precision: "quarter", Raw: "Q2 2027"},
@@ -339,8 +339,8 @@ func TestPublicEvidenceUsesTopThreePositiveContributions(t *testing.T) {
 	got := publicEvidence(r)
 	want := []Evidence{
 		{ID: "wishlist", Text: "Игра есть в вашем списке желаемого"},
-		{ID: "semantic-affinity", Text: "Похожа на игры, которые вам нравятся"},
-		{ID: "positive-feedback", Text: "Учитывает ваши положительные оценки"},
+		{ID: "semantic-affinity", Text: "Похожа на игры, в которые вы играли"},
+		{ID: "positive-feedback", Text: "Учитывает вашу положительную оценку этой игры"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("evidence count = %d, want %d: %#v", len(got), len(want), got)

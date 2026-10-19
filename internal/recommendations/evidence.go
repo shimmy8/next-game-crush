@@ -77,8 +77,8 @@ func BuildGroundingEvidence(r Recommendation, candidate CandidateEvidence, ancho
 	if anchor, ok := bestComponentAnchor(candidate.GameID, candidate.Features, anchors, weights, func(w profile.SignalWeights) float64 { return w.Achievement }); ok {
 		result = append(result, GroundingEvidence{ID: "achievement-anchor-1", Kind: EvidenceAchievementAnchor, PublicText: fmt.Sprintf("Есть сходство с игрой %s, где у вас заметный прогресс достижений.", anchor.Name), Strength: factorContribution(r.Factors.AchievementAffinity, r.Weights.AchievementAffinity), SourceGameIDs: []uuid.UUID{anchor.Signal.GameID}})
 	}
-	if sourceIDs := positiveFeedbackSources(candidate.GameID, anchors, weights); len(sourceIDs) > 0 {
-		result = append(result, GroundingEvidence{ID: "positive-feedback-1", Kind: EvidencePositiveFeedback, PublicText: "Вы уже отмечали эту игру как понравившуюся.", Strength: factorContribution(r.Factors.PositiveFeedback, r.Weights.PositiveFeedback), SourceGameIDs: sourceIDs})
+	if r.Factors.PositiveDirectFeedback > 0 && candidate.GameID != uuid.Nil {
+		result = append(result, GroundingEvidence{ID: "positive-feedback-1", Kind: EvidencePositiveFeedback, PublicText: "Вы уже отмечали эту игру как понравившуюся.", Strength: factorContribution(r.Factors.PositiveDirectFeedback, r.Weights.PositiveDirectFeedback), SourceGameIDs: []uuid.UUID{candidate.GameID}})
 	}
 	if clamp(r.Factors.Wishlist) > 0 {
 		result = append(result, GroundingEvidence{ID: "wishlist-context-1", Kind: EvidenceWishlistContext, PublicText: "Вы уже добавили эту игру в желаемое — следим за датой выхода.", Strength: factorContribution(r.Factors.Wishlist, r.Weights.Wishlist), SourceGameIDs: []uuid.UUID{candidate.GameID}})
@@ -360,21 +360,9 @@ func bestCompletionAnchor(candidate CandidateEvidence, anchors []EvidenceAnchor,
 	return ranked[0].anchor, true
 }
 
-func positiveFeedbackSources(candidateID uuid.UUID, anchors []EvidenceAnchor, weights map[uuid.UUID]profile.SignalWeights) []uuid.UUID {
-	result := make([]uuid.UUID, 0, 1)
-	for _, anchor := range anchors {
-		weight, ok := positiveAnchorWeight(anchor, weights)
-		if ok && anchor.Signal.GameID == candidateID && weight.Feedback > 0 {
-			result = appendUniqueUUID(result, anchor.Signal.GameID)
-		}
-	}
-	sortUUIDs(result)
-	return result
-}
-
 func positiveAnchorWeight(anchor EvidenceAnchor, weights map[uuid.UUID]profile.SignalWeights) (profile.SignalWeights, bool) {
 	weight, ok := weights[anchor.Signal.GameID]
-	return weight, ok && weight.Positive > 0 && weight.Negative == 0 && anchor.Signal.Dislikes == 0
+	return weight, ok && weight.Positive > 0
 }
 
 func normalizedFeatures(features FeatureValues) map[string]string {
@@ -513,11 +501,7 @@ func factorContribution(factor, weight float64) float64 {
 }
 
 func semanticContribution(r Recommendation) float64 {
-	affinity := clamp(r.Factors.PositiveSimilarity) - r.Weights.NegativeSimilarityMultiplier*clamp(r.Factors.NegativeSimilarity)
-	if affinity < 0 {
-		affinity = 0
-	}
-	return factorContribution(affinity, r.Weights.SemanticSimilarity)
+	return factorContribution(r.Factors.ActivitySimilarity, r.Weights.ActivitySimilarity)
 }
 
 func featureOverlapCount(left, right map[string]string) int {

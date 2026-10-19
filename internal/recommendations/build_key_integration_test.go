@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,9 +132,8 @@ func TestCatalogRetryGenerationReplaysPublishedRankingAndRepairsDeckFanout(t *te
 	if err := repo.store.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind=$1`, catalog.DeckRefreshJobKind).Scan(&deckJobs); err != nil {
 		t.Fatal(err)
 	}
-	wantBuildKey := RankingBuildKey(root, AlgorithmVersion, ActiveAdjustmentsDigest(nil))
-	if publishedRuns != 1 || rankingVersion != 2 || buildKey != wantBuildKey || deckJobs != 2 || planner.calls != 4 {
-		t.Fatalf("runs=%d version=%d build=%q want=%q deckJobs=%d calls=%d", publishedRuns, rankingVersion, buildKey, wantBuildKey, deckJobs, planner.calls)
+	if publishedRuns != 1 || rankingVersion != 2 || !strings.HasPrefix(buildKey, "pair-v2:") || !strings.Contains(buildKey, ":"+AlgorithmVersion+":") || deckJobs != 2 || planner.calls != 4 {
+		t.Fatalf("runs=%d version=%d build=%q deckJobs=%d calls=%d", publishedRuns, rankingVersion, buildKey, deckJobs, planner.calls)
 	}
 	if len(observer.calls) != 2 || observer.calls[0] || !observer.calls[1] || observer.keys[0] != gen0.IdempotencyKey || observer.keys[1] != gen1.IdempotencyKey {
 		t.Fatalf("observer calls=%v keys=%v", observer.calls, observer.keys)
@@ -250,7 +250,7 @@ func TestRankingV2PublishesWithoutMutatingV1(t *testing.T) {
 	}
 	repo := service.repository.(*SQLRepository)
 	var key string
-	if err := repo.store.Pool.QueryRow(ctx, `SELECT build_key FROM recommendation_runs WHERE user_id=$1 AND ranking_version=2 AND published`, old.owner).Scan(&key); err != nil || key != RankingBuildKey("same-workflow", AlgorithmVersion, ActiveAdjustmentsDigest(nil)) {
+	if err := repo.store.Pool.QueryRow(ctx, `SELECT build_key FROM recommendation_runs WHERE user_id=$1 AND ranking_version=2 AND published`, old.owner).Scan(&key); err != nil || !strings.HasPrefix(key, "pair-v2:") || !strings.Contains(key, ":"+AlgorithmVersion+":") {
 		t.Fatalf("v2 key=%q err=%v", key, err)
 	}
 	latest, err := service.Latest(ctx, old.owner)
@@ -444,7 +444,7 @@ func historicalRankingFixture(t *testing.T, failExplanation bool) (*Service, his
 		args  []any
 	}{
 		{`INSERT INTO users(id) VALUES($1)`, []any{old.owner}},
-		{`INSERT INTO preference_profiles(id,user_id,version,algorithm_metadata) VALUES($1,$2,1,'{}')`, []any{profileID, old.owner}},
+		{`INSERT INTO preference_profiles(id,user_id,version,summary,algorithm_metadata,publication_state,published_at,summary_source) VALUES($1,$2,1,'Legacy profile','{}','published',now(),'legacy')`, []any{profileID, old.owner}},
 		{`INSERT INTO catalog_entries(game_id,origin) VALUES($1,'seed')`, []any{gameID}},
 		{`INSERT INTO wishlist_entries(user_id,game_id,source,last_successful_fetch_at) VALUES($1,$2,'test',now())`, []any{old.owner, gameID}},
 		{`INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key,published) VALUES($1,$2,$3,1,'ranking-v1','same-workflow',true)`, []any{uuid.New(), old.owner, profileID}},

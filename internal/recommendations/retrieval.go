@@ -21,7 +21,6 @@ import (
 	"next-game-crush/internal/profile"
 	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
-	dbgen "next-game-crush/internal/store/sqlc"
 )
 
 type SQLRepository struct {
@@ -41,6 +40,14 @@ func NewSQLRepository(database *store.Store, embeddingModel, textModel string) (
 		return nil, errors.New("recommendation store and embedding model are required")
 	}
 	return &SQLRepository{store: database, embeddingModel: embeddingModel, textModel: textModel, now: time.Now, lookbackDays: 30, horizonDays: 90}, nil
+}
+
+func (r *SQLRepository) EnsureCurrent(ctx context.Context, userID uuid.UUID) (preferences.Overlay, error) {
+	repository, err := preferences.NewSQLRepository(r.store)
+	if err != nil {
+		return preferences.Overlay{}, err
+	}
+	return repository.RebuildOverlay(ctx, userID, "")
 }
 
 // SetHorizonDays configures the future side of the shared release window.
@@ -78,7 +85,7 @@ const candidateSelect = `WITH candidate_ids AS (
 	SELECT DISTINCT ON (game_id) game_id,precision,release_date,raw_text FROM game_release_dates ORDER BY game_id,observed_at DESC,id DESC
 )
 SELECT g.id,g.name,e.embedding,(w.game_id IS NOT NULL),(ug.game_id IS NOT NULL),
-	(COALESCE(cr.precision,'unknown')='day' AND cr.release_date<CURRENT_DATE),COALESCE(ld.action IN ('dislike','exclude'),false),COALESCE(f.likes,0),COALESCE(f.dislikes,0),
+	(COALESCE(cr.precision,'unknown')='day' AND cr.release_date<CURRENT_DATE),COALESCE(ld.action IN ('dislike','exclude'),false),COALESCE(ld.action='like',false),COALESCE(f.dislikes,0),
 	COALESCE(cr.precision,'unknown'),cr.release_date,cr.raw_text
 FROM candidate_ids ci JOIN games g ON g.id=ci.game_id
 LEFT JOIN game_embeddings e ON e.game_id=g.id AND e.model=$2
@@ -98,18 +105,36 @@ func (r *SQLRepository) Candidates(ctx context.Context, userID uuid.UUID, p prof
 	return input.Candidates, err
 }
 
+// RankingInputs is a rollout compatibility seam for callers that already hold
+// a profile. New ranking workflows use ResolveRankingInputs so profile and
+// overlay are selected inside one repeatable-read snapshot.
 func (r *SQLRepository) RankingInputs(ctx context.Context, userID uuid.UUID, p profile.Profile, limit int) (RankingInputs, error) {
+	return r.resolveRankingInputs(ctx, RankingRequest{UserID: userID}, limit, &p, false)
+}
+
+func (r *SQLRepository) ResolveRankingInputs(ctx context.Context, request RankingRequest, limit int) (RankingInputs, error) {
+	return r.resolveRankingInputs(ctx, request, limit, nil, true)
+}
+
+func (r *SQLRepository) resolveRankingInputs(ctx context.Context, request RankingRequest, limit int, supplied *profile.Profile, requireOverlay bool) (RankingInputs, error) {
+	if request.UserID == uuid.Nil || limit <= 0 {
+		return RankingInputs{}, errors.New("ranking user and positive candidate limit are required")
+	}
 	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return RankingInputs{}, err
 	}
 	defer tx.Rollback(ctx)
-	candidates, err := r.candidates(ctx, tx, userID, p, limit)
+	source, err := r.resolveSource(ctx, tx, request, supplied, requireOverlay)
+	if err != nil {
+		return RankingInputs{}, err
+	}
+	candidates, err := r.candidates(ctx, tx, request.UserID, source, limit)
 	if err != nil {
 		return RankingInputs{}, err
 	}
 	queries := r.store.Queries.WithTx(tx)
-	rows, err := queries.ListPreferenceAdjustments(ctx, dbgen.ListPreferenceAdjustmentsParams{UserID: pgtype.UUID{Bytes: userID, Valid: true}})
+	rows, err := queries.ListEffectivePreferenceAdjustments(ctx, pgtype.UUID{Bytes: request.UserID, Valid: true})
 	if err != nil {
 		return RankingInputs{}, err
 	}
@@ -142,37 +167,127 @@ func (r *SQLRepository) RankingInputs(ctx context.Context, userID uuid.UUID, p p
 	for _, candidate := range candidates {
 		gameIDs = append(gameIDs, candidate.GameID)
 	}
-	corpus, err := r.explanationCorpus(ctx, tx, userID, gameIDs)
+	corpus, err := r.explanationCorpus(ctx, tx, request.UserID, source.Activity.ID, gameIDs)
 	if err != nil {
 		return RankingInputs{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return RankingInputs{}, err
 	}
-	return RankingInputs{Candidates: candidates, ActiveAdjustments: active, Corpus: corpus}, nil
+	return RankingInputs{Source: source, Candidates: candidates, EffectiveAdjustments: active, ActiveAdjustments: active, Corpus: corpus}, nil
 }
 
-func (r *SQLRepository) candidates(ctx context.Context, tx pgx.Tx, userID uuid.UUID, p profile.Profile, limit int) ([]Candidate, error) {
+func (r *SQLRepository) resolveSource(ctx context.Context, tx pgx.Tx, request RankingRequest, supplied *profile.Profile, requireOverlay bool) (RankingSource, error) {
+	source := RankingSource{}
+	if supplied != nil {
+		source.Activity = *supplied
+		source.ProfileAlgorithmVersion = "legacy"
+	} else {
+		var metadata []byte
+		var vector *pgvector.Vector
+		var createdAt pgtype.Timestamptz
+		var buildKey, inputHash pgtype.Text
+		err := tx.QueryRow(ctx, `SELECT p.id,p.user_id,p.version,p.publication_state,p.algorithm_metadata,p.created_at,p.build_key,e.input_content_hash,e.embedding
+			FROM preference_profiles p
+			LEFT JOIN profile_embeddings e ON e.profile_id=p.id AND e.polarity='positive' AND e.model=$3
+			WHERE p.user_id=$1 AND ($2='' OR p.build_key=$2)
+			ORDER BY p.version DESC LIMIT 1`, request.UserID, strings.TrimSpace(request.ProfileBuildKey), r.embeddingModel).Scan(
+			&source.Activity.ID, &source.Activity.UserID, &source.Activity.Version, &source.Activity.PublicationState, &metadata, &createdAt, &buildKey, &inputHash, &vector,
+		)
+		if err != nil {
+			return RankingSource{}, fmt.Errorf("resolve vector-complete activity profile: %w", err)
+		}
+		source.Activity.CreatedAt = createdAt.Time.UTC()
+		if vector != nil {
+			source.Activity.Positive = append([]float32(nil), vector.Slice()...)
+		}
+		source.ProfileBuildKey = buildKey.String
+		source.ProfileInputContentHash = inputHash.String
+		var profileMetadata struct {
+			AlgorithmVersion string   `json:"algorithmVersion"`
+			Confidence       float64  `json:"confidence"`
+			PositiveStrength *float64 `json:"positiveStrength"`
+		}
+		_ = json.Unmarshal(metadata, &profileMetadata)
+		source.ProfileAlgorithmVersion = strings.TrimSpace(profileMetadata.AlgorithmVersion)
+		if source.ProfileAlgorithmVersion == "" {
+			source.ProfileAlgorithmVersion = "legacy"
+		}
+		source.Activity.Confidence = clamp(profileMetadata.Confidence)
+		source.Activity.PositiveStrength = 1
+		if profileMetadata.PositiveStrength != nil {
+			source.Activity.PositiveStrength = clamp(*profileMetadata.PositiveStrength)
+		}
+		if source.ProfileInputContentHash == "" {
+			source.ProfileInputContentHash = noVectorProfileIdentity(source.Activity.ID, source.Activity.Version, source.ProfileAlgorithmVersion, source.ProfileBuildKey)
+		}
+	}
+	queries := r.store.Queries.WithTx(tx)
+	overlayRow, err := queries.GetLatestPreferenceOverlay(ctx, pgtype.UUID{Bytes: request.UserID, Valid: true})
+	if errors.Is(err, pgx.ErrNoRows) && !requireOverlay {
+		return source, nil
+	}
+	if err != nil {
+		return RankingSource{}, fmt.Errorf("resolve preference overlay: %w", err)
+	}
+	source.Overlay = preferences.Overlay{
+		ID: uuid.UUID(overlayRow.ID.Bytes), UserID: uuid.UUID(overlayRow.UserID.Bytes), Version: overlayRow.Version,
+		AlgorithmVersion: overlayRow.AlgorithmVersion, BuildKey: overlayRow.BuildKey, InputContentHash: overlayRow.InputContentHash,
+	}
+	if overlayRow.CreatedAt.Valid {
+		source.Overlay.CreatedAt = overlayRow.CreatedAt.Time.UTC()
+	}
+	if err := json.Unmarshal(overlayRow.AlgorithmMetadata, &source.Overlay.Metadata); err != nil {
+		return RankingSource{}, fmt.Errorf("decode preference overlay metadata: %w", err)
+	}
+	embeddings, err := queries.GetPreferenceOverlayEmbeddings(ctx, overlayRow.ID)
+	if err != nil {
+		return RankingSource{}, err
+	}
+	for _, embedding := range embeddings {
+		if embedding.Model != r.embeddingModel {
+			continue
+		}
+		vector := append([]float32(nil), embedding.Embedding.Slice()...)
+		switch embedding.Polarity {
+		case "positive":
+			source.Overlay.Positive = vector
+		case "negative":
+			source.Overlay.Negative = vector
+		}
+	}
+	return source, nil
+}
+
+func (r *SQLRepository) candidates(ctx context.Context, tx pgx.Tx, userID uuid.UUID, source RankingSource, limit int) ([]Candidate, error) {
 	if limit <= 0 {
 		return nil, errors.New("candidate limit must be positive")
 	}
 	byID := map[uuid.UUID]Candidate{}
 	asOf := r.now().UTC()
-	semantic := hasVector(p.Positive)
+	semantic := hasVector(source.Activity.Positive)
 	base := "ug.game_id IS NULL"
 	condition, order := base, `lower(g.name) COLLATE "C",g.name COLLATE "C",g.id`
-	args := []any{userID, r.embeddingModel, 1000000}
+	args := []any{userID, r.embeddingModel, ActivityNeighborLimit}
 	if semantic {
 		condition = "e.embedding IS NOT NULL AND " + base
 		order = `e.embedding <=> $4,lower(g.name) COLLATE "C",g.name COLLATE "C",g.id`
-		args = append(args, pgvector.NewVector(p.Positive))
+		args = append(args, pgvector.NewVector(source.Activity.Positive))
 	}
-	if err := r.readCandidates(ctx, tx, userID, fmt.Sprintf(candidateSelect, condition, order), args, p, asOf, byID); err != nil {
+	if err := r.readCandidates(ctx, tx, userID, fmt.Sprintf(candidateSelect, condition, order), args, source, asOf, 0, byID); err != nil {
 		return nil, err
 	}
+	if hasVector(source.Overlay.Positive) {
+		overlayOrder := `e.embedding <=> $4,lower(g.name) COLLATE "C",g.name COLLATE "C",g.id`
+		args = []any{userID, r.embeddingModel, PreferenceNeighborLimit, pgvector.NewVector(source.Overlay.Positive)}
+		if err := r.readCandidates(ctx, tx, userID, fmt.Sprintf(candidateSelect, "e.embedding IS NOT NULL AND "+base, overlayOrder), args, source, asOf, ActivityNeighborLimit, byID); err != nil {
+			return nil, err
+		}
+	}
 	// Wishlist entries are mandatory candidates even if they have no embedding
-	// or fall outside the nearest-neighbor limit.
-	if err := r.readCandidates(ctx, tx, userID, fmt.Sprintf(candidateSelect, "w.game_id IS NOT NULL AND "+base, `lower(g.name) COLLATE "C",g.name COLLATE "C",g.id`), []any{userID, r.embeddingModel, 1000000}, p, asOf, byID); err != nil {
+	// or fall outside the nearest-neighbor limit. Current catalog entries are
+	// mandatory as well; eligibility and presentation caps are applied later.
+	if err := r.readCandidates(ctx, tx, userID, fmt.Sprintf(candidateSelect, base, `lower(g.name) COLLATE "C",g.name COLLATE "C",g.id`), []any{userID, r.embeddingModel, 1000000}, source, asOf, ActivityNeighborLimit+PreferenceNeighborLimit, byID); err != nil {
 		return nil, err
 	}
 	ordered := make([]Candidate, 0, len(byID))
@@ -186,15 +301,9 @@ func (r *SQLRepository) candidates(ctx context.Context, tx pgx.Tx, userID uuid.U
 		return ordered[i].GameID.String() < ordered[j].GameID.String()
 	})
 	result := make([]Candidate, 0, len(byID))
-	nonWishlist := 0
 	for _, candidate := range ordered {
 		if Eligible(candidate) && withinReleaseWindow(candidate.Release, asOf, r.lookbackDays, r.horizonDays) {
-			if candidate.Factors.Wishlist == 1 || nonWishlist < limit {
-				result = append(result, candidate)
-				if candidate.Factors.Wishlist != 1 {
-					nonWishlist++
-				}
-			}
+			result = append(result, candidate)
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -239,7 +348,11 @@ func (r *SQLRepository) ExplanationCorpus(ctx context.Context, userID uuid.UUID,
 		return EvidenceCorpus{}, err
 	}
 	defer tx.Rollback(ctx)
-	corpus, err := r.explanationCorpus(ctx, tx, userID, gameIDs)
+	var profileID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT p.id FROM preference_profiles p JOIN activity_profile_evidence evidence ON evidence.profile_id=p.id WHERE p.user_id=$1 ORDER BY p.version DESC LIMIT 1`, userID).Scan(&profileID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return EvidenceCorpus{}, err
+	}
+	corpus, err := r.explanationCorpus(ctx, tx, userID, profileID, gameIDs)
 	if err != nil {
 		return EvidenceCorpus{}, err
 	}
@@ -249,7 +362,7 @@ func (r *SQLRepository) ExplanationCorpus(ctx context.Context, userID uuid.UUID,
 	return corpus, nil
 }
 
-func (r *SQLRepository) explanationCorpus(ctx context.Context, queryer rowQuerier, userID uuid.UUID, gameIDs []uuid.UUID) (EvidenceCorpus, error) {
+func (r *SQLRepository) explanationCorpus(ctx context.Context, queryer rowQuerier, userID, profileID uuid.UUID, gameIDs []uuid.UUID) (EvidenceCorpus, error) {
 	corpus := EvidenceCorpus{Candidates: make(map[uuid.UUID]CandidateEvidence), Anchors: []EvidenceAnchor{}}
 	if len(gameIDs) == 0 {
 		return corpus, nil
@@ -288,45 +401,23 @@ func (r *SQLRepository) explanationCorpus(ctx context.Context, queryer rowQuerie
 	}
 	rows.Close()
 
-	rows, err = queryer.Query(ctx, `WITH relevant AS (
-			SELECT game_id FROM user_games WHERE user_id=$1 UNION
-			SELECT game_id FROM wishlist_entries WHERE user_id=$1 UNION
-			SELECT rec.game_id FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id WHERE f.user_id=$1 UNION
-			SELECT game_id FROM user_game_completion_projections WHERE user_id=$1
-		), feedback AS (
-			SELECT rec.game_id,
-				(count(*) FILTER (WHERE f.action='like'))::int likes,
-				(count(*) FILTER (WHERE f.action IN ('dislike','exclude')))::int dislikes
-			FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id
-			WHERE f.user_id=$1 GROUP BY rec.game_id
-		), latest_direct AS (
-			SELECT DISTINCT ON (rec.game_id) rec.game_id,f.action
-			FROM feedback_events f JOIN recommendations rec ON rec.id=f.recommendation_id
-			WHERE f.user_id=$1 AND f.action IN ('like','dislike','exclude')
-			ORDER BY rec.game_id,f.created_at DESC,f.id DESC
-		)
-		SELECT rel.game_id,g.name,e.embedding,COALESCE(ug.playtime_minutes,0),COALESCE(ug.recently_played_minutes,0),ug.last_played_at,
-			CASE WHEN COALESCE(a.total,0)>0 THEN a.achieved::float8/a.total ELSE 0 END,
-			COALESCE(cp.weight,0),COALESCE(ld.action IN ('dislike','exclude'),false),
-			(w.game_id IS NOT NULL),COALESCE(f.likes,0),COALESCE(f.dislikes,0),gf.features
-		FROM relevant rel
-		JOIN games g ON g.id=rel.game_id
-		JOIN game_embeddings e ON e.game_id=rel.game_id AND e.model=$2
-		LEFT JOIN user_games ug ON ug.user_id=$1 AND ug.game_id=rel.game_id
-		LEFT JOIN wishlist_entries w ON w.user_id=$1 AND w.game_id=rel.game_id
-		LEFT JOIN achievement_summaries a ON a.user_id=$1 AND a.game_id=rel.game_id
-		LEFT JOIN user_game_completion_projections cp ON cp.user_id=$1 AND cp.game_id=rel.game_id
-		LEFT JOIN feedback f ON f.game_id=rel.game_id
-		LEFT JOIN latest_direct ld ON ld.game_id=rel.game_id
-		LEFT JOIN game_features gf ON gf.game_id=rel.game_id AND gf.model=$3
-		ORDER BY rel.game_id`, userID, r.embeddingModel, r.textModel)
+	rows, err = queryer.Query(ctx, `SELECT evidence.game_id,g.name,e.embedding,evidence.playtime_minutes,evidence.recently_played_minutes,evidence.last_played_at,
+			evidence.achieved,evidence.total,CASE WHEN evidence.total>0 THEN evidence.achieved::float8/evidence.total ELSE 0 END,
+			evidence.completion_weight,gf.features
+		FROM activity_profile_evidence evidence
+		JOIN preference_profiles p ON p.id=evidence.profile_id AND p.user_id=$1
+		JOIN games g ON g.id=evidence.game_id
+		LEFT JOIN game_embeddings e ON e.game_id=evidence.game_id AND e.model=$3
+		LEFT JOIN game_features gf ON gf.game_id=evidence.game_id AND gf.model=$4
+		WHERE evidence.profile_id=$2
+		ORDER BY evidence.game_id`, userID, profileID, r.embeddingModel, r.textModel)
 	if err != nil {
 		return EvidenceCorpus{}, fmt.Errorf("load explanation anchors: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var anchor EvidenceAnchor
-		var vector pgvector.Vector
+		var vector *pgvector.Vector
 		var lastPlayedAt pgtype.Timestamptz
 		var rawFeatures []byte
 		if err := rows.Scan(
@@ -336,12 +427,10 @@ func (r *SQLRepository) explanationCorpus(ctx context.Context, queryer rowQuerie
 			&anchor.Signal.PlaytimeMinutes,
 			&anchor.Signal.RecentMinutes,
 			&lastPlayedAt,
+			&anchor.Signal.Achieved,
+			&anchor.Signal.Total,
 			&anchor.Signal.AchievementRatio,
 			&anchor.Signal.CompletionWeight,
-			&anchor.Signal.CompletionOverridden,
-			&anchor.Signal.Wishlisted,
-			&anchor.Signal.Likes,
-			&anchor.Signal.Dislikes,
 			&rawFeatures,
 		); err != nil {
 			return EvidenceCorpus{}, fmt.Errorf("scan explanation anchor: %w", err)
@@ -349,7 +438,9 @@ func (r *SQLRepository) explanationCorpus(ctx context.Context, queryer rowQuerie
 		if lastPlayedAt.Valid {
 			anchor.Signal.LastPlayedAt = lastPlayedAt.Time.UTC()
 		}
-		anchor.Signal.Vector = append([]float32(nil), vector.Slice()...)
+		if vector != nil {
+			anchor.Signal.Vector = append([]float32(nil), vector.Slice()...)
+		}
 		anchor.Features, err = decodeFeatureValues(rawFeatures)
 		if err != nil {
 			return EvidenceCorpus{}, fmt.Errorf("decode explanation anchor features: %w", err)
@@ -373,7 +464,7 @@ func decodeFeatureValues(raw []byte) (FeatureValues, error) {
 	return features, nil
 }
 
-func (r *SQLRepository) readCandidates(ctx context.Context, tx pgx.Tx, userID uuid.UUID, query string, args []any, p profile.Profile, asOf time.Time, dst map[uuid.UUID]Candidate) error {
+func (r *SQLRepository) readCandidates(ctx context.Context, tx pgx.Tx, userID uuid.UUID, query string, args []any, source RankingSource, asOf time.Time, rankBase int, dst map[uuid.UUID]Candidate) error {
 	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return err
@@ -386,15 +477,15 @@ func (r *SQLRepository) readCandidates(ctx context.Context, tx pgx.Tx, userID uu
 		var c Candidate
 		var vector *pgvector.Vector
 		var wishlist bool
-		var likes int
+		var liked bool
 		var releaseDate pgtype.Date
 		var raw pgtype.Text
-		if err := rows.Scan(&c.GameID, &c.Name, &vector, &wishlist, &c.Owned, &c.Released, &c.ExcludedByLatestDirectAction, &likes, &c.Dislikes, &c.Release.Precision, &releaseDate, &raw); err != nil {
+		if err := rows.Scan(&c.GameID, &c.Name, &vector, &wishlist, &c.Owned, &c.Released, &c.ExcludedByLatestDirectAction, &liked, &c.Dislikes, &c.Release.Precision, &releaseDate, &raw); err != nil {
 			return err
 		}
 		c.Factors.Wishlist = boolFactor(wishlist)
-		c.Factors.PositiveFeedback = boolFactor(likes > 0)
-		c.Factors.NegativeFeedback = boolFactor(c.Dislikes > 0)
+		c.Factors.PositiveDirectFeedback = boolFactor(liked)
+		c.Factors.NegativeDirectFeedback = boolFactor(c.ExcludedByLatestDirectAction)
 		c.Factors.Novelty = 1
 		c.Factors.DateUncertainty = boolFactor(c.Release.Precision != "day")
 		if releaseDate.Valid && c.Release.Precision == "day" {
@@ -410,12 +501,13 @@ func (r *SQLRepository) readCandidates(ctx context.Context, tx pgx.Tx, userID uu
 		}
 		if vector != nil {
 			slice := vector.Slice()
-			c.Factors.PositiveSimilarity = cosine01(profile.Cosine(p.Positive, slice)) * p.PositiveStrength
-			c.Factors.NegativeSimilarity = cosine01(profile.Cosine(p.Negative, slice))
+			c.Factors.ActivitySimilarity = cosine01(profile.Cosine(source.Activity.Positive, slice)) * source.Activity.PositiveStrength
+			c.Factors.PositivePreferenceSimilarity = cosine01(profile.Cosine(source.Overlay.Positive, slice))
+			c.Factors.NegativePreferenceSimilarity = cosine01(profile.Cosine(source.Overlay.Negative, slice))
 			quality += .5
 		}
 		c.Factors.Confidence = quality
-		c.retrievalRank = rank
+		c.retrievalRank = rankBase + rank
 		collected = append(collected, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -423,7 +515,7 @@ func (r *SQLRepository) readCandidates(ctx context.Context, tx pgx.Tx, userID uu
 	}
 	rows.Close()
 	for _, c := range collected {
-		values, err := r.affinities(ctx, tx, userID, c.GameID, asOf)
+		values, err := r.affinities(ctx, tx, source.Activity.ID, c.GameID, asOf)
 		if err != nil {
 			return err
 		}
@@ -448,7 +540,7 @@ type affinities struct {
 	Completion  float64
 }
 
-func (r *SQLRepository) affinities(ctx context.Context, tx pgx.Tx, userID, gameID uuid.UUID, asOf time.Time) (affinities, error) {
+func (r *SQLRepository) affinities(ctx context.Context, tx pgx.Tx, profileID, gameID uuid.UUID, asOf time.Time) (affinities, error) {
 	var candidate []byte
 	if err := tx.QueryRow(ctx, `SELECT features FROM game_features WHERE game_id=$1 AND model=$2`, gameID, r.textModel).Scan(&candidate); errors.Is(err, pgx.ErrNoRows) {
 		return affinities{}, nil
@@ -459,20 +551,12 @@ func (r *SQLRepository) affinities(ctx context.Context, tx pgx.Tx, userID, gameI
 	if len(target) == 0 {
 		return affinities{}, nil
 	}
-	rows, err := tx.Query(ctx, `SELECT gf.features,ug.playtime_minutes,ug.recently_played_minutes,ug.last_played_at,
-		COALESCE(a.achieved,0),COALESCE(a.total,0),COALESCE(cp.weight,0),COALESCE(ld.action IN ('dislike','exclude'),false)
-		FROM user_games ug
-		JOIN game_features gf ON gf.game_id=ug.game_id AND gf.model=$2
-		LEFT JOIN achievement_summaries a ON a.user_id=ug.user_id AND a.game_id=ug.game_id
-		LEFT JOIN user_game_completion_projections cp ON cp.user_id=ug.user_id AND cp.game_id=ug.game_id
-		LEFT JOIN LATERAL (
-			SELECT f.action FROM feedback_events f
-			JOIN recommendations rec ON rec.id=f.recommendation_id
-			WHERE f.user_id=ug.user_id AND rec.game_id=ug.game_id AND f.action IN ('like','dislike','exclude')
-			ORDER BY f.created_at DESC,f.id DESC LIMIT 1
-		) ld ON true
-		WHERE ug.user_id=$1
-		ORDER BY ug.game_id`, userID, r.textModel)
+	rows, err := tx.Query(ctx, `SELECT gf.features,evidence.playtime_minutes,evidence.recently_played_minutes,evidence.last_played_at,
+		evidence.achieved,evidence.total,evidence.completion_weight
+		FROM activity_profile_evidence evidence
+		JOIN game_features gf ON gf.game_id=evidence.game_id AND gf.model=$2
+		WHERE evidence.profile_id=$1
+		ORDER BY evidence.game_id`, profileID, r.textModel)
 	if err != nil {
 		return affinities{}, err
 	}
@@ -484,8 +568,7 @@ func (r *SQLRepository) affinities(ctx context.Context, tx pgx.Tx, userID, gameI
 		var lastPlayedAt pgtype.Timestamptz
 		var got, total int
 		var completionWeight float64
-		var completionOverridden bool
-		if err := rows.Scan(&raw, &minutes, &recentMinutes, &lastPlayedAt, &got, &total, &completionWeight, &completionOverridden); err != nil {
+		if err := rows.Scan(&raw, &minutes, &recentMinutes, &lastPlayedAt, &got, &total, &completionWeight); err != nil {
 			return affinities{}, err
 		}
 		overlap := setOverlap(target, featureSet(raw))
@@ -504,10 +587,8 @@ func (r *SQLRepository) affinities(ctx context.Context, tx pgx.Tx, userID, gameI
 		recent += overlap * rw
 		recentDen += rw
 		if completionWeight > 0 {
-			if !completionOverridden {
-				completion += overlap * completionWeight
-				completionDen += completionWeight
-			}
+			completion += overlap * completionWeight
+			completionDen += completionWeight
 		} else if total > 0 {
 			aw := float64(got) / float64(total)
 			ach += overlap * aw * recencyWeight
@@ -610,21 +691,41 @@ func releaseWindowEnded(window ReleaseWindow, now time.Time) bool {
 		return false
 	}
 }
-func (r *SQLRepository) SaveRanking(ctx context.Context, userID uuid.UUID, p profile.Profile, input []Recommendation, buildKey string) ([]Recommendation, int64, bool, error) {
+func (r *SQLRepository) SaveRanking(ctx context.Context, userID uuid.UUID, source RankingSource, input []Recommendation, buildKey string) ([]Recommendation, int64, bool, error) {
+	if source.Activity.ID == uuid.Nil || source.Overlay.ID == uuid.Nil {
+		return nil, 0, false, errors.New("ranking source requires exact activity profile and preference overlay")
+	}
+	if !strings.HasPrefix(buildKey, "pair-v2:") {
+		return nil, 0, false, errors.New("new ranking writes require an exact-pair build key")
+	}
 	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, 0, false, err
 	}
 	defer tx.Rollback(ctx)
+	persistedSource, err := r.persistedRankingSource(ctx, tx, userID, source.Activity.ID, source.Overlay.ID)
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("validate ranking source: %w", err)
+	}
+	fields := strings.Split(buildKey, ":")
+	if len(fields) != 4 || fields[0] != "pair-v2" || len(fields[1]) != 64 || fields[2] != AlgorithmVersion || fields[3] != rankingSourceDigest(persistedSource) {
+		return nil, 0, false, errors.New("ranking build key does not match persisted exact pair")
+	}
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, `ranking:`+userID.String()); err != nil {
 		return nil, 0, false, err
 	}
 	var rankingVersion int64
 	var published bool
-	err = tx.QueryRow(ctx, `SELECT ranking_version,published FROM recommendation_runs WHERE user_id=$1 AND (build_key=$2 OR ($3<>'' AND starts_with(build_key,$3))) ORDER BY ranking_version LIMIT 1`, userID, buildKey, rankingRequestPrefix(buildKey)).Scan(&rankingVersion, &published)
+	var existingBuildKey string
+	var existingProfileID uuid.UUID
+	var existingOverlayID pgtype.UUID
+	err = tx.QueryRow(ctx, `SELECT ranking_version,published,build_key,profile_id,preference_overlay_id FROM recommendation_runs WHERE user_id=$1 AND (build_key=$2 OR ($3<>'' AND starts_with(build_key,$3))) ORDER BY ranking_version LIMIT 1`, userID, buildKey, rankingRequestPrefix(buildKey)).Scan(&rankingVersion, &published, &existingBuildKey, &existingProfileID, &existingOverlayID)
 	replay := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, 0, false, err
+	}
+	if replay && (existingBuildKey != buildKey || existingProfileID != source.Activity.ID || !existingOverlayID.Valid || uuid.UUID(existingOverlayID.Bytes) != source.Overlay.ID) {
+		return nil, 0, false, errors.New("ranking build key collision")
 	}
 	if replay && published {
 		if err = tx.Commit(ctx); err != nil {
@@ -636,7 +737,7 @@ func (r *SQLRepository) SaveRanking(ctx context.Context, userID uuid.UUID, p pro
 		if _, err = tx.Exec(ctx, `DELETE FROM recommendations WHERE user_id=$1 AND ranking_version=$2`, userID, rankingVersion); err != nil {
 			return nil, 0, false, err
 		}
-		if _, err = tx.Exec(ctx, `UPDATE recommendation_runs SET published=false,profile_id=$3,build_key=$4 WHERE user_id=$1 AND ranking_version=$2`, userID, rankingVersion, p.ID, buildKey); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE recommendation_runs SET published=false,profile_id=$3,preference_overlay_id=$4,build_key=$5 WHERE user_id=$1 AND ranking_version=$2`, userID, rankingVersion, source.Activity.ID, source.Overlay.ID, buildKey); err != nil {
 			return nil, 0, false, err
 		}
 	} else if err = tx.QueryRow(ctx, `SELECT COALESCE(max(ranking_version),0)+1 FROM recommendation_runs WHERE user_id=$1`, userID).Scan(&rankingVersion); err != nil {
@@ -645,15 +746,15 @@ func (r *SQLRepository) SaveRanking(ctx context.Context, userID uuid.UUID, p pro
 	result := make([]Recommendation, 0, len(input))
 	now := r.now().UTC()
 	if !replay {
-		if _, err = tx.Exec(ctx, `INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key,created_at)VALUES($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), userID, p.ID, rankingVersion, AlgorithmVersion, buildKey, now); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO recommendation_runs(id,user_id,profile_id,preference_overlay_id,ranking_version,algorithm_version,build_key,created_at)VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, uuid.New(), userID, source.Activity.ID, source.Overlay.ID, rankingVersion, AlgorithmVersion, buildKey, now); err != nil {
 			return nil, 0, false, err
 		}
 	}
 	for _, item := range input {
 		id := uuid.New()
 		item.RankingVersion = rankingVersion
-		err = tx.QueryRow(ctx, `INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,ranking_version,score,text_model,embedding_model,created_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id,created_at`, id, userID, item.GameID, p.ID, item.AlgorithmVersion, rankingVersion, item.Score, nullableText(r.textModel), r.embeddingModel, now).Scan(&item.ID, &item.CreatedAt)
+		err = tx.QueryRow(ctx, `INSERT INTO recommendations(id,user_id,game_id,profile_id,preference_overlay_id,algorithm_version,ranking_version,score,text_model,embedding_model,created_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id,created_at`, id, userID, item.GameID, source.Activity.ID, source.Overlay.ID, item.AlgorithmVersion, rankingVersion, item.Score, nullableText(r.textModel), r.embeddingModel, now).Scan(&item.ID, &item.CreatedAt)
 		if err != nil {
 			return nil, 0, false, err
 		}
@@ -668,6 +769,48 @@ func (r *SQLRepository) SaveRanking(ctx context.Context, userID uuid.UUID, p pro
 		return nil, 0, false, err
 	}
 	return result, rankingVersion, false, nil
+}
+
+func (r *SQLRepository) persistedRankingSource(ctx context.Context, tx pgx.Tx, userID, profileID, overlayID uuid.UUID) (RankingSource, error) {
+	var source RankingSource
+	var metadata []byte
+	var profileBuildKey, profileInputHash pgtype.Text
+	err := tx.QueryRow(ctx, `SELECT p.id,p.user_id,p.version,p.algorithm_metadata,p.build_key,e.input_content_hash
+		FROM preference_profiles p
+		LEFT JOIN profile_embeddings e ON e.profile_id=p.id AND e.polarity='positive' AND e.model=$3
+		WHERE p.id=$1 AND p.user_id=$2`, profileID, userID, r.embeddingModel).Scan(
+		&source.Activity.ID, &source.Activity.UserID, &source.Activity.Version, &metadata, &profileBuildKey, &profileInputHash,
+	)
+	if err != nil {
+		return RankingSource{}, err
+	}
+	var profileMetadata struct {
+		AlgorithmVersion string `json:"algorithmVersion"`
+	}
+	_ = json.Unmarshal(metadata, &profileMetadata)
+	source.ProfileAlgorithmVersion = strings.TrimSpace(profileMetadata.AlgorithmVersion)
+	if source.ProfileAlgorithmVersion == "" {
+		source.ProfileAlgorithmVersion = "legacy"
+	}
+	source.ProfileBuildKey = profileBuildKey.String
+	source.ProfileInputContentHash = profileInputHash.String
+	if source.ProfileInputContentHash == "" {
+		source.ProfileInputContentHash = noVectorProfileIdentity(source.Activity.ID, source.Activity.Version, source.ProfileAlgorithmVersion, source.ProfileBuildKey)
+	}
+	err = tx.QueryRow(ctx, `SELECT id,user_id,version,algorithm_version,build_key,input_content_hash FROM preference_overlays WHERE id=$1 AND user_id=$2`, overlayID, userID).Scan(
+		&source.Overlay.ID, &source.Overlay.UserID, &source.Overlay.Version, &source.Overlay.AlgorithmVersion, &source.Overlay.BuildKey, &source.Overlay.InputContentHash,
+	)
+	if err != nil {
+		return RankingSource{}, err
+	}
+	return source, nil
+}
+
+func nullableUUID(value uuid.UUID) any {
+	if value == uuid.Nil {
+		return nil
+	}
+	return value
 }
 
 func (r *SQLRepository) SaveExplanation(ctx context.Context, userID uuid.UUID, rankingVersion int64, buildKey string, id uuid.UUID, gameName string, record ExplanationRecord) error {
@@ -859,8 +1002,8 @@ func scanRecommendation(row scanner) (Recommendation, error) {
 		r.Platforms = &Platforms{Windows: windows.Bool, Mac: mac.Bool, Linux: linux.Bool}
 	}
 	r.CoverImageURL, r.StoreURL = steamPresentation(r.SteamAppID, snapshot)
-	_ = json.Unmarshal(factors, &r.Factors)
-	_ = json.Unmarshal(weights, &r.Weights)
+	r.Factors = decodeFactors(factors)
+	r.Weights = decodeWeights(weights)
 	r.Confidence = r.Factors.Confidence
 	r.Wishlisted = clamp(r.Factors.Wishlist) > 0
 	mapStoredExplanation(&r, explanation, evidence, generated, ExplanationSource(source), failure)
@@ -876,6 +1019,60 @@ func scanRecommendation(row scanner) (Recommendation, error) {
 	}
 	r.Reviews = validReviewSummary(reviewBand, reviewLabel, reviewPercent, reviewTotal, reviewObservedAt)
 	return r, nil
+}
+
+func decodeFactors(raw []byte) Factors {
+	var result Factors
+	_ = json.Unmarshal(raw, &result)
+	var legacy struct {
+		PositiveSimilarity float64 `json:"positiveSimilarity"`
+		NegativeSimilarity float64 `json:"negativeSimilarity"`
+		PositiveFeedback   float64 `json:"positiveFeedback"`
+		NegativeFeedback   float64 `json:"negativeFeedback"`
+	}
+	_ = json.Unmarshal(raw, &legacy)
+	if result.ActivitySimilarity == 0 {
+		result.ActivitySimilarity = legacy.PositiveSimilarity
+	}
+	if result.NegativePreferenceSimilarity == 0 {
+		result.NegativePreferenceSimilarity = legacy.NegativeSimilarity
+	}
+	if result.PositiveDirectFeedback == 0 {
+		result.PositiveDirectFeedback = legacy.PositiveFeedback
+	}
+	if result.NegativeDirectFeedback == 0 {
+		result.NegativeDirectFeedback = legacy.NegativeFeedback
+	}
+	return result
+}
+
+func decodeWeights(raw []byte) Weights {
+	var result Weights
+	_ = json.Unmarshal(raw, &result)
+	var legacy struct {
+		SemanticSimilarity           float64 `json:"semanticSimilarity"`
+		PositiveFeedback             float64 `json:"positiveFeedback"`
+		NegativeFeedback             float64 `json:"negativeFeedback"`
+		NegativeSimilarityMultiplier float64 `json:"negativeSimilarityMultiplier"`
+		NegativeModePreferenceWeight float64 `json:"negativeModePreferenceWeight"`
+	}
+	_ = json.Unmarshal(raw, &legacy)
+	if result.ActivitySimilarity == 0 {
+		result.ActivitySimilarity = legacy.SemanticSimilarity
+	}
+	if result.PositiveDirectFeedback == 0 {
+		result.PositiveDirectFeedback = legacy.PositiveFeedback
+	}
+	if result.NegativeDirectFeedback == 0 {
+		result.NegativeDirectFeedback = legacy.NegativeFeedback
+	}
+	if result.NegativePreferenceSimilarity == 0 && legacy.SemanticSimilarity != 0 {
+		result.NegativePreferenceSimilarity = -legacy.SemanticSimilarity * legacy.NegativeSimilarityMultiplier
+	}
+	if result.NegativeModePreference == 0 {
+		result.NegativeModePreference = legacy.NegativeModePreferenceWeight
+	}
+	return result
 }
 
 func validReviewSummary(band, label pgtype.Text, percent pgtype.Int4, total pgtype.Int8, observedAt pgtype.Timestamptz) *ReviewSummary {

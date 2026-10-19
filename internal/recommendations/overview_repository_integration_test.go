@@ -60,21 +60,24 @@ func TestOverviewReadsOnePublishedRunDuringRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	repo, _ := NewSQLRepository(db, "embed", "text")
+	source := rankingSourceForTest(t, repo, owner, p)
 	service := &Service{repository: repo, eligibility: allowAllCurrentEligibility{}, clock: recommendationTestClock}
 	service.SetOverviewSources(repo, nil)
 	first := insertRankingGame(t, db, 7101, "Published discovery")
 	second := insertRankingGame(t, db, 7102, "Next wishlist")
-	firstSaved, v1, _, err := repo.SaveRanking(ctx, owner, p, []Recommendation{{GameID: first, AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights()}}, "overview-v1")
+	firstKey := RankingBuildKey("overview-v1", AlgorithmVersion, source)
+	firstSaved, v1, _, err := repo.SaveRanking(ctx, owner, source, []Recommendation{{GameID: first, AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights()}}, firstKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = repo.SaveExplanation(ctx, owner, v1, "overview-v1", firstSaved[0].ID, firstSaved[0].Name, ExplanationRecord{Text: neutralExplanation, Source: ExplanationSourceNone, Supplied: []GroundingEvidence{}}); err != nil {
+	if err = repo.SaveExplanation(ctx, owner, v1, firstKey, firstSaved[0].ID, firstSaved[0].Name, ExplanationRecord{Text: neutralExplanation, Source: ExplanationSourceNone, Supplied: []GroundingEvidence{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err = repo.PublishRanking(ctx, owner, v1, "overview-v1"); err != nil {
+	if err = repo.PublishRanking(ctx, owner, v1, firstKey); err != nil {
 		t.Fatal(err)
 	}
-	secondSaved, v2, _, err := repo.SaveRanking(ctx, owner, p, []Recommendation{{GameID: second, AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights(), Factors: Factors{Wishlist: 1}}}, "overview-v2")
+	secondKey := RankingBuildKey("overview-v2", AlgorithmVersion, source)
+	secondSaved, v2, _, err := repo.SaveRanking(ctx, owner, source, []Recommendation{{GameID: second, AlgorithmVersion: AlgorithmVersion, Weights: DefaultWeights(), Factors: Factors{Wishlist: 1}}}, secondKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,10 +85,10 @@ func TestOverviewReadsOnePublishedRunDuringRebuild(t *testing.T) {
 	if err != nil || before.Discoveries.Featured == nil || before.Discoveries.Featured.GameID != first || before.Discoveries.Featured.RankingVersion != v1 || before.Wishlist.Total != 0 {
 		t.Fatalf("before=%#v err=%v", before, err)
 	}
-	if err = repo.SaveExplanation(ctx, owner, v2, "overview-v2", secondSaved[0].ID, secondSaved[0].Name, ExplanationRecord{Text: neutralExplanation, Source: ExplanationSourceNone, Supplied: []GroundingEvidence{}}); err != nil {
+	if err = repo.SaveExplanation(ctx, owner, v2, secondKey, secondSaved[0].ID, secondSaved[0].Name, ExplanationRecord{Text: neutralExplanation, Source: ExplanationSourceNone, Supplied: []GroundingEvidence{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err = repo.PublishRanking(ctx, owner, v2, "overview-v2"); err != nil {
+	if err = repo.PublishRanking(ctx, owner, v2, secondKey); err != nil {
 		t.Fatal(err)
 	}
 	after, err := service.Overview(ctx, owner)

@@ -18,6 +18,7 @@ import (
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/catalog"
 	"next-game-crush/internal/jobs"
+	"next-game-crush/internal/preferences"
 	"next-game-crush/internal/profile"
 )
 
@@ -42,16 +43,27 @@ type CatalogRebuildObserver interface {
 type Repository interface {
 	Candidates(context.Context, uuid.UUID, profile.Profile, int) ([]Candidate, error)
 	RankingInputs(context.Context, uuid.UUID, profile.Profile, int) (RankingInputs, error)
-	SaveRanking(context.Context, uuid.UUID, profile.Profile, []Recommendation, string) ([]Recommendation, int64, bool, error)
+	ResolveRankingInputs(context.Context, RankingRequest, int) (RankingInputs, error)
+	SaveRanking(context.Context, uuid.UUID, RankingSource, []Recommendation, string) ([]Recommendation, int64, bool, error)
 	SaveExplanation(context.Context, uuid.UUID, int64, string, uuid.UUID, string, ExplanationRecord) error
 	PublishRanking(context.Context, uuid.UUID, int64, string) error
 	PublishedDeckRefreshTargets(context.Context, uuid.UUID, int64) ([]catalog.DeckRefreshTarget, error)
 	Latest(context.Context, uuid.UUID) ([]Recommendation, error)
 	Get(context.Context, uuid.UUID, uuid.UUID) (Recommendation, error)
 }
+type preferenceOverlayEnsurer interface {
+	EnsureCurrent(context.Context, uuid.UUID) (preferences.Overlay, error)
+}
+type preferenceRepositoryEnsurer struct{ repository *preferences.SQLRepository }
+
+func (e preferenceRepositoryEnsurer) EnsureCurrent(ctx context.Context, userID uuid.UUID) (preferences.Overlay, error) {
+	return e.repository.RebuildOverlay(ctx, userID, "")
+}
+
 type Service struct {
 	repository         Repository
 	profiles           *profile.Service
+	overlays           preferenceOverlayEnsurer
 	explainer          ExplanationClient
 	limit              int
 	queue              *jobs.Queue
@@ -91,11 +103,23 @@ func (s *Service) SetExplanationCache(cache ExplanationCache, model string) {
 	s.explanationModel = strings.TrimSpace(model)
 }
 
-func NewService(repository Repository, profiles *profile.Service, explainer ExplanationClient, eligibility catalog.CurrentEligibilityReader, clock func() time.Time) (*Service, error) {
+func NewService(repository Repository, profiles *profile.Service, explainer ExplanationClient, eligibility catalog.CurrentEligibilityReader, clock func() time.Time, overlayServices ...preferenceOverlayEnsurer) (*Service, error) {
 	if repository == nil || profiles == nil || eligibility == nil || clock == nil {
 		return nil, errors.New("recommendation repository, profile service, eligibility reader, and clock are required")
 	}
-	return &Service{repository: repository, profiles: profiles, explainer: explainer, eligibility: eligibility, clock: clock, limit: 100}, nil
+	var overlays preferenceOverlayEnsurer
+	if len(overlayServices) > 0 {
+		overlays = overlayServices[0]
+	} else if provider, ok := repository.(preferenceOverlayEnsurer); ok {
+		overlays = provider
+	} else if sqlRepository, ok := repository.(*SQLRepository); ok {
+		preferenceRepository, err := preferences.NewSQLRepository(sqlRepository.store)
+		if err != nil {
+			return nil, err
+		}
+		overlays = preferenceRepositoryEnsurer{repository: preferenceRepository}
+	}
+	return &Service{repository: repository, profiles: profiles, overlays: overlays, explainer: explainer, eligibility: eligibility, clock: clock, limit: 100}, nil
 }
 func (s *Service) Rebuild(ctx context.Context, userID uuid.UUID) ([]Recommendation, error) {
 	items, _, _, err := s.rebuild(ctx, userID, uuid.NewString())
@@ -103,33 +127,24 @@ func (s *Service) Rebuild(ctx context.Context, userID uuid.UUID) ([]Recommendati
 }
 func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string) ([]Recommendation, int64, ExplanationStats, error) {
 	emptyStats := ExplanationStats{FailureReasons: map[ExplanationFailureReason]int{}}
-	p, err := s.profiles.Latest(ctx, userID)
-	if err != nil {
-		return nil, 0, emptyStats, fmt.Errorf("load current profile: %w", err)
+	if s.overlays == nil {
+		return nil, 0, emptyStats, errors.New("preference overlay service is required")
 	}
-	// Eligibility must run before the presentation limit so expired rows cannot
-	// consume capacity that belongs to current candidates.
-	input, err := s.repository.RankingInputs(ctx, userID, p, 1000000)
+	input, err := s.resolveCoherentInputs(ctx, userID, buildKey)
 	if err != nil {
 		return nil, 0, emptyStats, fmt.Errorf("retrieve candidates: %w", err)
 	}
+	p := input.Source.Activity
 	allowed, err := s.eligibility.FilterEligibleGameIDs(ctx, candidateIDs(input.Candidates), s.clock().UTC())
 	if err != nil {
 		return nil, 0, emptyStats, fmt.Errorf("filter current catalog eligibility: %w", err)
 	}
 	candidates := make([]Candidate, 0, len(input.Candidates))
-	nonWishlist := 0
 	for _, candidate := range input.Candidates {
 		if !allowed[candidate.GameID] {
 			continue
 		}
-		if candidate.Factors.Wishlist != 1 && nonWishlist >= s.limit {
-			continue
-		}
 		candidates = append(candidates, candidate)
-		if candidate.Factors.Wishlist != 1 {
-			nonWishlist++
-		}
 	}
 	weights := DefaultWeights()
 	output := make([]Recommendation, 0, len(candidates))
@@ -145,8 +160,12 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 		output = append(output, item)
 	}
 	output = Sort(output)
-	runBuildKey := RankingBuildKey(buildKey, AlgorithmVersion, ActiveAdjustmentsDigest(input.ActiveAdjustments))
-	saved, rankingVersion, alreadyPublished, err := s.repository.SaveRanking(ctx, userID, p, output, runBuildKey)
+	// Rank the complete deduplicated union first. The presentation cap applies
+	// only afterwards so a strong item from a later retrieval leg cannot be
+	// discarded before scoring; wishlist entries are mandatory and uncapped.
+	output = capRankedRecommendations(output, s.limit)
+	runBuildKey := RankingBuildKey(buildKey, AlgorithmVersion, input.Source)
+	saved, rankingVersion, alreadyPublished, err := s.repository.SaveRanking(ctx, userID, input.Source, output, runBuildKey)
 	if err != nil {
 		return nil, 0, emptyStats, fmt.Errorf("persist ranking: %w", err)
 	}
@@ -206,6 +225,45 @@ func (s *Service) rebuild(ctx context.Context, userID uuid.UUID, buildKey string
 		return nil, rankingVersion, stats, err
 	}
 	return saved, rankingVersion, stats, nil
+}
+
+func capRankedRecommendations(ranked []Recommendation, nonWishlistLimit int) []Recommendation {
+	result := make([]Recommendation, 0, len(ranked))
+	nonWishlist := 0
+	for _, item := range ranked {
+		if !item.Wishlisted && nonWishlist >= nonWishlistLimit {
+			continue
+		}
+		result = append(result, item)
+		if !item.Wishlisted {
+			nonWishlist++
+		}
+	}
+	return result
+}
+
+// resolveCoherentInputs closes the gap between publishing an overlay and
+// opening the ranking snapshot. A feedback commit in that gap makes the first
+// snapshot's direct factors newer than its overlay; rebuilding once more
+// detects that change and retries with the exact newly published overlay.
+func (s *Service) resolveCoherentInputs(ctx context.Context, userID uuid.UUID, buildKey string) (RankingInputs, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if _, err := s.overlays.EnsureCurrent(ctx, userID); err != nil {
+			return RankingInputs{}, fmt.Errorf("ensure current preference overlay: %w", err)
+		}
+		input, err := s.repository.ResolveRankingInputs(ctx, RankingRequest{UserID: userID, RequestKey: buildKey}, 1000000)
+		if err != nil {
+			return RankingInputs{}, err
+		}
+		current, err := s.overlays.EnsureCurrent(ctx, userID)
+		if err != nil {
+			return RankingInputs{}, fmt.Errorf("verify current preference overlay: %w", err)
+		}
+		if current.ID == input.Source.Overlay.ID && current.InputContentHash == input.Source.Overlay.InputContentHash {
+			return input, nil
+		}
+	}
+	return RankingInputs{}, errors.New("preference overlay changed during ranking snapshot")
 }
 
 func (s *Service) explainCached(ctx context.Context, userID, gameID uuid.UUID, name string, selected []GroundingEvidence) (ExplanationResult, error) {
@@ -543,17 +601,15 @@ func publicEvidence(r Recommendation) []Evidence {
 		order        int
 	}
 
-	affinity := clamp(r.Factors.PositiveSimilarity) - r.Weights.NegativeSimilarityMultiplier*clamp(r.Factors.NegativeSimilarity)
-	if affinity < 0 {
-		affinity = 0
-	}
+	affinity := r.Factors.ActivitySimilarity
 	reasons := []reason{
-		{Evidence: Evidence{ID: "semantic-affinity", Text: "Похожа на игры, которые вам нравятся"}, contribution: affinity * r.Weights.SemanticSimilarity, order: 0},
+		{Evidence: Evidence{ID: "semantic-affinity", Text: "Похожа на игры, в которые вы играли"}, contribution: clamp(affinity) * r.Weights.ActivitySimilarity, order: 0},
+		{Evidence: Evidence{ID: "preference-affinity", Text: "Похожа на игры, которые вы отмечали как понравившиеся"}, contribution: clamp(r.Factors.PositivePreferenceSimilarity) * r.Weights.PositivePreferenceSimilarity, order: 1},
 		{Evidence: Evidence{ID: "tag-affinity", Text: "Совпадает с вашими любимыми жанрами и метками"}, contribution: clamp(r.Factors.TagAffinity) * r.Weights.TagAffinity, order: 2},
 		{Evidence: Evidence{ID: "playtime-affinity", Text: "Похожа на игры, которым вы уделяли много времени"}, contribution: clamp(r.Factors.PlaytimeAffinity) * r.Weights.PlaytimeAffinity, order: 3},
 		{Evidence: Evidence{ID: "achievement-affinity", Text: "Похожа на игры, в которых вы часто получали достижения"}, contribution: clamp(r.Factors.AchievementAffinity) * r.Weights.AchievementAffinity, order: 4},
 		{Evidence: Evidence{ID: "recent-activity", Text: "Соответствует вашим недавним игровым интересам"}, contribution: clamp(r.Factors.RecentActivityAffinity) * r.Weights.RecentActivityAffinity, order: 5},
-		{Evidence: Evidence{ID: "positive-feedback", Text: "Учитывает ваши положительные оценки"}, contribution: clamp(r.Factors.PositiveFeedback) * r.Weights.PositiveFeedback, order: 6},
+		{Evidence: Evidence{ID: "positive-feedback", Text: "Учитывает вашу положительную оценку этой игры"}, contribution: clamp(r.Factors.PositiveDirectFeedback) * r.Weights.PositiveDirectFeedback, order: 6},
 		{Evidence: Evidence{ID: "novelty", Text: "Добавляет новое к вашим привычным игровым интересам"}, contribution: clamp(r.Factors.Novelty) * r.Weights.Novelty, order: 7},
 	}
 	positive := reasons[:0]

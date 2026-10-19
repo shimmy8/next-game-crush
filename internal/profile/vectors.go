@@ -25,12 +25,6 @@ type Signal struct {
 	CompletionAt             time.Time
 	CompletionBasis          string
 	CompletionAlgorithm      string
-	// Deprecated compatibility fields. Activity loaders and vector builders never
-	// populate or consume them; Task 5 removes the remaining ranking callers.
-	CompletionOverridden bool
-	Wishlisted           bool
-	Likes                int
-	Dislikes             int
 }
 
 type Vectors struct {
@@ -46,13 +40,10 @@ type Vectors struct {
 
 type SignalWeights struct {
 	Positive    float64
-	Negative    float64 // deprecated; always zero for activity profiles
 	Playtime    float64
 	Recent      float64
 	Achievement float64
 	Completion  float64
-	Wishlist    float64 // deprecated; always zero for activity profiles
-	Feedback    float64 // deprecated; always zero for activity profiles
 }
 
 func CalculateSignalWeights(input []Signal, asOf time.Time) map[uuid.UUID]SignalWeights {

@@ -8,39 +8,59 @@ import (
 	"next-game-crush/internal/profile"
 )
 
-const AlgorithmVersion = "ranking-v4-achievement-completion"
+const (
+	AlgorithmVersion        = "ranking-v5-activity-overlay"
+	ActivityNeighborLimit   = 100
+	PreferenceNeighborLimit = 40
+)
 
 type Factors struct {
-	NegativeModePreference float64 `json:"negativeModePreference"`
-	PositiveSimilarity     float64 `json:"positiveSimilarity"`
-	NegativeSimilarity     float64 `json:"negativeSimilarity"`
-	Wishlist               float64 `json:"wishlist"`
-	TagAffinity            float64 `json:"tagAffinity"`
-	PlaytimeAffinity       float64 `json:"playtimeAffinity"`
-	AchievementAffinity    float64 `json:"achievementAffinity"`
-	RecentActivityAffinity float64 `json:"recentActivityAffinity"`
-	CompletionAffinity     float64 `json:"completionAffinity"`
-	PositiveFeedback       float64 `json:"positiveFeedback"`
-	Novelty                float64 `json:"novelty"`
-	NegativeFeedback       float64 `json:"negativeFeedback"`
-	DateUncertainty        float64 `json:"dateUncertainty"`
-	Confidence             float64 `json:"confidence"`
-}
-
-type Weights struct {
-	NegativeModePreferenceWeight float64 `json:"negativeModePreferenceWeight"`
-	SemanticSimilarity           float64 `json:"semanticSimilarity"`
+	ActivitySimilarity           float64 `json:"activitySimilarity"`
+	PositivePreferenceSimilarity float64 `json:"positivePreferenceSimilarity"`
+	NegativePreferenceSimilarity float64 `json:"negativePreferenceSimilarity"`
+	PositiveDirectFeedback       float64 `json:"positiveDirectFeedback"`
+	NegativeDirectFeedback       float64 `json:"negativeDirectFeedback"`
+	NegativeModePreference       float64 `json:"negativeModePreference"`
 	Wishlist                     float64 `json:"wishlist"`
 	TagAffinity                  float64 `json:"tagAffinity"`
 	PlaytimeAffinity             float64 `json:"playtimeAffinity"`
 	AchievementAffinity          float64 `json:"achievementAffinity"`
 	RecentActivityAffinity       float64 `json:"recentActivityAffinity"`
 	CompletionAffinity           float64 `json:"completionAffinity"`
-	PositiveFeedback             float64 `json:"positiveFeedback"`
 	Novelty                      float64 `json:"novelty"`
-	NegativeFeedback             float64 `json:"negativeFeedback"`
 	DateUncertainty              float64 `json:"dateUncertainty"`
-	NegativeSimilarityMultiplier float64 `json:"negativeSimilarityMultiplier"`
+	Confidence                   float64 `json:"confidence"`
+}
+
+type Weights struct {
+	ActivitySimilarity           float64 `json:"activitySimilarity"`
+	PositivePreferenceSimilarity float64 `json:"positivePreferenceSimilarity"`
+	NegativePreferenceSimilarity float64 `json:"negativePreferenceSimilarity"`
+	PositiveDirectFeedback       float64 `json:"positiveDirectFeedback"`
+	NegativeDirectFeedback       float64 `json:"negativeDirectFeedback"`
+	NegativeModePreference       float64 `json:"negativeModePreference"`
+	Wishlist                     float64 `json:"wishlist"`
+	TagAffinity                  float64 `json:"tagAffinity"`
+	PlaytimeAffinity             float64 `json:"playtimeAffinity"`
+	AchievementAffinity          float64 `json:"achievementAffinity"`
+	RecentActivityAffinity       float64 `json:"recentActivityAffinity"`
+	CompletionAffinity           float64 `json:"completionAffinity"`
+	Novelty                      float64 `json:"novelty"`
+	DateUncertainty              float64 `json:"dateUncertainty"`
+}
+
+type RankingSource struct {
+	Activity                profile.Profile
+	Overlay                 preferences.Overlay
+	ProfileAlgorithmVersion string
+	ProfileBuildKey         string
+	ProfileInputContentHash string
+}
+
+type RankingRequest struct {
+	UserID          uuid.UUID
+	ProfileBuildKey string
+	RequestKey      string
 }
 
 type Result struct {

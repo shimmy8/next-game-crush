@@ -129,7 +129,7 @@ func TestLoadActivitySignalsIgnoreDirectActionsAndPreserveCompletion(t *testing.
 			t.Fatalf("signals = %#v, want one", signals)
 		}
 		got := signals[0]
-		if got.CompletionWeight != 1.85 || got.CompletionOverridden || got.Likes != 0 || got.Dislikes != 0 {
+		if got.CompletionWeight != 1.85 {
 			t.Fatalf("activity signal leaked direct feedback: %#v", got)
 		}
 		var weight float64
