@@ -372,10 +372,10 @@ func TestNonFiniteEmbeddingIsNeverPersisted(t *testing.T) {
 func TestProfileSummaryIsNormalizedBeforePersistence(t *testing.T) {
 	repository := &fakeRepository{profileEvidence: ProfileEvidence{EvidenceKey: "profile", Evidence: []EvidenceItem{{Key: "signal-1", Value: "puzzles"}}}}
 	client := &fakeClient{profileSummary: ProfileSummary{
-		Summary:      "  " + strings.Repeat("я", 650) + "  ",
-		Preferences:  []string{" puzzles ", "", "puzzles", strings.Repeat("я", 145)},
+		Summary:      "  " + strings.Repeat("я", 650) + " (signal-1)  ",
+		Preferences:  []string{" puzzles [signal-1] ", "", "puzzles", strings.Repeat("я", 145)},
 		Avoidances:   nil,
-		Uncertainty:  "  мало данных  ",
+		Uncertainty:  "  мало данных (signal-1)  ",
 		EvidenceKeys: []string{"signal-1"},
 	}}
 	service, _ := NewService(repository, client, "gpt-6-luna", "text-embedding-3-small")

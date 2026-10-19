@@ -96,7 +96,7 @@ func (client *OpenAI) SummarizeProfile(ctx context.Context, input ProfileEvidenc
 	for i, item := range normalized.Evidence {
 		allowedKeys[i] = item.Key
 	}
-	err = client.structured(ctx, "profile_summary_v5", profileInstructions, ProfilePromptVersion, profileSummarySchema(allowedKeys), normalized, &output)
+	err = client.structured(ctx, "profile_summary_v6", profileInstructions, ProfilePromptVersion, profileSummarySchema(allowedKeys), normalized, &output)
 	if err != nil {
 		return ProfileSummary{}, err
 	}
@@ -474,11 +474,26 @@ func validateFeatureOutput(output GameFeatures) error {
 }
 
 func normalizeAndValidateProfileOutput(output ProfileSummary, allowed map[string]struct{}) (ProfileSummary, error) {
-	output.Summary = strings.TrimSpace(output.Summary)
-	output.Uncertainty = strings.TrimSpace(output.Uncertainty)
+	var err error
+	output.Summary, err = sanitizeProfileText(output.Summary, allowed)
+	if err != nil {
+		return ProfileSummary{}, err
+	}
+	output.Uncertainty, err = sanitizeProfileText(output.Uncertainty, allowed)
+	if err != nil {
+		return ProfileSummary{}, err
+	}
 	summaryLength := utf8.RuneCountInString(output.Summary)
 	if !utf8.ValidString(output.Summary) || summaryLength == 0 || summaryLength > 4000 || !utf8.ValidString(output.Uncertainty) || utf8.RuneCountInString(output.Uncertainty) > 2000 {
 		return ProfileSummary{}, fmt.Errorf("%w: invalid profile text", ErrInvalidOutput)
+	}
+	output.Preferences, err = sanitizeProfileValues(output.Preferences, allowed)
+	if err != nil {
+		return ProfileSummary{}, err
+	}
+	output.Avoidances, err = sanitizeProfileValues(output.Avoidances, allowed)
+	if err != nil {
+		return ProfileSummary{}, err
 	}
 	output.Preferences = normalizeProfileValues(output.Preferences, 30, 144)
 	output.Avoidances = normalizeProfileValues(output.Avoidances, 30, 144)
@@ -486,6 +501,78 @@ func normalizeAndValidateProfileOutput(output ProfileSummary, allowed map[string
 		return ProfileSummary{}, err
 	}
 	return output, nil
+}
+
+var profileSignalPattern = regexp.MustCompile(`signal-[0-9]+`)
+var profileCitationGroupPattern = regexp.MustCompile(`\([^()]*signal-[0-9]+[^()]*\)|\[[^\[\]]*signal-[0-9]+[^\[\]]*\]`)
+var profileCitationExpressionPattern = regexp.MustCompile(`signal-[0-9]+(?:[ \t]*[–—-][ \t]*signal-[0-9]+)?`)
+var profileCitationRangePattern = regexp.MustCompile(`^(signal-)([0-9]+)[ \t]*[–—-][ \t]*signal-([0-9]+)$`)
+var profileCitationSeparatorsPattern = regexp.MustCompile(`^[\s,;]*$`)
+var profileRepeatedSpacesPattern = regexp.MustCompile(`[ \t]{2,}`)
+var profileSpaceBeforePunctuationPattern = regexp.MustCompile(`[ \t]+([,.;:!?])`)
+
+func sanitizeProfileText(value string, allowed map[string]struct{}) (string, error) {
+	unsafe := false
+	value = profileCitationGroupPattern.ReplaceAllStringFunc(value, func(group string) string {
+		if !validProfileCitationGroup(group[1:len(group)-1], allowed) {
+			unsafe = true
+			return group
+		}
+		return ""
+	})
+	if unsafe || profileSignalPattern.MatchString(value) {
+		return "", fmt.Errorf("%w: inline profile citation", ErrInvalidEvidence)
+	}
+	value = profileRepeatedSpacesPattern.ReplaceAllString(value, " ")
+	value = profileSpaceBeforePunctuationPattern.ReplaceAllString(value, "$1")
+	return strings.TrimSpace(value), nil
+}
+
+func validProfileCitationGroup(content string, allowed map[string]struct{}) bool {
+	matches := profileCitationExpressionPattern.FindAllStringIndex(content, -1)
+	if len(matches) == 0 {
+		return false
+	}
+	position := 0
+	for _, match := range matches {
+		if !profileCitationSeparatorsPattern.MatchString(content[position:match[0]]) || !allowedProfileCitationExpression(content[match[0]:match[1]], allowed) {
+			return false
+		}
+		position = match[1]
+	}
+	return profileCitationSeparatorsPattern.MatchString(content[position:])
+}
+
+func allowedProfileCitationExpression(expression string, allowed map[string]struct{}) bool {
+	parts := profileCitationRangePattern.FindStringSubmatch(expression)
+	if parts == nil {
+		_, ok := allowed[expression]
+		return ok
+	}
+	start, startErr := strconv.Atoi(parts[2])
+	end, endErr := strconv.Atoi(parts[3])
+	if startErr != nil || endErr != nil || end < start || len(parts[2]) != len(parts[3]) || end-start >= len(allowed) {
+		return false
+	}
+	for index := start; index <= end; index++ {
+		key := parts[1] + fmt.Sprintf("%0*d", len(parts[2]), index)
+		if _, ok := allowed[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeProfileValues(values []string, allowed map[string]struct{}) ([]string, error) {
+	result := make([]string, len(values))
+	for index, value := range values {
+		cleaned, err := sanitizeProfileText(value, allowed)
+		if err != nil {
+			return nil, err
+		}
+		result[index] = cleaned
+	}
+	return result, nil
 }
 
 func normalizeProfileValues(values []string, maxItems, maxRunes int) []string {

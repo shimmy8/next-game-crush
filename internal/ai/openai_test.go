@@ -191,7 +191,7 @@ func TestProfileExplanationAndFeedbackStructuredOperations(t *testing.T) {
 	}
 }
 
-func TestProfileSummaryUsesV5StrictSchemaWithOnlySuppliedCitationKeys(t *testing.T) {
+func TestProfileSummaryUsesV6StrictSchemaWithOnlySuppliedCitationKeys(t *testing.T) {
 	var request map[string]any
 	profileText := strings.Repeat("я", 650)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -215,7 +215,7 @@ func TestProfileSummaryUsesV5StrictSchemaWithOnlySuppliedCitationKeys(t *testing
 	}
 
 	format := request["text"].(map[string]any)["format"].(map[string]any)
-	if format["name"] != "profile_summary_v5" || format["strict"] != true {
+	if format["name"] != "profile_summary_v6" || format["strict"] != true {
 		t.Fatalf("format = %#v", format)
 	}
 	schema := format["schema"].(map[string]any)
@@ -327,6 +327,72 @@ func TestProfileSummaryNormalizesOptionalArraysWithoutFailing(t *testing.T) {
 	}
 	if output.Uncertainty != "мало данных" {
 		t.Fatalf("uncertainty = %q", output.Uncertainty)
+	}
+}
+
+func TestProfileSummaryRemovesAllowedInlineEvidence(t *testing.T) {
+	allowed := map[string]struct{}{
+		"signal-001": {},
+		"signal-002": {},
+		"signal-003": {},
+		"signal-004": {},
+	}
+	output, err := normalizeAndValidateProfileOutput(ProfileSummary{
+		Summary:      "Сейчас заметна активность. (signal-001–signal-004) История остаётся разнообразной.",
+		Preferences:  []string{"Тактические игры [signal-001, signal-002]"},
+		Avoidances:   []string{"Долгий гринд (signal-003)"},
+		Uncertainty:  "Даты запусков неизвестны [signal-004].",
+		EvidenceKeys: []string{"signal-001", "signal-004"},
+	}, allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output.Summary != "Сейчас заметна активность. История остаётся разнообразной." {
+		t.Fatalf("summary = %q", output.Summary)
+	}
+	if !reflect.DeepEqual(output.Preferences, []string{"Тактические игры"}) {
+		t.Fatalf("preferences = %#v", output.Preferences)
+	}
+	if !reflect.DeepEqual(output.Avoidances, []string{"Долгий гринд"}) {
+		t.Fatalf("avoidances = %#v", output.Avoidances)
+	}
+	if output.Uncertainty != "Даты запусков неизвестны." {
+		t.Fatalf("uncertainty = %q", output.Uncertainty)
+	}
+}
+
+func TestProfileSummaryRejectsUnsafeInlineEvidence(t *testing.T) {
+	allowed := map[string]struct{}{
+		"signal-001": {},
+		"signal-002": {},
+		"signal-003": {},
+		"signal-004": {},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*ProfileSummary)
+	}{
+		{name: "unknown range", mutate: func(output *ProfileSummary) { output.Summary += " (signal-001–signal-005)" }},
+		{name: "mixed prose and key", mutate: func(output *ProfileSummary) { output.Summary += " (см. signal-001)" }},
+		{name: "ungrouped key", mutate: func(output *ProfileSummary) { output.Summary += " signal-001" }},
+		{name: "preference", mutate: func(output *ProfileSummary) { output.Preferences = []string{"Тактика [signal-999]"} }},
+		{name: "avoidance", mutate: func(output *ProfileSummary) { output.Avoidances = []string{"Гринд signal-001"} }},
+		{name: "uncertainty", mutate: func(output *ProfileSummary) { output.Uncertainty = "Мало данных (signal-999)" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			output := ProfileSummary{
+				Summary:      "Наблюдается разнообразная игровая активность.",
+				Preferences:  []string{},
+				Avoidances:   []string{},
+				EvidenceKeys: []string{"signal-001"},
+			}
+			test.mutate(&output)
+			_, err := normalizeAndValidateProfileOutput(output, allowed)
+			if !errors.Is(err, ErrInvalidEvidence) {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }
 

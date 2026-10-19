@@ -39,7 +39,7 @@ func TestExplanationPromptRequiresSafeRussianPresentation(t *testing.T) {
 }
 
 func TestProfilePromptContract(t *testing.T) {
-	if ProfilePromptVersion != "profile-summary-v5-synthesis" {
+	if ProfilePromptVersion != "profile-summary-v6-inline-evidence" {
 		t.Fatalf("ProfilePromptVersion = %q", ProfilePromptVersion)
 	}
 	for _, required := range []string{
@@ -60,6 +60,8 @@ func TestProfilePromptContract(t *testing.T) {
 		"never invent last-played or release dates",
 		"at most one concise material caveat",
 		"detailed caveats in uncertainty",
+		"opaque evidence keys only in the structured evidence_keys field",
+		"Never include them in summary, preferences, avoidances, or uncertainty",
 	} {
 		if !strings.Contains(profileInstructions, required) {
 			t.Fatalf("profile instructions do not contain %q: %q", required, profileInstructions)
