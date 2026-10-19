@@ -29,7 +29,8 @@ func TestMutableFixtureControlsAreUnavailableOutsideHarness(t *testing.T) {
 }
 
 func TestCatalogSearchFixturesCoverFourFeedsAndReviewTransition(t *testing.T) {
-	handler := newE2EFakeHandler(true)
+	fixtureDay := time.Date(2032, time.March, 15, 0, 0, 0, 0, time.UTC)
+	handler := newE2EFakeHandlerAt(true, fixtureDay)
 	client, err := steam.NewClient(steam.HTTPConfig{
 		APIKey:             "fixture-steam-key",
 		StoreBaseURL:       "https://fixture.invalid",
@@ -75,10 +76,52 @@ func TestCatalogSearchFixturesCoverFourFeedsAndReviewTransition(t *testing.T) {
 	if err != nil || changedPage.Items[0].Review.Band != steam.ReviewMixedOrBelow || changedPage.Items[0].Review.PositivePercent == nil || *changedPage.Items[0].Review.PositivePercent != 62 {
 		t.Fatalf("parsed review transition=%+v err=%v", changedPage, err)
 	}
+	postNoContent(t, handler, "/__test/search-reviews?mode=changed_expired")
+	expiredPage, err := client.Search(context.Background(), steam.SearchRequest{Feed: steam.FeedPopularNew, Count: 200})
+	if err != nil || expiredPage.Items[1].ReleaseText != fixtureSearchDate(fixtureDay.AddDate(0, 0, -8)) {
+		t.Fatalf("unrated expiry transition=%+v err=%v", expiredPage, err)
+	}
 
 	page := searchFixtureResponse(t, handler, "popularnew", 2, 1)
 	if page.Start != 2 || page.PageSize != 1 || !strings.Contains(page.HTML, `data-ds-appid="520003"`) {
 		t.Fatalf("pagination response = %+v", page)
+	}
+}
+
+func TestCatalogSearchCanHoldConcurrentPopularRequests(t *testing.T) {
+	handler := newE2EFakeHandler(true)
+	postNoContent(t, handler, "/__test/search-mode?mode=hold_popular")
+	done := make(chan struct{}, 6)
+	for range 6 {
+		go func() {
+			response := rawSearchResponse(handler, "popularcomingsoon")
+			if response.Code == http.StatusOK {
+				done <- struct{}{}
+			}
+		}()
+	}
+	var counters struct {
+		ActiveSearch    int `json:"activeSearch"`
+		MaxActiveSearch int `json:"maxActiveSearch"`
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		decodeGET(t, handler, "/__test/catalog-counters", &counters)
+		if counters.ActiveSearch == 6 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if counters.ActiveSearch != 6 || counters.MaxActiveSearch != 6 {
+		t.Fatalf("held search counters = %+v", counters)
+	}
+	postNoContent(t, handler, "/__test/search-mode?mode=healthy")
+	for range 6 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("held search did not resume")
+		}
 	}
 }
 
@@ -95,6 +138,10 @@ func TestCatalogSearchFailureModesAndCounters(t *testing.T) {
 	broken := searchFixtureResponse(t, handler, "popularcomingsoon", 0, 200)
 	if !strings.Contains(broken.HTML, "fixture-layout-changed") || strings.Contains(broken.HTML, "search_result_row") {
 		t.Fatalf("parser breakage fixture = %+v", broken)
+	}
+	parserRetry := rawSearchResponse(handler, "popularcomingsoon")
+	if parserRetry.Code != http.StatusTooManyRequests || parserRetry.Header().Get("Retry-After") != "1" {
+		t.Fatalf("parser retry status=%d retry-after=%q", parserRetry.Code, parserRetry.Header().Get("Retry-After"))
 	}
 	postNoContent(t, handler, "/__test/search-mode?mode=tail_rate_limited")
 	tail := rawSearchResponse(handler, "recent")
@@ -118,7 +165,7 @@ func TestCatalogSearchFailureModesAndCounters(t *testing.T) {
 		AIByApp    map[string]int `json:"aiByApp"`
 	}
 	decodeGET(t, handler, "/__test/catalog-counters", &counters)
-	if counters.Search["popularcomingsoon"] != 2 || counters.AppDetails["520001"] != 2 || counters.AI != 2 || counters.AIByApp["520001"] != 2 {
+	if counters.Search["popularcomingsoon"] != 3 || counters.AppDetails["520001"] != 2 || counters.AI != 2 || counters.AIByApp["520001"] != 2 {
 		t.Fatalf("counters = %+v", counters)
 	}
 
@@ -132,6 +179,39 @@ func TestCatalogSearchFailureModesAndCounters(t *testing.T) {
 	decodeGET(t, handler, "/__test/catalog-counters", &counters)
 	if len(counters.Search) != 0 || len(counters.AppDetails) != 0 || counters.AI != 0 || len(counters.AIByApp) != 0 {
 		t.Fatalf("reset counters = %+v", counters)
+	}
+}
+
+func TestRestartFixtureIntroducesFreshCandidateWhileTailsWait(t *testing.T) {
+	handler := newE2EFakeHandlerAt(true, time.Date(2032, time.March, 15, 0, 0, 0, 0, time.UTC))
+	postNoContent(t, handler, "/__test/search-mode?mode=restart_tail_rate_limited")
+	popular := searchFixtureResponse(t, handler, "popularnew", 0, 200)
+	if popular.Total != 5 || !strings.Contains(popular.HTML, `data-ds-appid="520005"`) {
+		t.Fatalf("restart popular-new fixture = %+v", popular)
+	}
+	tail := rawSearchResponse(handler, "recent")
+	if tail.Code != http.StatusTooManyRequests || tail.Header().Get("Retry-After") != "7" {
+		t.Fatalf("restart tail status=%d retry-after=%q", tail.Code, tail.Header().Get("Retry-After"))
+	}
+	getOK(t, handler, "/api/appdetails?appids=520005")
+}
+
+func TestReconciliationFixtureCompletesAndCountsPages(t *testing.T) {
+	handler := newE2EFakeHandler(true)
+	first := fixtureRequest(handler, http.MethodGet, appListFixtureURL(0))
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"have_more_results":true`) {
+		t.Fatalf("first reconciliation page status=%d body=%q", first.Code, first.Body.String())
+	}
+	second := fixtureRequest(handler, http.MethodGet, appListFixtureURL(424246))
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"have_more_results":false`) {
+		t.Fatalf("last reconciliation page status=%d body=%q", second.Code, second.Body.String())
+	}
+	var counters struct {
+		AppList int `json:"appList"`
+	}
+	decodeGET(t, handler, "/__test/catalog-counters", &counters)
+	if counters.AppList != 2 {
+		t.Fatalf("app list requests=%d", counters.AppList)
 	}
 }
 
@@ -175,6 +255,28 @@ func TestCatalogFixtureDatesStayRelativeAndSearchMatchesAppDetails(t *testing.T)
 			t.Fatalf("AppID %d appdetails release=%q, want %q", tc.appID, got, wantStore)
 		}
 	}
+	postNoContent(t, handler, "/__test/search-reviews?mode=changed_expired")
+	response := fixtureRequest(handler, http.MethodGet, "/api/appdetails?appids=520002")
+	var expired map[string]struct {
+		Data struct {
+			ReleaseDate struct {
+				Date string `json:"date"`
+			} `json:"release_date"`
+		} `json:"data"`
+	}
+	if response.Code != http.StatusOK || json.NewDecoder(response.Body).Decode(&expired) != nil || expired["520002"].Data.ReleaseDate.Date != fixtureStoreDate(fixtureDay.AddDate(0, 0, -8)) {
+		t.Fatalf("expired appdetails status=%d payload=%+v", response.Code, expired)
+	}
+}
+
+func TestExpiredReviewModeKeepsPositiveAnchor(t *testing.T) {
+	fixtureDay := time.Date(2032, time.March, 15, 0, 0, 0, 0, time.UTC)
+	handler := newE2EFakeHandlerAt(true, fixtureDay)
+	postNoContent(t, handler, "/__test/search-reviews?mode=expired")
+	page := searchFixtureResponse(t, handler, "popularnew", 0, 200)
+	if !strings.Contains(page.HTML, "91%") || strings.Contains(page.HTML, "62%") || !strings.Contains(page.HTML, fixtureSearchDate(fixtureDay.AddDate(0, 0, -8))) {
+		t.Fatalf("expired-only transition = %s", page.HTML)
+	}
 }
 
 type searchFixtureEnvelope struct {
@@ -204,6 +306,11 @@ func rawSearchResponse(handler http.Handler, filter string) *httptest.ResponseRe
 func rawSearchResponseWithPage(handler http.Handler, filter string, start, count int) *httptest.ResponseRecorder {
 	query := url.Values{"filter": {filter}, "category1": {"998"}, "ignore_preferences": {"1"}, "infinite": {"1"}, "start": {strconv.Itoa(start)}, "count": {strconv.Itoa(count)}}
 	return fixtureRequest(handler, http.MethodGet, "/search/results/?"+query.Encode())
+}
+
+func appListFixtureURL(lastAppID int) string {
+	input := url.QueryEscape(`{"include_games":true,"last_appid":` + strconv.Itoa(lastAppID) + `,"max_results":200}`)
+	return "/IStoreService/GetAppList/v1/?input_json=" + input
 }
 
 func postNoContent(t *testing.T, handler http.Handler, endpoint string) {

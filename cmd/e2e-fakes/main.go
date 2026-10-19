@@ -36,18 +36,38 @@ func run() error {
 type catalogFixtureState struct {
 	mu                 sync.Mutex
 	fixtureDay         time.Time
+	runToken           string
+	daySevenAppID      int64
+	restartAppID       int64
+	duplicateAppID     int64
 	searchMode         string
 	reviewMode         string
 	searchRequests     map[string]int
 	appDetailsRequests map[int64]int
 	aiRequests         int
 	aiByApp            map[int64]int
+	parserBrokenCalls  int
+	activeSearch       int
+	maxActiveSearch    int
+	searchRelease      chan struct{}
 }
 
 func newCatalogFixtureState(now time.Time) *catalogFixtureState {
 	year, month, day := now.UTC().Date()
+	daySevenAppID := int64(520002)
+	restartAppID := int64(520005)
+	duplicateAppID := int64(520006)
+	if now.Nanosecond() != 0 {
+		daySevenAppID = 600_000_000 + now.UnixNano()%100_000_000
+		restartAppID = 700_000_000 + now.UnixNano()%100_000_000
+		duplicateAppID = 800_000_000 + now.UnixNano()%100_000_000
+	}
 	return &catalogFixtureState{
 		fixtureDay:         time.Date(year, month, day, 0, 0, 0, 0, time.UTC),
+		runToken:           strconv.FormatInt(now.UnixNano(), 36),
+		daySevenAppID:      daySevenAppID,
+		restartAppID:       restartAppID,
+		duplicateAppID:     duplicateAppID,
 		searchMode:         "healthy",
 		reviewMode:         "initial",
 		searchRequests:     make(map[string]int),
@@ -59,12 +79,19 @@ func newCatalogFixtureState(now time.Time) *catalogFixtureState {
 func (s *catalogFixtureState) reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.searchRelease != nil {
+		close(s.searchRelease)
+		s.searchRelease = nil
+	}
 	s.searchMode = "healthy"
 	s.reviewMode = "initial"
 	s.searchRequests = make(map[string]int)
 	s.appDetailsRequests = make(map[int64]int)
 	s.aiRequests = 0
 	s.aiByApp = make(map[int64]int)
+	s.parserBrokenCalls = 0
+	s.activeSearch = 0
+	s.maxActiveSearch = 0
 }
 
 func newE2EFakeHandler(testHarness bool) http.Handler {
@@ -102,12 +129,19 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		}
 		mode := r.URL.Query().Get("mode")
 		switch mode {
-		case "healthy", "popular_parser_broken", "popular_rate_limited", "tail_rate_limited":
+		case "healthy", "popular_parser_broken", "popular_rate_limited", "tail_rate_limited", "restart_tail_rate_limited", "duplicate_candidate", "hold_popular":
 		default:
 			http.Error(w, "unknown fixture mode", http.StatusBadRequest)
 			return
 		}
 		catalogFixture.mu.Lock()
+		if catalogFixture.searchMode == "hold_popular" && mode != "hold_popular" && catalogFixture.searchRelease != nil {
+			close(catalogFixture.searchRelease)
+			catalogFixture.searchRelease = nil
+		}
+		if mode == "hold_popular" && catalogFixture.searchMode != "hold_popular" {
+			catalogFixture.searchRelease = make(chan struct{})
+		}
 		catalogFixture.searchMode = mode
 		catalogFixture.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
@@ -118,7 +152,7 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 			return
 		}
 		mode := r.URL.Query().Get("mode")
-		if mode != "initial" && mode != "changed" {
+		if mode != "initial" && mode != "changed" && mode != "expired" && mode != "changed_expired" {
 			http.Error(w, "unknown fixture mode", http.StatusBadRequest)
 			return
 		}
@@ -146,7 +180,7 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		for appID, count := range catalogFixture.aiByApp {
 			aiByApp[strconv.FormatInt(appID, 10)] = count
 		}
-		writeJSON(w, map[string]any{"fixtureDate": catalogFixture.fixtureDay.Format(time.DateOnly), "search": search, "appdetails": appDetails, "ai": catalogFixture.aiRequests, "aiByApp": aiByApp})
+		writeJSON(w, map[string]any{"fixtureDate": catalogFixture.fixtureDay.Format(time.DateOnly), "search": search, "appdetails": appDetails, "ai": catalogFixture.aiRequests, "aiByApp": aiByApp, "appList": catalogRequests.Load(), "activeSearch": catalogFixture.activeSearch, "maxActiveSearch": catalogFixture.maxActiveSearch, "anchors": map[string]int64{"daySeven": catalogFixture.daySevenAppID, "restart": catalogFixture.restartAppID, "duplicate": catalogFixture.duplicateAppID}})
 	})
 	mux.HandleFunc("/__test/openai-explanation-mode", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -342,7 +376,7 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		}
 		catalogRequests.Add(1)
 		if input.LastAppID > 0 {
-			http.Error(w, "fixture later page unavailable", http.StatusServiceUnavailable)
+			writeJSON(w, map[string]any{"response": map[string]any{"apps": []any{}, "last_appid": input.LastAppID, "have_more_results": false, "success": true}})
 			return
 		}
 		modified := uint32(time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC).Unix())
@@ -370,14 +404,43 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		catalogFixture.mu.Lock()
 		catalogFixture.searchRequests[filter]++
 		mode, reviewMode := catalogFixture.searchMode, catalogFixture.reviewMode
+		release := catalogFixture.searchRelease
+		parserBrokenCall := 0
+		if filter == "popularcomingsoon" && mode == "popular_parser_broken" {
+			catalogFixture.parserBrokenCalls++
+			parserBrokenCall = catalogFixture.parserBrokenCalls
+		}
 		catalogFixture.mu.Unlock()
+		if filter == "popularcomingsoon" && mode == "hold_popular" {
+			catalogFixture.mu.Lock()
+			catalogFixture.activeSearch++
+			if catalogFixture.activeSearch > catalogFixture.maxActiveSearch {
+				catalogFixture.maxActiveSearch = catalogFixture.activeSearch
+			}
+			catalogFixture.mu.Unlock()
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			catalogFixture.mu.Lock()
+			catalogFixture.activeSearch--
+			catalogFixture.mu.Unlock()
+			if r.Context().Err() != nil {
+				return
+			}
+		}
 		if filter == "popularcomingsoon" && mode == "popular_rate_limited" {
 			w.Header().Set("Retry-After", "7")
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
-		if (filter == "recent" || filter == "comingsoon") && mode == "tail_rate_limited" {
+		if (filter == "recent" || filter == "comingsoon") && (mode == "tail_rate_limited" || mode == "restart_tail_rate_limited") {
 			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if filter == "popularcomingsoon" && mode == "popular_parser_broken" && parserBrokenCall > 1 {
+			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
@@ -386,7 +449,7 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 			writeJSON(w, map[string]any{"success": 1, "start": start, "pagesize": count, "total_count": 1, "results_html": `<div class="fixture-layout-changed">parser must reject this</div>`})
 			return
 		}
-		items, ok := catalogSearchItems(filter, reviewMode, catalogFixture.fixtureDay)
+		items, ok := catalogSearchItems(filter, reviewMode, mode, catalogFixture.fixtureDay, catalogFixture.runToken, catalogFixture.daySevenAppID, catalogFixture.restartAppID, catalogFixture.duplicateAppID)
 		if !ok {
 			http.Error(w, "unknown search feed", http.StatusBadRequest)
 			return
@@ -406,6 +469,7 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		id, _ := strconv.ParseInt(r.URL.Query().Get("appids"), 10, 64)
 		catalogFixture.mu.Lock()
 		catalogFixture.appDetailsRequests[id]++
+		reviewMode := catalogFixture.reviewMode
 		catalogFixture.mu.Unlock()
 		fixtureDay := catalogFixture.fixtureDay
 		date := fixtureStoreDate(fixtureDay.AddDate(0, 0, 25))
@@ -415,48 +479,58 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		gameType, comingSoon := "game", true
 		categories := []any{map[string]any{"id": 2, "description": "Single-player"}}
 		name := fmt.Sprintf("Fixture Release %d", id)
-		switch id {
-		case 10:
-			name, date, comingSoon = "Fixture Short Story", "Jan 1, 2020", false
-		case 11:
-			name, date, comingSoon = "Fixture Endless Realm", "Jan 1, 2021", false
-		case 424242:
-			name, date = "Fixture Discovered Co-op", fixtureStoreDate(fixtureDay.AddDate(0, 0, 28))
-			categories = []any{map[string]any{"id": 9, "description": "Co-op"}}
-		case 424243:
-			gameType = "dlc"
-		case 424244:
-			comingSoon, date = false, fixtureStoreDate(fixtureDay.AddDate(0, 0, -17))
-		case 424245:
-			gameType = "software"
-		case 424246:
-			date = fixtureStoreDate(fixtureDay.AddDate(4, 0, 0))
-		case 510001:
-			name, date = "Fixture Popular Upcoming", fixtureStoreDate(fixtureDay.AddDate(0, 0, 28))
-		case 510002:
-			name, date = "Fixture Popular Upcoming Tail", fixtureStoreMonth(fixtureDay.AddDate(0, 0, 29))
-		case 520001:
-			name, date, comingSoon = "Fixture Positive Released", fixtureStoreDate(fixtureDay.AddDate(0, 0, -6)), false
-		case 520002:
-			name, date, comingSoon = "Fixture Unrated Day Seven", fixtureStoreDate(fixtureDay.AddDate(0, 0, -7)), false
-		case 520003:
-			name, date, comingSoon = "Fixture Mixed Released", fixtureStoreDate(fixtureDay.AddDate(0, 0, -6)), false
-		case 520004:
-			name, date, comingSoon = "Fixture Unrated Day Eight", fixtureStoreDate(fixtureDay.AddDate(0, 0, -8)), false
-		case 530001:
-			name, date, comingSoon = "Fixture Recent Positive", fixtureStoreDate(fixtureDay.AddDate(0, 0, -1)), false
-		case 530002:
-			name, date, comingSoon = "Fixture Recent Tail", fixtureStoreDate(fixtureDay.AddDate(0, 0, -17)), false
-		case 540001:
-			name, date = "Fixture Coming Soon", fixtureStoreDate(fixtureDay.AddDate(0, 0, 2))
-		case 540002:
-			name, date = "Fixture Coming Soon Tail", fixtureStoreDate(fixtureDay.AddDate(0, 0, 29))
-		case 300001, 300002:
-			categories = []any{map[string]any{"id": 9, "description": "Co-op"}}
-		case 300003:
-			categories = []any{map[string]any{"id": 1, "description": "Multi-player"}}
-		case 300008:
-			categories = []any{map[string]any{"id": 999, "description": "Unknown fixture mode"}}
+		if id == catalogFixture.daySevenAppID {
+			offset := -7
+			if reviewMode == "expired" || reviewMode == "changed_expired" {
+				offset = -8
+			}
+			name, date, comingSoon = "Fixture Unrated Day Seven", fixtureStoreDate(fixtureDay.AddDate(0, 0, offset)), false
+		} else if id == catalogFixture.restartAppID {
+			name, date, comingSoon = fixtureVariantName("Fixture Restart Candidate", catalogFixture.runToken), fixtureStoreDate(fixtureDay.AddDate(0, 0, -5)), false
+		} else if id == catalogFixture.duplicateAppID {
+			name, date, comingSoon = fixtureVariantName("Fixture Duplicate Candidate", catalogFixture.runToken), fixtureStoreDate(fixtureDay.AddDate(0, 0, -4)), false
+		} else {
+			switch id {
+			case 10:
+				name, date, comingSoon = "Fixture Short Story", "Jan 1, 2020", false
+			case 11:
+				name, date, comingSoon = "Fixture Endless Realm", "Jan 1, 2021", false
+			case 424242:
+				name, date = "Fixture Discovered Co-op", fixtureStoreDate(fixtureDay.AddDate(0, 0, 28))
+				categories = []any{map[string]any{"id": 9, "description": "Co-op"}}
+			case 424243:
+				gameType = "dlc"
+			case 424244:
+				comingSoon, date = false, fixtureStoreDate(fixtureDay.AddDate(0, 0, -17))
+			case 424245:
+				gameType = "software"
+			case 424246:
+				date = fixtureStoreDate(fixtureDay.AddDate(4, 0, 0))
+			case 510001:
+				name, date = "Fixture Popular Upcoming", fixtureStoreDate(fixtureDay.AddDate(0, 0, 28))
+			case 510002:
+				name, date = "Fixture Popular Upcoming Tail", fixtureStoreMonth(fixtureDay.AddDate(0, 0, 29))
+			case 520001:
+				name, date, comingSoon = "Fixture Positive Released", fixtureStoreDate(fixtureDay.AddDate(0, 0, -6)), false
+			case 520003:
+				name, date, comingSoon = "Fixture Mixed Released", fixtureStoreDate(fixtureDay.AddDate(0, 0, -6)), false
+			case 520004:
+				name, date, comingSoon = "Fixture Unrated Day Eight", fixtureStoreDate(fixtureDay.AddDate(0, 0, -8)), false
+			case 530001:
+				name, date, comingSoon = "Fixture Recent Positive", fixtureStoreDate(fixtureDay.AddDate(0, 0, -1)), false
+			case 530002:
+				name, date, comingSoon = "Fixture Recent Tail", fixtureStoreDate(fixtureDay.AddDate(0, 0, -17)), false
+			case 540001:
+				name, date = "Fixture Coming Soon", fixtureStoreDate(fixtureDay.AddDate(0, 0, 2))
+			case 540002:
+				name, date = "Fixture Coming Soon Tail", fixtureStoreDate(fixtureDay.AddDate(0, 0, 29))
+			case 300001, 300002:
+				categories = []any{map[string]any{"id": 9, "description": "Co-op"}}
+			case 300003:
+				categories = []any{map[string]any{"id": 1, "description": "Multi-player"}}
+			case 300008:
+				categories = []any{map[string]any{"id": 999, "description": "Unknown fixture mode"}}
+			}
 		}
 		payload := map[string]any{strconv.FormatInt(id, 10): map[string]any{"success": true, "data": map[string]any{"type": gameType, "name": name, "steam_appid": id, "required_age": 0, "is_free": false, "short_description": "A cooperative exploration game.", "header_image": "https://example.invalid/game.jpg", "developers": []string{"Fixture Studio"}, "publishers": []string{"Fixture Publisher"}, "platforms": map[string]bool{"windows": true, "mac": id%3 == 0, "linux": id%2 == 0}, "categories": categories, "genres": []any{map[string]any{"id": "1", "description": "Action"}}, "release_date": map[string]any{"coming_soon": comingSoon, "date": date}}}}
 		writeJSON(w, payload)
@@ -479,6 +553,12 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		for _, input := range body.Input {
 			for appID, fixtureName := range fixtureCatalogNames() {
 				if strings.Contains(input, fixtureName) {
+					if appID == 520005 {
+						appID = catalogFixture.restartAppID
+					}
+					if appID == 520006 {
+						appID = catalogFixture.duplicateAppID
+					}
 					catalogFixture.aiByApp[appID]++
 					break
 				}
@@ -505,6 +585,12 @@ func newE2EFakeHandlerAt(testHarness bool, now time.Time) http.Handler {
 		if name == "game_features_v1" {
 			if gameName, ok := input["name"].(string); ok {
 				if appID := fixtureCatalogAppID(gameName); appID != 0 {
+					if appID == 520005 {
+						appID = catalogFixture.restartAppID
+					}
+					if appID == 520006 {
+						appID = catalogFixture.duplicateAppID
+					}
 					catalogFixture.aiByApp[appID]++
 				}
 			}
@@ -576,9 +662,9 @@ type catalogSearchItem struct {
 	appID, name, release, review string
 }
 
-func catalogSearchItems(filter, reviewMode string, fixtureDay time.Time) ([]catalogSearchItem, bool) {
+func catalogSearchItems(filter, reviewMode, searchMode string, fixtureDay time.Time, runToken string, daySevenAppID, restartAppID, duplicateAppID int64) ([]catalogSearchItem, bool) {
 	positive := `Very Positive&lt;br&gt;91% of the 1,284 user reviews for this game are positive.`
-	if reviewMode == "changed" {
+	if reviewMode == "changed" || reviewMode == "changed_expired" {
 		positive = `Mixed&lt;br&gt;62% of the 1,500 user reviews for this game are positive.`
 	}
 	switch filter {
@@ -588,12 +674,23 @@ func catalogSearchItems(filter, reviewMode string, fixtureDay time.Time) ([]cata
 			{"510002", "Fixture Popular Upcoming Tail", fixtureStoreMonth(fixtureDay.AddDate(0, 0, 29)), ""},
 		}, true
 	case "popularnew":
-		return []catalogSearchItem{
+		unratedOffset := -7
+		if reviewMode == "expired" || reviewMode == "changed_expired" {
+			unratedOffset = -8
+		}
+		items := []catalogSearchItem{
 			{"520001", "Fixture Positive Released", fixtureSearchDate(fixtureDay.AddDate(0, 0, -6)), positive},
-			{"520002", "Fixture Unrated Day Seven", fixtureSearchDate(fixtureDay.AddDate(0, 0, -7)), `No user reviews`},
+			{strconv.FormatInt(daySevenAppID, 10), "Fixture Unrated Day Seven", fixtureSearchDate(fixtureDay.AddDate(0, 0, unratedOffset)), `No user reviews`},
 			{"520003", "Fixture Mixed Released", fixtureSearchDate(fixtureDay.AddDate(0, 0, -6)), `Mixed&lt;br&gt;55% of the 320 user reviews for this game are positive.`},
 			{"520004", "Fixture Unrated Day Eight", fixtureSearchDate(fixtureDay.AddDate(0, 0, -8)), `No user reviews`},
-		}, true
+		}
+		if searchMode == "restart_tail_rate_limited" {
+			items = append(items, catalogSearchItem{strconv.FormatInt(restartAppID, 10), fixtureVariantName("Fixture Restart Candidate", runToken), fixtureSearchDate(fixtureDay.AddDate(0, 0, -5)), `Very Positive&lt;br&gt;90% of the 200 user reviews for this game are positive.`})
+		}
+		if searchMode == "duplicate_candidate" {
+			items = append(items, catalogSearchItem{strconv.FormatInt(duplicateAppID, 10), fixtureVariantName("Fixture Duplicate Candidate", runToken), fixtureSearchDate(fixtureDay.AddDate(0, 0, -4)), `Positive&lt;br&gt;89% of the 120 user reviews for this game are positive.`})
+		}
+		return items, true
 	case "recent":
 		return []catalogSearchItem{
 			{"530001", "Fixture Recent Positive", fixtureSearchDate(fixtureDay.AddDate(0, 0, -1)), `Positive&lt;br&gt;88% of the 80 user reviews for this game are positive.`},
@@ -613,9 +710,11 @@ func fixtureSearchDate(day time.Time) string { return day.Format("2 Jan, 2006") 
 func fixtureStoreDate(day time.Time) string  { return day.Format("Jan 2, 2006") }
 func fixtureStoreMonth(day time.Time) string { return day.Format("January 2006") }
 
+func fixtureVariantName(name, token string) string { return name + " " + token }
+
 func fixtureCatalogAppID(name string) int64 {
 	for appID, fixtureName := range fixtureCatalogNames() {
-		if name == fixtureName {
+		if strings.HasPrefix(name, fixtureName) {
 			return appID
 		}
 	}
@@ -630,6 +729,8 @@ func fixtureCatalogNames() map[int64]string {
 		520002: "Fixture Unrated Day Seven",
 		520003: "Fixture Mixed Released",
 		520004: "Fixture Unrated Day Eight",
+		520005: "Fixture Restart Candidate",
+		520006: "Fixture Duplicate Candidate",
 		530001: "Fixture Recent Positive",
 		530002: "Fixture Recent Tail",
 		540001: "Fixture Coming Soon",
