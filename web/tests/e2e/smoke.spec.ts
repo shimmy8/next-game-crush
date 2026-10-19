@@ -72,6 +72,25 @@ test('complete fixture-authenticated product loop', async ({ page, request }) =>
   }, { timeout: 90_000 }).toBe('succeeded')
   const firstStatus = await (await page.request.get(`${api}/api/sync/${jobId}`)).json() as { stages: Array<{ kind: string; stage: string; status: string }> }
   expect(firstStatus.stages.some((stage) => /achievement/i.test(`${stage.kind} ${stage.stage}`) && stage.status === 'succeeded')).toBeTruthy()
+  // User sync intentionally does not await optional catalog-lane metadata.
+  // Wait for the Search publications, all fixture wishlist releases and the
+  // catalog-triggered successor ranking before taking the idempotency snapshot.
+  const wishlistReleaseAppIDs = Array.from({ length: 8 }, (_, index) => 300001 + index)
+  await expect.poll(async () => {
+    const health = await (await page.request.get(`${api}/api/health`)).json() as {
+      catalogSearch: {
+        status: string
+        lastReconciliationAt: string | null
+      }
+    }
+    const jobs = await (await page.request.get(`${api}/api/jobs`)).json() as Array<{ kind: string; status: string }>
+    const calendar = await (await page.request.get(`${api}/api/calendar`)).json() as Record<string, CalendarItem[] | null>
+    const completedRankings = jobs.filter((entry) => entry.kind === 'recommendations.rebuild' && entry.status === 'succeeded').length
+    const searchSettled = health.catalogSearch.status === 'ready' && health.catalogSearch.lastReconciliationAt !== null
+    const visibleAppIDs = new Set(items(calendar).map((entry) => entry.steamAppId))
+    const metadataSettled = wishlistReleaseAppIDs.every((appID) => visibleAppIDs.has(appID))
+    return searchSettled && metadataSettled ? completedRankings : 0
+  }, { timeout: 120_000 }).toBeGreaterThanOrEqual(2)
   const firstCalendar = await (await page.request.get(`${api}/api/calendar`)).json() as Record<string, CalendarItem[] | null>
 
   const repeated = await page.request.post(`${api}/api/sync`, { headers: { 'X-CSRF-Token': user.csrfToken } })
@@ -104,11 +123,6 @@ test('complete fixture-authenticated product loop', async ({ page, request }) =>
   expect(latestGames.length).toBe(items(firstCalendar).length)
   expect([...latestGames].sort()).toEqual(items(firstCalendar).map((item) => item.gameId).sort())
 
-  const compatibility = page.getByRole('group', { name: 'Совместимость игры' }).first()
-  await expect(compatibility).toBeVisible()
-  await expect(compatibility).toContainText('Windows')
-  await expect(compatibility).toContainText(/Steam Deck:/)
-
   const target = items(buckets).find((item) => item.steamAppId === 4898190)
   if (!target) throw new Error('fixture calendar must contain AppID 4898190')
   expect(target).toMatchObject({ platforms: { windows: true, mac: true, linux: true }, deckCompatibility: 'verified' })
@@ -121,9 +135,13 @@ test('complete fixture-authenticated product loop', async ({ page, request }) =>
   const calendarSection = page.locator('.calendar-section')
   await calendarSection.getByRole('button', { name: 'Следующий месяц' }).click()
   await calendarSection.getByRole('button', { name: 'Следующий месяц' }).click()
-  await expect(calendarSection.getByRole('link', { name: new RegExp(`^${target.name} — открыть в Steam`) })).toBeVisible()
+  const targetLink = calendarSection.getByRole('link', { name: new RegExp(`^${target.name} — открыть в Steam`) })
+  await expect(targetLink).toBeVisible()
   await expect(calendarSection.getByRole('link', { name: new RegExp(`^${platformNegative.name} — открыть в Steam`) })).toBeVisible()
   await expect(calendarSection.getByRole('link', { name: new RegExp(`^${deckNegative.name} — открыть в Steam`) })).toBeVisible()
+  const compatibility = calendarSection.getByRole('article').filter({ has: targetLink }).getByRole('group', { name: 'Совместимость игры' })
+  await expect(compatibility).toContainText('Windows')
+  await expect(compatibility).toContainText(/Steam Deck:/)
   await calendarSection.getByRole('combobox', { name: 'Платформа' }).selectOption('mac')
   await calendarSection.getByRole('combobox', { name: 'Steam Deck' }).selectOption('verified')
   await expect(calendarSection.getByRole('link', { name: new RegExp(`^${target.name} — открыть в Steam`) })).toBeVisible()

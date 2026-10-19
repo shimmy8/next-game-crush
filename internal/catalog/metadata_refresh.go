@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -31,27 +32,26 @@ type MetadataWorkItem struct {
 	NextEligibleAt time.Time
 }
 
-// EnqueueUserSyncCandidates routes known Search candidates through the same
+// EnqueueUserSyncCandidates routes user-derived candidates through the same
 // AppDetails reservation and qualification protocol as scheduled discovery.
-// Apps not observed by Search yet are left for the next Search occurrence.
+// A candidate not observed by Search is bootstrapped into the shared material
+// revision domain first, so it retains the same fencing, TTL and throttle.
 func (r *SearchRepository) EnqueueUserSyncCandidates(ctx context.Context, queue *jobs.Queue, cfg DiscoveryConfig, identity string, targets []RefreshTarget, now time.Time) (int, error) {
 	if r == nil || r.store == nil || queue == nil || cfg.Validate() != nil || strings.TrimSpace(identity) == "" || now.IsZero() {
 		return 0, errors.New("invalid user sync catalog ingress")
 	}
 	count := 0
 	for _, target := range targets {
-		var runRevision, ordinal int64
-		var fingerprint string
-		err := r.store.Pool.QueryRow(ctx, `SELECT material_run_revision,material_observation_ordinal,material_fingerprint
-			FROM catalog_metadata_heads WHERE steam_app_id=$1`, target.AppID).Scan(&runRevision, &ordinal, &fingerprint)
-		if errors.Is(err, pgx.ErrNoRows) {
-			continue
-		}
+		// AppID is already part of the ingress key. Keep the remaining identity
+		// stable across users and sync executions so shared catalog state neither
+		// stores a user UUID nor accumulates one work item per interactive sync.
+		ingress := MetadataIngress{Kind: "user_sync", Identity: "user_sync:v1"}
+		rev, fingerprint, err := r.ensureUserSyncCandidate(ctx, ingress, target, now.UTC())
 		if err != nil {
 			return count, err
 		}
-		item, err := r.ReserveIngressMetadata(ctx, MetadataIngress{Kind: "user_sync", Identity: identity}, target.AppID,
-			CandidateRevision{RunRevision: runRevision, ObservationOrdinal: ordinal}, fingerprint, cfg.AppDetailsHourlyBudget, now.UTC())
+		item, err := r.ReserveIngressMetadata(ctx, ingress, target.AppID,
+			rev, fingerprint, cfg.AppDetailsHourlyBudget, now.UTC())
 		if err != nil {
 			return count, err
 		}
@@ -73,11 +73,79 @@ func (r *SearchRepository) EnqueueUserSyncCandidates(ctx context.Context, queue 
 	return count, nil
 }
 
+func (r *SearchRepository) ensureUserSyncCandidate(ctx context.Context, in MetadataIngress, target RefreshTarget, now time.Time) (CandidateRevision, string, error) {
+	if !validMetadataIngress(in) || target.AppID < 1 || target.AppID > math.MaxUint32 || target.Priority < 1 || target.Priority > 100 {
+		return CandidateRevision{}, "", errors.New("invalid user sync candidate")
+	}
+	tx, err := r.store.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return CandidateRevision{}, "", err
+	}
+	defer tx.Rollback(ctx)
+	q := r.store.Queries.WithTx(tx)
+	if err := q.LockMetadataApp(ctx, target.AppID); err != nil {
+		return CandidateRevision{}, "", err
+	}
+	var rev CandidateRevision
+	var fingerprint string
+	err = tx.QueryRow(ctx, `SELECT material_run_revision,material_observation_ordinal,material_fingerprint
+		FROM catalog_metadata_heads WHERE steam_app_id=$1 FOR UPDATE`, target.AppID).
+		Scan(&rev.RunRevision, &rev.ObservationOrdinal, &fingerprint)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return CandidateRevision{}, "", err
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = tx.QueryRow(ctx, `SELECT material_run_revision,material_observation_ordinal,material_fingerprint
+			FROM catalog_search_current WHERE steam_app_id=$1 FOR UPDATE`, target.AppID).
+			Scan(&rev.RunRevision, &rev.ObservationOrdinal, &fingerprint)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := tx.QueryRow(ctx, `SELECT nextval(pg_get_serial_sequence('catalog_search_runs','run_revision'))`).Scan(&rev.RunRevision); err != nil {
+				return CandidateRevision{}, "", err
+			}
+			rev.ObservationOrdinal = 1
+			fingerprint = "user_sync:v1"
+			if _, err := tx.Exec(ctx, `INSERT INTO catalog_search_current
+				(steam_app_id,run_revision,observation_ordinal,priority,fingerprint,last_seen_at,
+				 material_run_revision,material_observation_ordinal,material_fingerprint)
+				VALUES($1,$2,$3,$4,$5,$6,$2,$3,$5)`, target.AppID, rev.RunRevision,
+				rev.ObservationOrdinal, target.Priority, fingerprint, now); err != nil {
+				return CandidateRevision{}, "", err
+			}
+		} else if err != nil {
+			return CandidateRevision{}, "", err
+		}
+		if _, err := q.UpsertMetadataCandidateHead(ctx, dbgen.UpsertMetadataCandidateHeadParams{
+			SteamAppID: target.AppID, RunRevision: rev.RunRevision, ObservationOrdinal: rev.ObservationOrdinal,
+			Fingerprint: fingerprint, NowAt: pgtype.Timestamptz{Time: now, Valid: true},
+		}); err != nil {
+			return CandidateRevision{}, "", err
+		}
+	}
+	if err := q.RecordMetadataProvenance(ctx, dbgen.RecordMetadataProvenanceParams{SteamAppID: target.AppID,
+		IngressKind: in.Kind, IngressIdentity: in.Identity, RunRevision: rev.RunRevision, ObservationOrdinal: rev.ObservationOrdinal,
+		FirstSeenAt: pgtype.Timestamptz{Time: now, Valid: true}}); err != nil {
+		return CandidateRevision{}, "", err
+	}
+	if _, err := q.UpsertMetadataIngressWork(ctx, dbgen.UpsertMetadataIngressWorkParams{SteamAppID: target.AppID,
+		IngressKind: in.Kind, IngressIdentity: in.Identity, RunRevision: rev.RunRevision, ObservationOrdinal: rev.ObservationOrdinal,
+		Fingerprint: fingerprint, MaterialRunRevision: rev.RunRevision, MaterialObservationOrdinal: rev.ObservationOrdinal,
+		MaterialFingerprint: fingerprint, Priority: int16(target.Priority), UpdatedAt: pgtype.Timestamptz{Time: now, Valid: true}}); err != nil {
+		return CandidateRevision{}, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return CandidateRevision{}, "", err
+	}
+	return rev, fingerprint, nil
+}
+
 func (r *SearchRepository) EnqueueReadyIngressQualifications(ctx context.Context, queue *jobs.Queue, cfg DiscoveryConfig, now time.Time) (int, error) {
 	if r == nil || queue == nil || cfg.Validate() != nil || now.IsZero() {
 		return 0, errors.New("invalid metadata ingress producer")
 	}
-	count := 0
+	count, err := r.enqueueReservedIngressQualifications(ctx, queue)
+	if err != nil {
+		return count, err
+	}
 	for {
 		item, err := r.ClaimIngressMetadataWork(ctx, cfg.AppDetailsHourlyBudget, now.UTC())
 		if errors.Is(err, ErrNoMetadataWork) {
@@ -101,6 +169,53 @@ func (r *SearchRepository) EnqueueReadyIngressQualifications(ctx context.Context
 		}
 		count++
 	}
+}
+
+func (r *SearchRepository) enqueueReservedIngressQualifications(ctx context.Context, queue *jobs.Queue) (int, error) {
+	rows, err := r.store.Pool.Query(ctx, `SELECT w.steam_app_id,w.priority,r.run_revision,r.observation_ordinal,
+		r.id,r.fencing_token,r.retry_generation
+		FROM catalog_metadata_ingress_work w
+		JOIN catalog_metadata_heads h USING(steam_app_id)
+		JOIN catalog_store_reservations r USING(steam_app_id)
+		WHERE w.status='reserved' AND r.status='reserved'
+		  AND (w.material_run_revision,w.material_observation_ordinal,w.material_fingerprint)=
+		      (h.material_run_revision,h.material_observation_ordinal,h.material_fingerprint)
+		  AND (r.run_revision,r.observation_ordinal,r.fingerprint)=
+		      (h.material_run_revision,h.material_observation_ordinal,h.material_fingerprint)
+		ORDER BY w.priority DESC,w.created_at,w.steam_app_id`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	payloads := make([]SearchQualificationPayload, 0)
+	for rows.Next() {
+		var payload SearchQualificationPayload
+		var priority int16
+		var reservationID, token pgtype.UUID
+		var generation int32
+		if err := rows.Scan(&payload.AppID, &priority, &payload.CandidateRevision.RunRevision,
+			&payload.CandidateRevision.ObservationOrdinal, &reservationID, &token, &generation); err != nil {
+			return 0, err
+		}
+		payload.Version, payload.Priority, payload.RetryGeneration = SearchQualificationPayloadVersion, int(priority), int(generation)
+		payload.ReservationID, payload.ReservationToken = uuid.UUID(reservationID.Bytes), uuid.UUID(token.Bytes)
+		payloads = append(payloads, payload)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, payload := range payloads {
+		spec, err := NewSearchQualificationSpec(payload, uuid.Nil)
+		if err != nil {
+			return count, err
+		}
+		if _, err := queue.Enqueue(ctx, spec); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
 }
 
 // MetadataRefreshTTL returns the default appdetails freshness interval. Search

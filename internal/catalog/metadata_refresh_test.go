@@ -133,6 +133,104 @@ func TestUserSyncRefreshUsesDurableSearchQualification(t *testing.T) {
 	}
 }
 
+func TestUserSyncBootstrapsHeadlessCandidateIntoSharedQualification(t *testing.T) {
+	db := openCatalogTestStore(t)
+	repo := NewSearchRepository(db)
+	queue := jobs.NewQueue(db)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	cfg := DefaultDiscoveryConfig()
+
+	count, err := repo.EnqueueUserSyncCandidates(ctx, queue, cfg, "sync:headless", []RefreshTarget{{AppID: 622, Priority: 100}}, now)
+	if err != nil || count != 1 {
+		t.Fatalf("enqueued=%d err=%v", count, err)
+	}
+	var currentRun, currentOrdinal, headRun, headOrdinal int64
+	var currentFingerprint, headFingerprint, lane, kind string
+	if err := db.Pool.QueryRow(ctx, `SELECT c.material_run_revision,c.material_observation_ordinal,c.material_fingerprint,
+		h.material_run_revision,h.material_observation_ordinal,h.material_fingerprint
+		FROM catalog_search_current c JOIN catalog_metadata_heads h USING(steam_app_id)
+		WHERE c.steam_app_id=622`).Scan(&currentRun, &currentOrdinal, &currentFingerprint, &headRun, &headOrdinal, &headFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if currentRun < 1 || currentOrdinal != 1 || currentRun != headRun || currentOrdinal != headOrdinal ||
+		currentFingerprint != "user_sync:v1" || currentFingerprint != headFingerprint {
+		t.Fatalf("current=%d/%d/%q head=%d/%d/%q", currentRun, currentOrdinal, currentFingerprint, headRun, headOrdinal, headFingerprint)
+	}
+	if err := db.Pool.QueryRow(ctx, `SELECT lane,kind FROM sync_jobs WHERE kind=$1`, SearchQualificationJobKind).Scan(&lane, &kind); err != nil {
+		t.Fatal(err)
+	}
+	if lane != string(jobs.LaneCatalog) || kind != SearchQualificationJobKind {
+		t.Fatalf("job lane=%q kind=%q", lane, kind)
+	}
+
+	// A later user-sync occurrence shares the existing Store lease instead of
+	// issuing a duplicate request while the first qualification is in flight.
+	count, err = repo.EnqueueUserSyncCandidates(ctx, queue, cfg, "sync:headless:replay", []RefreshTarget{{AppID: 622, Priority: 100}}, now.Add(time.Second))
+	if err != nil || count != 0 {
+		t.Fatalf("replay enqueued=%d err=%v", count, err)
+	}
+	var jobsCount int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind=$1`, SearchQualificationJobKind).Scan(&jobsCount); err != nil {
+		t.Fatal(err)
+	}
+	if jobsCount != 1 {
+		t.Fatalf("qualification jobs=%d, want 1", jobsCount)
+	}
+
+	// Headless revisions consume the same global allocator, so any later Search
+	// observation is necessarily newer and can safely supersede this material.
+	_, searchRevision := insertMetadataRun(t, db, "daily", "scheduled", now.Add(time.Hour), 700, "search", "complete", nil)
+	if searchRevision.RunRevision <= currentRun {
+		t.Fatalf("search revision=%d, want > headless revision=%d", searchRevision.RunRevision, currentRun)
+	}
+}
+
+func TestUserSyncHeadlessIngressRecoversAcrossCrashBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		reserveBeforeRun bool
+	}{
+		{name: "after bootstrap"},
+		{name: "after reservation before enqueue", reserveBeforeRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openCatalogTestStore(t)
+			ctx := context.Background()
+			now := time.Now().UTC().Truncate(time.Second)
+			cfg := DefaultDiscoveryConfig()
+			ingress := MetadataIngress{Kind: "user_sync", Identity: "sync:crash:" + tc.name}
+			target := RefreshTarget{AppID: 623, Priority: 100}
+			repo := NewSearchRepository(db)
+			rev, fingerprint, err := repo.ensureUserSyncCandidate(ctx, ingress, target, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.reserveBeforeRun {
+				item, err := repo.ReserveIngressMetadata(ctx, ingress, target.AppID, rev, fingerprint, cfg.AppDetailsHourlyBudget, now)
+				if err != nil || !item.Reservation.Granted {
+					t.Fatalf("reservation=%+v err=%v", item, err)
+				}
+			}
+			// Simulate a process restart: only durable DB state is available to a
+			// fresh producer and no qualification job was enqueued by the old one.
+			restarted := NewSearchRepository(db)
+			queue := jobs.NewQueue(db)
+			count, err := restarted.EnqueueReadyIngressQualifications(ctx, queue, cfg, now.Add(time.Second))
+			if err != nil || count != 1 {
+				t.Fatalf("recovered=%d err=%v", count, err)
+			}
+			var jobsCount int
+			if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE kind=$1 AND lane='catalog'`, SearchQualificationJobKind).Scan(&jobsCount); err != nil {
+				t.Fatal(err)
+			}
+			if jobsCount != 1 {
+				t.Fatalf("qualification jobs=%d, want 1", jobsCount)
+			}
+		})
+	}
+}
+
 func TestMetadataTTLByReleasePhaseAndTombstone(t *testing.T) {
 	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	date := now.AddDate(0, 0, 2)

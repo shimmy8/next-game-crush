@@ -438,8 +438,8 @@ func lockSearchQualificationState(ctx context.Context, tx pgx.Tx, payload Search
 }
 
 // preflightSearchQualification rejects work that was already superseded before
-// execution. It intentionally commits no catalog changes: the worker completes
-// the stale queue lease, while the current reservation/head remains untouched.
+// execution. User-only work whose owning activity was removed is durably
+// cancelled before the Store call; shared Search work remains catalog-owned.
 // persistSearchQualification and persistSearchQualificationFailure repeat the
 // same fence after the external request to cover concurrent supersession.
 func (r *DiscoveryRepository) preflightSearchQualification(ctx context.Context, lease jobs.Lease, payload SearchQualificationPayload) (bool, error) {
@@ -454,6 +454,18 @@ func (r *DiscoveryRepository) preflightSearchQualification(ctx context.Context, 
 	owned, _, err := lockSearchQualificationState(ctx, tx, payload)
 	if err != nil {
 		return false, err
+	}
+	if owned {
+		live, err := qualificationHasLiveSource(ctx, tx, payload.AppID)
+		if err != nil {
+			return false, err
+		}
+		if !live {
+			if err := cancelUserSyncQualification(ctx, tx, payload); err != nil {
+				return false, err
+			}
+			owned = false
+		}
 	}
 	if err := commitDiscoveryLease(ctx, tx, lease); err != nil {
 		return false, err
@@ -477,6 +489,16 @@ func (r *DiscoveryRepository) persistSearchQualification(ctx context.Context, le
 	if !owned {
 		return commitDiscoveryLease(ctx, tx, lease)
 	}
+	live, err := qualificationHasLiveSource(ctx, tx, payload.AppID)
+	if err != nil {
+		return err
+	}
+	if !live {
+		if err := cancelUserSyncQualification(ctx, tx, payload); err != nil {
+			return err
+		}
+		return commitDiscoveryLease(ctx, tx, lease)
+	}
 	q := r.store.Queries.WithTx(tx)
 	current, err := q.LockCurrentMetadataCandidate(ctx, payload.AppID)
 	if err != nil {
@@ -497,22 +519,29 @@ func (r *DiscoveryRepository) persistSearchQualification(ctx context.Context, le
 			Review: review, PopularUpcoming: popularUpcoming, PopularNew: popularNew, Wishlisted: wishlisted}, cfg)
 	}
 	semanticHash := SemanticContentHash(details)
+	sharedDiscovery, err := hasSharedDiscoveryProvenance(ctx, tx, payload.AppID)
+	if err != nil {
+		return err
+	}
 	var gameID uuid.UUID
 	if strings.EqualFold(strings.TrimSpace(details.Type), "game") {
 		gameID, err = r.persistSearchCanonicalGame(ctx, tx, q, details, window, semanticHash, now)
 		if err != nil {
 			return err
 		}
-		changed, err := setSharedSource(ctx, tx, gameID, "steam_discovery", decision.Active, now)
-		if err != nil {
-			return err
+		changed := false
+		if sharedDiscovery {
+			changed, err = setSharedSource(ctx, tx, gameID, "steam_discovery", decision.Active, now)
+			if err != nil {
+				return err
+			}
 		}
 		if decision.Active && planner != nil {
 			if err := enqueueSearchDiscoveryFeatures(ctx, q, planner, gameID, details, payload.Priority); err != nil {
 				return err
 			}
 		}
-		if changed {
+		if changed || (wishlisted && current.SemanticContentHash == "" && semanticHash != "") {
 			if err := r.MarkCandidateSetDirtyAt(ctx, tx, EligibilityChange{GameID: gameID, Kind: EligibilityChangeMembership, NextChangeAt: decision.NextChangeAt}, now); err != nil {
 				return err
 			}
@@ -521,7 +550,7 @@ func (r *DiscoveryRepository) persistSearchQualification(ctx context.Context, le
 				return err
 			}
 		}
-	} else if old, getErr := q.GetGameByAppID(ctx, payload.AppID); getErr == nil {
+	} else if old, getErr := q.GetGameByAppID(ctx, payload.AppID); getErr == nil && sharedDiscovery {
 		changed, sourceErr := setSharedSource(ctx, tx, uuid.UUID(old.ID.Bytes), "steam_discovery", false, now)
 		if sourceErr != nil {
 			return sourceErr
@@ -592,6 +621,63 @@ func searchEligibilityProvenance(ctx context.Context, tx pgx.Tx, appID int64) (p
 		EXISTS(SELECT 1 FROM wishlist_entries w JOIN games g ON g.id=w.game_id WHERE g.steam_app_id=$1)`, appID).
 		Scan(&popularUpcoming, &popularNew, &wishlisted)
 	return
+}
+
+func hasSharedDiscoveryProvenance(ctx context.Context, tx pgx.Tx, appID int64) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM catalog_metadata_provenance
+		WHERE steam_app_id=$1 AND ingress_kind IN ('scheduled','manual','initial','reconciliation'))`, appID).Scan(&exists)
+	return exists, err
+}
+
+// qualificationHasLiveSource locks a live user row when qualification depends
+// solely on user activity. Account deletion then either wins before this check
+// (and cancels publication), or waits and performs its post-delete catalog
+// cleanup after this transaction commits.
+func qualificationHasLiveSource(ctx context.Context, tx pgx.Tx, appID int64) (bool, error) {
+	shared, err := hasSharedDiscoveryProvenance(ctx, tx, appID)
+	if err != nil || shared {
+		return shared, err
+	}
+	var userID uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT u.id FROM users u
+		WHERE NOT EXISTS(SELECT 1 FROM deleted_user_tombstones d WHERE d.user_id=u.id)
+		  AND EXISTS(SELECT 1 FROM games g WHERE g.steam_app_id=$1 AND (
+			EXISTS(SELECT 1 FROM wishlist_entries w WHERE w.user_id=u.id AND w.game_id=g.id)
+			OR EXISTS(SELECT 1 FROM user_games ug WHERE ug.user_id=u.id AND ug.game_id=g.id)
+			OR EXISTS(SELECT 1 FROM achievement_summaries a WHERE a.user_id=u.id AND a.game_id=g.id)))
+		ORDER BY u.id LIMIT 1 FOR KEY SHARE OF u`, appID).Scan(&userID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func cancelUserSyncQualification(ctx context.Context, tx pgx.Tx, payload SearchQualificationPayload) error {
+	command, err := tx.Exec(ctx, `UPDATE catalog_store_reservations
+		SET status='released',next_retry_at=NULL,updated_at=now()
+		WHERE steam_app_id=$1 AND id=$2 AND fencing_token=$3 AND status='reserved'
+		  AND run_revision=$4 AND observation_ordinal=$5`, payload.AppID, payload.ReservationID,
+		payload.ReservationToken, payload.CandidateRevision.RunRevision, payload.CandidateRevision.ObservationOrdinal)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return errors.New("user sync qualification cancellation reservation fence lost")
+	}
+	if _, err := tx.Exec(ctx, `UPDATE catalog_metadata_ingress_work
+		SET status='superseded',next_eligible_at=NULL,updated_at=now()
+		WHERE steam_app_id=$1 AND material_run_revision=$2 AND material_observation_ordinal=$3
+		  AND status IN ('pending','reserved','deferred')`, payload.AppID,
+		payload.CandidateRevision.RunRevision, payload.CandidateRevision.ObservationOrdinal); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE catalog_search_worklist SET status='superseded',next_retry_at=NULL
+		WHERE steam_app_id=$1 AND COALESCE(material_run_revision,run_revision)=$2
+		  AND COALESCE(material_observation_ordinal,observation_ordinal)=$3
+		  AND status IN ('pending','reserved','deferred')`, payload.AppID,
+		payload.CandidateRevision.RunRevision, payload.CandidateRevision.ObservationOrdinal)
+	return err
 }
 
 func (r *DiscoveryRepository) persistSearchCanonicalGame(ctx context.Context, tx pgx.Tx, q *dbgen.Queries, details steam.GameDetails, window ReleaseWindow, semanticHash string, now time.Time) (uuid.UUID, error) {

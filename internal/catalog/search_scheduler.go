@@ -10,12 +10,15 @@ import (
 	"next-game-crush/internal/jobs"
 )
 
+const catalogRecoverySweepInterval = time.Minute
+
 type SearchScheduler struct {
 	repo                  *SearchRepository
 	queue                 *jobs.Queue
 	cfg                   DiscoveryConfig
 	now                   func() time.Time
 	daily, reconciliation cron.Schedule
+	recoveryInterval      time.Duration
 }
 
 func NewSearchScheduler(repo *SearchRepository, queue *jobs.Queue, cfg DiscoveryConfig, now func() time.Time) (*SearchScheduler, error) {
@@ -36,7 +39,8 @@ func NewSearchScheduler(repo *SearchRepository, queue *jobs.Queue, cfg Discovery
 	if now == nil {
 		now = time.Now
 	}
-	return &SearchScheduler{repo: repo, queue: queue, cfg: cfg, now: now, daily: daily, reconciliation: reconciliation}, nil
+	return &SearchScheduler{repo: repo, queue: queue, cfg: cfg, now: now, daily: daily, reconciliation: reconciliation,
+		recoveryInterval: catalogRecoverySweepInterval}, nil
 }
 
 // latestOccurrence asks cron for real instants rather than subtracting a day,
@@ -63,11 +67,11 @@ func (s *SearchScheduler) EnsureScheduled(ctx context.Context) error {
 	if err := s.repo.ScheduleDueRebuilds(ctx, s.cfg, now); err != nil {
 		return err
 	}
-	if !s.cfg.Enabled {
-		return nil
-	}
 	if _, err := s.repo.EnqueueReadyIngressQualifications(ctx, s.queue, s.cfg, now); err != nil {
 		return err
+	}
+	if !s.cfg.Enabled {
+		return nil
 	}
 	daily, err := latestOccurrence(s.daily, now)
 	if err != nil {
@@ -116,23 +120,28 @@ func (s *SearchScheduler) EnsureScheduled(ctx context.Context) error {
 func (s *SearchScheduler) Nudge(ctx context.Context) error { return s.EnsureScheduled(ctx) }
 
 // Run owns only schedule timing. Work execution remains isolated in the
-// catalog worker, and disabled discovery stays idle until shutdown.
+// catalog worker. The cheap recovery sweep remains active when Search is
+// disabled so a qualification committed after an early sync nudge cannot
+// strand durable rebuild state until process restart.
 func (s *SearchScheduler) Run(ctx context.Context) error {
 	if s == nil {
 		return errors.New("search scheduler is required")
 	}
-	if !s.cfg.Enabled {
-		<-ctx.Done()
-		return nil
-	}
+	// User-sync ingress remains recoverable even when Search discovery is
+	// disabled, so startup always performs one durable outbox sweep.
 	if err := s.EnsureScheduled(ctx); err != nil {
 		return err
 	}
 	for {
 		now := s.now().UTC()
-		next := s.daily.Next(now)
-		if candidate := s.reconciliation.Next(now); candidate.Before(next) {
-			next = candidate
+		next := now.Add(s.recoveryInterval)
+		if s.cfg.Enabled {
+			if candidate := s.daily.Next(now); candidate.Before(next) {
+				next = candidate
+			}
+			if candidate := s.reconciliation.Next(now); candidate.Before(next) {
+				next = candidate
+			}
 		}
 		delay := next.Sub(now)
 		if delay < 0 {

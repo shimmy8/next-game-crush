@@ -10,11 +10,32 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"next-game-crush/internal/ai"
 	"next-game-crush/internal/jobs"
 	"next-game-crush/internal/steam"
 	"next-game-crush/internal/store"
+	dbgen "next-game-crush/internal/store/sqlc"
 )
+
+type blockingQualificationMetadata struct {
+	steam.Client
+	details steam.GameDetails
+	called  chan struct{}
+	release chan struct{}
+	calls   int
+}
+
+func (m *blockingQualificationMetadata) GameDetails(ctx context.Context, _ int64) (steam.GameDetails, error) {
+	m.calls++
+	close(m.called)
+	select {
+	case <-ctx.Done():
+		return steam.GameDetails{}, ctx.Err()
+	case <-m.release:
+		return m.details, nil
+	}
+}
 
 func TestSearchQualificationProtocolRemainsCatalogLaneOnly(t *testing.T) {
 	payload := SearchQualificationPayload{Version: 1, AppID: 620,
@@ -486,6 +507,343 @@ func TestSearchQualificationPersistsCanonicalAndReviewState(t *testing.T) {
 		t.Fatalf("canonical=%q review=%q/%q/%v/%d active=%v soon=%v tombstone=%q hash=%q reservation=%q work=%q releases=%d feature=%d calls=%d deck=%d",
 			name, reviewBand, reviewLabel, reviewPercent, reviewTotal, active, comingSoon, tombstone, semanticHash,
 			reservationStatus, workStatus, releaseCount, featureJobs, planner.calls, metadata.deckCalls)
+	}
+	var discoverySources, sharedEntries int
+	if err := repo.store.Pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM catalog_entry_sources s JOIN games g ON g.id=s.game_id
+		 WHERE g.steam_app_id=620 AND s.source='steam_discovery' AND s.active),
+		(SELECT count(*) FROM catalog_entries e JOIN games g ON g.id=e.game_id WHERE g.steam_app_id=620)`).
+		Scan(&discoverySources, &sharedEntries); err != nil {
+		t.Fatal(err)
+	}
+	if discoverySources != 1 || sharedEntries != 1 {
+		t.Fatalf("Search discovery sources=%d shared entries=%d, want 1/1", discoverySources, sharedEntries)
+	}
+}
+
+func TestHeadlessWishlistCandidatePublishesMetadataThroughSearchQualification(t *testing.T) {
+	db := openCatalogTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	userID, gameID := uuid.New(), uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,source_snapshot,last_successful_fetch_at)
+		VALUES($1,987654322,'Wishlist placeholder','steam_wishlist','{}',$2)`, gameID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO wishlist_entries(user_id,game_id,source,last_successful_fetch_at)
+		VALUES($1,$2,'steam_wishlist',$3)`, userID, gameID, now); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultDiscoveryConfig()
+	cfg.Enabled = true
+	repo := NewSearchRepository(db)
+	queue := jobs.NewQueue(db)
+	count, err := repo.EnqueueUserSyncCandidates(ctx, queue, cfg, "sync:wishlist-only", []RefreshTarget{{AppID: 987654322, Priority: 100}}, now)
+	if err != nil || count != 1 {
+		t.Fatalf("enqueued=%d err=%v", count, err)
+	}
+	details := steam.GameDetails{AppID: 987654322, Type: "game", Name: "Wishlist release", ShortDescription: "Wishlist metadata",
+		ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "20 Oct, 2026"}, Platforms: steam.Platforms{Windows: true}}
+	metadata := &discoveryMetadata{details: details}
+	service, err := NewDiscoveryService(NewDiscoveryRepository(db), metadata, queue, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return now }
+	lease, err := queue.Claim(ctx, jobs.LaneCatalog, "wishlist-headless", time.Minute)
+	if err != nil || lease == nil || lease.Kind != SearchQualificationJobKind {
+		t.Fatalf("claim=%+v err=%v", lease, err)
+	}
+	if err := service.handleSearchQualification(ctx, *lease); err != nil {
+		t.Fatal(err)
+	}
+	var name, snapshot, releaseRaw, reservationStatus string
+	var releaseCount int
+	if err := db.Pool.QueryRow(ctx, `SELECT g.name,g.source_snapshot::text,r.raw_text,s.status,
+		(SELECT count(*) FROM game_release_dates WHERE game_id=g.id)
+		FROM games g
+		JOIN catalog_store_reservations s ON s.steam_app_id=g.steam_app_id
+		JOIN LATERAL (SELECT raw_text FROM game_release_dates WHERE game_id=g.id ORDER BY observed_at DESC,id DESC LIMIT 1) r ON true
+		WHERE g.steam_app_id=987654322`).Scan(&name, &snapshot, &releaseRaw, &reservationStatus, &releaseCount); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.calls != 1 || name != details.Name || snapshot == "{}" || releaseRaw != details.ReleaseDate.Raw ||
+		releaseCount != 1 || reservationStatus != "complete" {
+		t.Fatalf("calls=%d name=%q snapshot=%q release=%q count=%d reservation=%q",
+			metadata.calls, name, snapshot, releaseRaw, releaseCount, reservationStatus)
+	}
+	count, err = repo.EnqueueUserSyncCandidates(ctx, queue, cfg, "sync:wishlist-only:next", []RefreshTarget{{AppID: 987654322, Priority: 90}}, now.Add(time.Minute))
+	if err != nil || count != 0 {
+		t.Fatalf("fresh replay enqueued=%d err=%v", count, err)
+	}
+	var qualificationJobs, budgetUsed int
+	if err := db.Pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM sync_jobs WHERE kind='catalog.search.qualify'),
+		(SELECT used FROM catalog_budget_reservations WHERE kind='appdetails')`).Scan(&qualificationJobs, &budgetUsed); err != nil {
+		t.Fatal(err)
+	}
+	if qualificationJobs != 1 || budgetUsed != 1 || metadata.calls != 1 {
+		t.Fatalf("jobs=%d budget=%d Store calls=%d, want 1/1/1", qualificationJobs, budgetUsed, metadata.calls)
+	}
+	var activeDiscovery, sharedEntries int
+	if err := db.Pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM catalog_entry_sources WHERE game_id=$1 AND source='steam_discovery' AND active),
+		(SELECT count(*) FROM catalog_entries WHERE game_id=$1)`, gameID).Scan(&activeDiscovery, &sharedEntries); err != nil {
+		t.Fatal(err)
+	}
+	if activeDiscovery != 0 || sharedEntries != 0 {
+		t.Fatalf("user-only discovery sources=%d shared entries=%d, want 0/0", activeDiscovery, sharedEntries)
+	}
+	var dirtyRevision int64
+	if err := db.Pool.QueryRow(ctx, `SELECT dirty_revision FROM catalog_rebuild_state WHERE user_id=$1`, userID).Scan(&dirtyRevision); err != nil {
+		t.Fatal(err)
+	}
+	eligibilityArgs := dbgen.IsCatalogGameEligibleParams{
+		GameID: pgtype.UUID{Bytes: gameID, Valid: true}, Today: pgtype.Date{Time: now, Valid: true},
+		HorizonDays: int32(cfg.HorizonDays), LookbackDays: int32(cfg.LookbackDays),
+	}
+	eligible, err := db.Queries.IsCatalogGameEligible(ctx, eligibilityArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirtyRevision < 1 || !eligible {
+		t.Fatalf("single qualification dirty_revision=%d eligible=%v, want dirty and eligible", dirtyRevision, eligible)
+	}
+	// Model the worst ordering: catalog qualification commits before the first
+	// profile exists. The durable wishlist-owner dirty row must survive until
+	// profile publication and then schedule the successor ranking.
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, uuid.New(), userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ScheduleDueRebuilds(ctx, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var rebuildJobs int
+	if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs WHERE user_id=$1 AND kind='recommendations.rebuild'`, userID).Scan(&rebuildJobs); err != nil {
+		t.Fatal(err)
+	}
+	if rebuildJobs != 1 {
+		t.Fatalf("successor ranking jobs=%d, want 1", rebuildJobs)
+	}
+	if _, err := db.Pool.Exec(ctx, `DELETE FROM wishlist_entries WHERE user_id=$1 AND game_id=$2`, userID, gameID); err != nil {
+		t.Fatal(err)
+	}
+	eligible, err = db.Queries.IsCatalogGameEligible(ctx, eligibilityArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eligible {
+		t.Fatal("removed wishlist-only game remained a current catalog candidate")
+	}
+}
+
+func TestUserSyncQualificationIsFencedByWishlistRemovalAndDeletion(t *testing.T) {
+	setup := func(t *testing.T, appID int64) (*store.Store, *jobs.Queue, uuid.UUID, uuid.UUID, jobs.Lease, DiscoveryConfig, time.Time) {
+		t.Helper()
+		db := openCatalogTestStore(t)
+		ctx := context.Background()
+		now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+		userID, gameID := uuid.New(), uuid.New()
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,source_snapshot,last_successful_fetch_at)
+			VALUES($1,$2,'Wishlist placeholder','steam_wishlist','{}',$3)`, gameID, appID, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `INSERT INTO wishlist_entries(user_id,game_id,source,last_successful_fetch_at)
+			VALUES($1,$2,'steam_wishlist',$3)`, userID, gameID, now); err != nil {
+			t.Fatal(err)
+		}
+		cfg := DefaultDiscoveryConfig()
+		repo, queue := NewSearchRepository(db), jobs.NewQueue(db)
+		if count, err := repo.EnqueueUserSyncCandidates(ctx, queue, cfg, "contains-"+userID.String(),
+			[]RefreshTarget{{AppID: appID, Priority: 100}}, now); err != nil || count != 1 {
+			t.Fatalf("enqueued=%d err=%v", count, err)
+		}
+		lease, err := queue.Claim(ctx, jobs.LaneCatalog, "deletion-fence", time.Minute)
+		if err != nil || lease == nil {
+			t.Fatalf("lease=%+v err=%v", lease, err)
+		}
+		return db, queue, userID, gameID, *lease, cfg, now
+	}
+	deleteUser := func(t *testing.T, db *store.Store, userID uuid.UUID) {
+		t.Helper()
+		tx, err := db.Pool.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(context.Background())
+		if _, err := tx.Exec(context.Background(), `INSERT INTO deleted_user_tombstones(user_id) VALUES($1)`, userID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, userID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("removed before preflight spends no Store call", func(t *testing.T) {
+		db, queue, userID, gameID, lease, cfg, now := setup(t, 987654323)
+		deleteUser(t, db, userID)
+		metadata := &discoveryMetadata{details: steam.GameDetails{AppID: 987654323, Type: "game", Name: "Deleted",
+			ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "20 Oct, 2026"}}}
+		service, err := NewDiscoveryService(NewDiscoveryRepository(db), metadata, queue, cfg, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		service.now = func() time.Time { return now }
+		if err := service.handleSearchQualification(context.Background(), lease); err != nil {
+			t.Fatal(err)
+		}
+		var reservation, ingress, snapshot string
+		if err := db.Pool.QueryRow(context.Background(), `SELECT r.status,w.status,g.source_snapshot::text
+			FROM catalog_store_reservations r JOIN catalog_metadata_ingress_work w USING(steam_app_id)
+			JOIN games g ON g.steam_app_id=r.steam_app_id WHERE r.steam_app_id=987654323`).
+			Scan(&reservation, &ingress, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if metadata.calls != 0 || reservation != "released" || ingress != "superseded" || snapshot != "{}" {
+			t.Fatalf("calls=%d reservation=%q ingress=%q snapshot=%q game=%s", metadata.calls, reservation, ingress, snapshot, gameID)
+		}
+	})
+
+	t.Run("deletion during Store call cannot publish", func(t *testing.T) {
+		db, queue, userID, _, lease, cfg, now := setup(t, 987654324)
+		metadata := &blockingQualificationMetadata{
+			details: steam.GameDetails{AppID: 987654324, Type: "game", Name: "Too late",
+				ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "20 Oct, 2026"}},
+			called: make(chan struct{}), release: make(chan struct{}),
+		}
+		service, err := NewDiscoveryService(NewDiscoveryRepository(db), metadata, queue, cfg, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		service.now = func() time.Time { return now }
+		result := make(chan error, 1)
+		go func() { result <- service.handleSearchQualification(context.Background(), lease) }()
+		<-metadata.called
+		deleteUser(t, db, userID)
+		close(metadata.release)
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+		var reservation, ingress, name, snapshot string
+		var releases int
+		if err := db.Pool.QueryRow(context.Background(), `SELECT r.status,w.status,g.name,g.source_snapshot::text,
+			(SELECT count(*) FROM game_release_dates d WHERE d.game_id=g.id)
+			FROM catalog_store_reservations r JOIN catalog_metadata_ingress_work w USING(steam_app_id)
+			JOIN games g ON g.steam_app_id=r.steam_app_id WHERE r.steam_app_id=987654324`).
+			Scan(&reservation, &ingress, &name, &snapshot, &releases); err != nil {
+			t.Fatal(err)
+		}
+		if metadata.calls != 1 || reservation != "released" || ingress != "superseded" ||
+			name != "Wishlist placeholder" || snapshot != "{}" || releases != 0 {
+			t.Fatalf("calls=%d reservation=%q ingress=%q name=%q snapshot=%q releases=%d",
+				metadata.calls, reservation, ingress, name, snapshot, releases)
+		}
+	})
+}
+
+func TestNewerSearchObservationSupersedesInFlightUserSyncQualification(t *testing.T) {
+	db := openCatalogTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	const appID int64 = 987654325
+	userID, gameID := uuid.New(), uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,source_snapshot,last_successful_fetch_at)
+		VALUES($1,$2,'Wishlist placeholder','steam_wishlist','{}',$3)`, gameID, appID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO wishlist_entries(user_id,game_id,source,last_successful_fetch_at)
+		VALUES($1,$2,'steam_wishlist',$3)`, userID, gameID, now); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultDiscoveryConfig()
+	repo, queue := NewSearchRepository(db), jobs.NewQueue(db)
+	if count, err := repo.EnqueueUserSyncCandidates(ctx, queue, cfg, "sync:first", []RefreshTarget{{AppID: appID, Priority: 100}}, now); err != nil || count != 1 {
+		t.Fatalf("user qualification enqueued=%d err=%v", count, err)
+	}
+	oldLease, err := queue.Claim(ctx, jobs.LaneCatalog, "interleave-old", time.Minute)
+	if err != nil || oldLease == nil || oldLease.Kind != SearchQualificationJobKind {
+		t.Fatalf("old lease=%+v err=%v", oldLease, err)
+	}
+	var oldPayload SearchQualificationPayload
+	if err := json.Unmarshal(oldLease.Payload, &oldPayload); err != nil {
+		t.Fatal(err)
+	}
+
+	scan, err := NewSearchScanService(repo, &searchStub{}, queue, cfg, func() time.Time { return now.Add(time.Minute) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	enableSearchQualificationProducer(t, scan, repo)
+	run := searchTestRun(t, repo, cfg, now.Add(time.Minute))
+	observation := testObservation(appID, "20 Oct, 2026", steam.ReviewPositive, "Positive")
+	observation.Fingerprint = "search:newer-material"
+	if err := scan.CommitPage(ctx, run, steam.FeedPopularUpcoming, 0, 0,
+		steam.SearchPage{Start: 0, Count: 1, Total: 1, Items: []steam.SearchObservation{observation}}); err != nil {
+		t.Fatal(err)
+	}
+	if run.Revision <= oldPayload.CandidateRevision.RunRevision {
+		t.Fatalf("search revision=%d did not advance user revision=%d", run.Revision, oldPayload.CandidateRevision.RunRevision)
+	}
+
+	metadata := &discoveryMetadata{details: steam.GameDetails{AppID: appID, Type: "game", Name: "Search wins",
+		ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "20 Oct, 2026"}}}
+	service, err := NewDiscoveryService(NewDiscoveryRepository(db), metadata, queue, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return now.Add(2 * time.Minute) }
+	if err := service.handleSearchQualification(ctx, *oldLease); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Complete(ctx, *oldLease); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.calls != 0 {
+		t.Fatalf("superseded user qualification made %d Store calls", metadata.calls)
+	}
+	newLease, err := queue.Claim(ctx, jobs.LaneCatalog, "interleave-new", time.Minute)
+	if err != nil || newLease == nil || newLease.Kind != SearchQualificationJobKind {
+		t.Fatalf("new lease=%+v err=%v", newLease, err)
+	}
+	var newPayload SearchQualificationPayload
+	if err := json.Unmarshal(newLease.Payload, &newPayload); err != nil {
+		t.Fatal(err)
+	}
+	if newPayload.CandidateRevision.RunRevision != run.Revision || newPayload.ReservationID == oldPayload.ReservationID {
+		t.Fatalf("old=%+v new=%+v run=%+v", oldPayload, newPayload, run)
+	}
+	if err := service.handleSearchQualification(ctx, *newLease); err != nil {
+		t.Fatal(err)
+	}
+	var name, fingerprint, reservationStatus, ingressStatus string
+	var sharedSource, userProvenance, searchProvenance int
+	if err := db.Pool.QueryRow(ctx, `SELECT g.name,h.material_fingerprint,r.status,w.status,
+		(SELECT count(*) FROM catalog_entry_sources s WHERE s.game_id=g.id AND s.source='steam_discovery' AND s.active),
+		(SELECT count(*) FROM catalog_metadata_provenance p WHERE p.steam_app_id=g.steam_app_id AND p.ingress_kind='user_sync'),
+		(SELECT count(*) FROM catalog_metadata_provenance p WHERE p.steam_app_id=g.steam_app_id AND p.ingress_kind='manual')
+		FROM games g JOIN catalog_metadata_heads h USING(steam_app_id)
+		JOIN catalog_store_reservations r USING(steam_app_id)
+		JOIN catalog_metadata_ingress_work w USING(steam_app_id)
+		WHERE g.steam_app_id=$1`, appID).Scan(&name, &fingerprint, &reservationStatus, &ingressStatus,
+		&sharedSource, &userProvenance, &searchProvenance); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.calls != 1 || name != "Search wins" || fingerprint != observation.Fingerprint || reservationStatus != "complete" ||
+		ingressStatus != "superseded" || sharedSource != 1 || userProvenance != 1 || searchProvenance != 1 {
+		t.Fatalf("calls=%d name=%q fingerprint=%q reservation=%q ingress=%q source=%d provenance=%d/%d",
+			metadata.calls, name, fingerprint, reservationStatus, ingressStatus, sharedSource, userProvenance, searchProvenance)
 	}
 }
 

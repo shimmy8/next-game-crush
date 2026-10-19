@@ -102,6 +102,127 @@ func TestStartupCreatesOneCatchupAndInitialRun(t *testing.T) {
 	}
 }
 
+func TestDisabledDiscoveryStartupRecoversUserSyncIngress(t *testing.T) {
+	db := openCatalogTestStore(t)
+	ctx := context.Background()
+	now := searchClock()
+	repo := NewSearchRepository(db)
+	queue := jobs.NewQueue(db)
+	cfg := DefaultDiscoveryConfig()
+	cfg.Enabled = false
+	if _, _, err := repo.ensureUserSyncCandidate(ctx, MetadataIngress{Kind: "user_sync", Identity: "sync:restart"},
+		RefreshTarget{AppID: 730, Priority: 100}, now); err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := NewSearchScheduler(repo, queue, cfg, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.EnsureScheduled(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var ingressStatus, reservationStatus string
+	var qualifications int
+	if err := db.Pool.QueryRow(ctx, `SELECT w.status,r.status,
+		(SELECT count(*) FROM sync_jobs WHERE kind='catalog.search.qualify' AND lane='catalog')
+		FROM catalog_metadata_ingress_work w
+		JOIN catalog_store_reservations r USING(steam_app_id)
+		WHERE w.steam_app_id=730`).Scan(&ingressStatus, &reservationStatus, &qualifications); err != nil {
+		t.Fatal(err)
+	}
+	if ingressStatus != "reserved" || reservationStatus != "reserved" || qualifications != 1 {
+		t.Fatalf("ingress=%q reservation=%q qualifications=%d, want reserved/reserved/1", ingressStatus, reservationStatus, qualifications)
+	}
+}
+
+func TestDisabledDiscoveryRunRecoversRebuildAfterEarlySyncNudge(t *testing.T) {
+	db := openCatalogTestStore(t)
+	ctx := context.Background()
+	now := searchClock()
+	userID, gameID := uuid.New(), uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version) VALUES($1,$2,1)`, uuid.New(), userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO games(id,steam_app_id,name,source,source_snapshot,last_successful_fetch_at)
+		VALUES($1,987654323,'Wishlist placeholder','steam_wishlist','{}',$2)`, gameID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO wishlist_entries(user_id,game_id,source,last_successful_fetch_at)
+		VALUES($1,$2,'steam_wishlist',$3)`, userID, gameID, now); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultDiscoveryConfig()
+	cfg.Enabled = false
+	repo := NewSearchRepository(db)
+	queue := jobs.NewQueue(db)
+	if count, err := repo.EnqueueUserSyncCandidates(ctx, queue, cfg, "sync:early-nudge",
+		[]RefreshTarget{{AppID: 987654323, Priority: 100}}, now); err != nil || count != 1 {
+		t.Fatalf("enqueued=%d err=%v", count, err)
+	}
+	scheduler, err := NewSearchScheduler(repo, queue, cfg, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This is the production ordering that exposed the lost wakeup: sync/root
+	// completion nudges before the catalog worker commits qualification.
+	if err := scheduler.Nudge(ctx); err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	scheduler.recoveryInterval = 5 * time.Millisecond
+	startupComplete := make(chan struct{})
+	clockCalls := 0
+	scheduler.now = func() time.Time {
+		clockCalls++
+		if clockCalls == 2 {
+			close(startupComplete)
+		}
+		return now
+	}
+	done := make(chan error, 1)
+	go func() { done <- scheduler.Run(runCtx) }()
+	<-startupComplete
+
+	lease, err := queue.Claim(ctx, jobs.LaneCatalog, "disabled-recovery", time.Minute)
+	if err != nil || lease == nil || lease.Kind != SearchQualificationJobKind {
+		t.Fatalf("claim=%+v err=%v", lease, err)
+	}
+	metadata := &discoveryMetadata{details: steam.GameDetails{AppID: 987654323, Type: "game", Name: "Wishlist release",
+		ShortDescription: "Wishlist metadata", ReleaseDate: steam.ReleaseDate{ComingSoon: true, Raw: "20 Oct, 2026"},
+		Platforms: steam.Platforms{Windows: true}}}
+	service, err := NewDiscoveryService(NewDiscoveryRepository(db), metadata, queue, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return now }
+	if err := service.handleSearchQualification(ctx, *lease); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var rebuilds int
+		if err := db.Pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs
+			WHERE user_id=$1 AND kind='recommendations.rebuild' AND status='queued'`, userID).Scan(&rebuilds); err != nil {
+			t.Fatal(err)
+		}
+		if rebuilds == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("disabled scheduler did not recover the post-qualification rebuild")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDeadOccurrenceCreatesOneFencedRetryGeneration(t *testing.T) {
 	s, db := searchSchedulerFixture(t)
 	ctx := context.Background()

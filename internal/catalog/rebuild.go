@@ -214,7 +214,8 @@ func (r *DiscoveryRepository) MarkCandidateSetDirtyAt(ctx context.Context, tx pg
 	now = now.UTC()
 	_, err := tx.Exec(ctx, `WITH live_users AS MATERIALIZED (
 		SELECT u.id AS user_id FROM users u
-		WHERE EXISTS(SELECT 1 FROM preference_profiles p WHERE p.user_id=u.id)
+		WHERE (EXISTS(SELECT 1 FROM preference_profiles p WHERE p.user_id=u.id)
+		   OR EXISTS(SELECT 1 FROM wishlist_entries w WHERE w.user_id=u.id AND w.game_id=$2))
 		  AND NOT EXISTS(SELECT 1 FROM deleted_user_tombstones d WHERE d.user_id=u.id)
 		ORDER BY u.id FOR KEY SHARE OF u
 	)
@@ -224,7 +225,7 @@ func (r *DiscoveryRepository) MarkCandidateSetDirtyAt(ctx context.Context, tx pg
 		dirty_revision=catalog_rebuild_state.dirty_revision+1,
 		dirty_since=COALESCE(catalog_rebuild_state.dirty_since,EXCLUDED.dirty_since),
 		first_dirty_at=COALESCE(catalog_rebuild_state.first_dirty_at,EXCLUDED.first_dirty_at),
-		retry_generation=0`, now)
+		retry_generation=0`, now, change.GameID)
 	return err
 }
 

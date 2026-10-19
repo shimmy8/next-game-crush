@@ -120,7 +120,8 @@ func (s *Service) RefreshTargets(ctx context.Context) ([]RefreshTarget, error) {
 		  WHERE r.game_id=g.id AND r.ranking_version=(
 		    SELECT max(rr.ranking_version) FROM recommendation_runs rr
 		    WHERE rr.user_id=r.user_id AND rr.published
-		  )) AS displayed
+		  )) AS displayed,
+		EXISTS(SELECT 1 FROM wishlist_entries w WHERE w.game_id=g.id) AS wishlisted
 		FROM games g
 		WHERE EXISTS(SELECT 1 FROM catalog_entry_sources src WHERE src.game_id=g.id AND src.active)
 		   OR EXISTS(SELECT 1 FROM wishlist_entries w WHERE w.game_id=g.id)
@@ -132,13 +133,16 @@ func (s *Service) RefreshTargets(ctx context.Context) ([]RefreshTarget, error) {
 	result := []RefreshTarget{}
 	for rows.Next() {
 		var target RefreshTarget
-		var displayed bool
-		if err := rows.Scan(&target.AppID, &displayed); err != nil {
+		var displayed, wishlisted bool
+		if err := rows.Scan(&target.AppID, &displayed, &wishlisted); err != nil {
 			return nil, err
 		}
 		target.Priority = 50
 		if displayed {
 			target.Priority = 80
+		}
+		if wishlisted {
+			target.Priority = 100
 		}
 		result = append(result, target)
 	}

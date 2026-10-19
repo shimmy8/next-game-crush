@@ -1317,7 +1317,7 @@ func TestKnownRefreshFansOutIntoIndependentJobs(t *testing.T) {
 	if err := db.Pool.QueryRow(context.Background(), `SELECT count(*),min(priority),max(priority) FROM sync_jobs WHERE parent_job_id=$1 AND kind='catalog.refresh_game'`, id).Scan(&count, &minPriority, &maxPriority); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 || minPriority != 50 || maxPriority != 80 {
+	if count != 2 || minPriority != 80 || maxPriority != 100 {
 		t.Fatalf("fanout count=%d priorities=%d..%d", count, minPriority, maxPriority)
 	}
 	var oldPriority, latestPriority int
@@ -1327,8 +1327,8 @@ func TestKnownRefreshFansOutIntoIndependentJobs(t *testing.T) {
 		FROM sync_jobs WHERE parent_job_id=$1 AND kind='catalog.refresh_game'`, id).Scan(&oldPriority, &latestPriority); err != nil {
 		t.Fatal(err)
 	}
-	if oldPriority != 50 || latestPriority != 80 {
-		t.Fatalf("old/latest priorities=%d/%d, want 50/80", oldPriority, latestPriority)
+	if oldPriority != 100 || latestPriority != 80 {
+		t.Fatalf("wishlist/latest priorities=%d/%d, want 100/80", oldPriority, latestPriority)
 	}
 	if lease.Priority != 100 {
 		t.Fatalf("lease priority=%d", lease.Priority)
