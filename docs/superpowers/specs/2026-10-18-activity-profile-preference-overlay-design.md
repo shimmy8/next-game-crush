@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-18
 
-**Status:** Ready for user review
+**Status:** Implemented — browser release gate pending
 
 **Related MVP design:** `docs/superpowers/specs/2026-10-17-next-game-crush-mvp-design.md`
 
