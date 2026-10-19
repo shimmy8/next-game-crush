@@ -9,14 +9,40 @@ import (
 	"context"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	pgvector_go "github.com/pgvector/pgvector-go"
 )
 
-const getLatestPreferenceProfile = `-- name: GetLatestPreferenceProfile :one
-SELECT id, user_id, version, summary, model, input_content_hash, algorithm_metadata, created_at, build_key FROM preference_profiles WHERE user_id=$1 ORDER BY version DESC LIMIT 1
+const failBuildingActivityProfile = `-- name: FailBuildingActivityProfile :execrows
+UPDATE preference_profiles SET publication_state='failed'
+WHERE preference_profiles.id=$1 AND preference_profiles.user_id=$2
+  AND preference_profiles.publication_state='building'
+  AND NOT EXISTS(SELECT 1 FROM deleted_user_tombstones tombstone WHERE tombstone.user_id=preference_profiles.user_id)
 `
 
-func (q *Queries) GetLatestPreferenceProfile(ctx context.Context, userID pgtype.UUID) (PreferenceProfile, error) {
-	row := q.db.QueryRow(ctx, getLatestPreferenceProfile, userID)
+type FailBuildingActivityProfileParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+func (q *Queries) FailBuildingActivityProfile(ctx context.Context, arg FailBuildingActivityProfileParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failBuildingActivityProfile, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getActivityProfileByBuildKey = `-- name: GetActivityProfileByBuildKey :one
+SELECT id, user_id, version, summary, model, input_content_hash, algorithm_metadata, created_at, build_key, publication_state, published_at, summary_source FROM preference_profiles WHERE user_id=$1 AND build_key=$2
+`
+
+type GetActivityProfileByBuildKeyParams struct {
+	UserID   pgtype.UUID `json:"user_id"`
+	BuildKey pgtype.Text `json:"build_key"`
+}
+
+func (q *Queries) GetActivityProfileByBuildKey(ctx context.Context, arg GetActivityProfileByBuildKeyParams) (PreferenceProfile, error) {
+	row := q.db.QueryRow(ctx, getActivityProfileByBuildKey, arg.UserID, arg.BuildKey)
 	var i PreferenceProfile
 	err := row.Scan(
 		&i.ID,
@@ -28,6 +54,88 @@ func (q *Queries) GetLatestPreferenceProfile(ctx context.Context, userID pgtype.
 		&i.AlgorithmMetadata,
 		&i.CreatedAt,
 		&i.BuildKey,
+		&i.PublicationState,
+		&i.PublishedAt,
+		&i.SummarySource,
+	)
+	return i, err
+}
+
+const getActivityProfileByID = `-- name: GetActivityProfileByID :one
+SELECT id, user_id, version, summary, model, input_content_hash, algorithm_metadata, created_at, build_key, publication_state, published_at, summary_source FROM preference_profiles WHERE id=$1 AND user_id=$2
+`
+
+type GetActivityProfileByIDParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+func (q *Queries) GetActivityProfileByID(ctx context.Context, arg GetActivityProfileByIDParams) (PreferenceProfile, error) {
+	row := q.db.QueryRow(ctx, getActivityProfileByID, arg.ID, arg.UserID)
+	var i PreferenceProfile
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Version,
+		&i.Summary,
+		&i.Model,
+		&i.InputContentHash,
+		&i.AlgorithmMetadata,
+		&i.CreatedAt,
+		&i.BuildKey,
+		&i.PublicationState,
+		&i.PublishedAt,
+		&i.SummarySource,
+	)
+	return i, err
+}
+
+const getLatestActivityProfileState = `-- name: GetLatestActivityProfileState :one
+SELECT id, user_id, version, summary, model, input_content_hash, algorithm_metadata, created_at, build_key, publication_state, published_at, summary_source FROM preference_profiles WHERE user_id=$1 ORDER BY version DESC LIMIT 1
+`
+
+func (q *Queries) GetLatestActivityProfileState(ctx context.Context, userID pgtype.UUID) (PreferenceProfile, error) {
+	row := q.db.QueryRow(ctx, getLatestActivityProfileState, userID)
+	var i PreferenceProfile
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Version,
+		&i.Summary,
+		&i.Model,
+		&i.InputContentHash,
+		&i.AlgorithmMetadata,
+		&i.CreatedAt,
+		&i.BuildKey,
+		&i.PublicationState,
+		&i.PublishedAt,
+		&i.SummarySource,
+	)
+	return i, err
+}
+
+const getLatestPublishedActivityProfile = `-- name: GetLatestPublishedActivityProfile :one
+SELECT id, user_id, version, summary, model, input_content_hash, algorithm_metadata, created_at, build_key, publication_state, published_at, summary_source FROM preference_profiles
+WHERE user_id=$1 AND publication_state='published'
+ORDER BY version DESC LIMIT 1
+`
+
+func (q *Queries) GetLatestPublishedActivityProfile(ctx context.Context, userID pgtype.UUID) (PreferenceProfile, error) {
+	row := q.db.QueryRow(ctx, getLatestPublishedActivityProfile, userID)
+	var i PreferenceProfile
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Version,
+		&i.Summary,
+		&i.Model,
+		&i.InputContentHash,
+		&i.AlgorithmMetadata,
+		&i.CreatedAt,
+		&i.BuildKey,
+		&i.PublicationState,
+		&i.PublishedAt,
+		&i.SummarySource,
 	)
 	return i, err
 }
@@ -62,4 +170,187 @@ func (q *Queries) GetProfileEmbeddings(ctx context.Context, profileID pgtype.UUI
 		return nil, err
 	}
 	return items, nil
+}
+
+const insertActivityProfile = `-- name: InsertActivityProfile :one
+INSERT INTO preference_profiles(
+    id,user_id,version,summary,model,input_content_hash,algorithm_metadata,created_at,
+    build_key,publication_state,published_at,summary_source
+) VALUES(
+    $1,$2,$3,$4,$5,
+    $6,$7,$8,
+    $9,$10,$11,$12
+) RETURNING id, user_id, version, summary, model, input_content_hash, algorithm_metadata, created_at, build_key, publication_state, published_at, summary_source
+`
+
+type InsertActivityProfileParams struct {
+	ID                pgtype.UUID        `json:"id"`
+	UserID            pgtype.UUID        `json:"user_id"`
+	Version           int64              `json:"version"`
+	Summary           pgtype.Text        `json:"summary"`
+	Model             pgtype.Text        `json:"model"`
+	InputContentHash  pgtype.Text        `json:"input_content_hash"`
+	AlgorithmMetadata []byte             `json:"algorithm_metadata"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	BuildKey          pgtype.Text        `json:"build_key"`
+	PublicationState  string             `json:"publication_state"`
+	PublishedAt       pgtype.Timestamptz `json:"published_at"`
+	SummarySource     pgtype.Text        `json:"summary_source"`
+}
+
+func (q *Queries) InsertActivityProfile(ctx context.Context, arg InsertActivityProfileParams) (PreferenceProfile, error) {
+	row := q.db.QueryRow(ctx, insertActivityProfile,
+		arg.ID,
+		arg.UserID,
+		arg.Version,
+		arg.Summary,
+		arg.Model,
+		arg.InputContentHash,
+		arg.AlgorithmMetadata,
+		arg.CreatedAt,
+		arg.BuildKey,
+		arg.PublicationState,
+		arg.PublishedAt,
+		arg.SummarySource,
+	)
+	var i PreferenceProfile
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Version,
+		&i.Summary,
+		&i.Model,
+		&i.InputContentHash,
+		&i.AlgorithmMetadata,
+		&i.CreatedAt,
+		&i.BuildKey,
+		&i.PublicationState,
+		&i.PublishedAt,
+		&i.SummarySource,
+	)
+	return i, err
+}
+
+const insertActivityProfileEmbedding = `-- name: InsertActivityProfileEmbedding :exec
+INSERT INTO profile_embeddings(profile_id,polarity,model,input_content_hash,embedding,source,last_successful_fetch_at)
+VALUES($1,$2,$3,$4,$5,$6,$7)
+`
+
+type InsertActivityProfileEmbeddingParams struct {
+	ProfileID             pgtype.UUID        `json:"profile_id"`
+	Polarity              string             `json:"polarity"`
+	Model                 string             `json:"model"`
+	InputContentHash      string             `json:"input_content_hash"`
+	Embedding             pgvector_go.Vector `json:"embedding"`
+	Source                string             `json:"source"`
+	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
+}
+
+func (q *Queries) InsertActivityProfileEmbedding(ctx context.Context, arg InsertActivityProfileEmbeddingParams) error {
+	_, err := q.db.Exec(ctx, insertActivityProfileEmbedding,
+		arg.ProfileID,
+		arg.Polarity,
+		arg.Model,
+		arg.InputContentHash,
+		arg.Embedding,
+		arg.Source,
+		arg.LastSuccessfulFetchAt,
+	)
+	return err
+}
+
+const insertActivityProfileEvidence = `-- name: InsertActivityProfileEvidence :exec
+INSERT INTO activity_profile_evidence(
+    profile_id,game_id,playtime_minutes,recently_played_minutes,last_played_at,achieved,total,
+    completion_ending_count,completion_hundred_percent_basis,completion_weight,completion_at,
+    completion_basis,completion_algorithm_version
+) VALUES(
+    $1,$2,$3,$4,
+    $5,$6,$7,$8,
+    $9,$10,$11,
+    $12,$13
+)
+`
+
+type InsertActivityProfileEvidenceParams struct {
+	ProfileID                     pgtype.UUID        `json:"profile_id"`
+	GameID                        pgtype.UUID        `json:"game_id"`
+	PlaytimeMinutes               int64              `json:"playtime_minutes"`
+	RecentlyPlayedMinutes         int64              `json:"recently_played_minutes"`
+	LastPlayedAt                  pgtype.Timestamptz `json:"last_played_at"`
+	Achieved                      int32              `json:"achieved"`
+	Total                         int32              `json:"total"`
+	CompletionEndingCount         int32              `json:"completion_ending_count"`
+	CompletionHundredPercentBasis bool               `json:"completion_hundred_percent_basis"`
+	CompletionWeight              float64            `json:"completion_weight"`
+	CompletionAt                  pgtype.Timestamptz `json:"completion_at"`
+	CompletionBasis               pgtype.Text        `json:"completion_basis"`
+	CompletionAlgorithmVersion    pgtype.Text        `json:"completion_algorithm_version"`
+}
+
+func (q *Queries) InsertActivityProfileEvidence(ctx context.Context, arg InsertActivityProfileEvidenceParams) error {
+	_, err := q.db.Exec(ctx, insertActivityProfileEvidence,
+		arg.ProfileID,
+		arg.GameID,
+		arg.PlaytimeMinutes,
+		arg.RecentlyPlayedMinutes,
+		arg.LastPlayedAt,
+		arg.Achieved,
+		arg.Total,
+		arg.CompletionEndingCount,
+		arg.CompletionHundredPercentBasis,
+		arg.CompletionWeight,
+		arg.CompletionAt,
+		arg.CompletionBasis,
+		arg.CompletionAlgorithmVersion,
+	)
+	return err
+}
+
+const publishActivityProfile = `-- name: PublishActivityProfile :one
+UPDATE preference_profiles SET
+    summary=$1,model=$2,input_content_hash=$3,
+    summary_source=$4,publication_state='published',published_at=$5
+WHERE preference_profiles.id=$6 AND preference_profiles.user_id=$7
+  AND preference_profiles.publication_state='building'
+  AND NOT EXISTS(SELECT 1 FROM deleted_user_tombstones tombstone WHERE tombstone.user_id=preference_profiles.user_id)
+RETURNING id, user_id, version, summary, model, input_content_hash, algorithm_metadata, created_at, build_key, publication_state, published_at, summary_source
+`
+
+type PublishActivityProfileParams struct {
+	Summary          pgtype.Text        `json:"summary"`
+	Model            pgtype.Text        `json:"model"`
+	InputContentHash pgtype.Text        `json:"input_content_hash"`
+	SummarySource    pgtype.Text        `json:"summary_source"`
+	PublishedAt      pgtype.Timestamptz `json:"published_at"`
+	ID               pgtype.UUID        `json:"id"`
+	UserID           pgtype.UUID        `json:"user_id"`
+}
+
+func (q *Queries) PublishActivityProfile(ctx context.Context, arg PublishActivityProfileParams) (PreferenceProfile, error) {
+	row := q.db.QueryRow(ctx, publishActivityProfile,
+		arg.Summary,
+		arg.Model,
+		arg.InputContentHash,
+		arg.SummarySource,
+		arg.PublishedAt,
+		arg.ID,
+		arg.UserID,
+	)
+	var i PreferenceProfile
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Version,
+		&i.Summary,
+		&i.Model,
+		&i.InputContentHash,
+		&i.AlgorithmMetadata,
+		&i.CreatedAt,
+		&i.BuildKey,
+		&i.PublicationState,
+		&i.PublishedAt,
+		&i.SummarySource,
+	)
+	return i, err
 }

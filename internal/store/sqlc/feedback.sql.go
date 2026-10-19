@@ -138,6 +138,123 @@ func (q *Queries) LinkFeedbackRebuildJob(ctx context.Context, arg LinkFeedbackRe
 	return result.RowsAffected(), nil
 }
 
+const listEffectiveDirectReactions = `-- name: ListEffectiveDirectReactions :many
+WITH effective AS (
+    SELECT DISTINCT ON (rec.game_id)
+        f.id,f.user_id,rec.game_id,f.action,f.created_at
+    FROM feedback_events f
+    JOIN recommendations rec ON rec.id=f.recommendation_id AND rec.user_id=f.user_id
+    WHERE f.user_id=$1 AND f.action IN ('like','dislike','exclude')
+    ORDER BY rec.game_id,f.created_at DESC,f.id DESC
+)
+SELECT effective.id AS feedback_id,effective.game_id,effective.action,effective.created_at,
+       ARRAY[
+           COALESCE(saved.model,''),
+           COALESCE(saved.input_content_hash,''),
+           COALESCE(saved.embedding::text,'')
+       ]::text[] AS embedding_snapshot
+FROM effective
+LEFT JOIN LATERAL (
+    SELECT model,input_content_hash,embedding
+    FROM game_embeddings
+    WHERE game_id=effective.game_id
+    ORDER BY last_successful_fetch_at DESC,model
+    LIMIT 1
+) saved ON true
+ORDER BY effective.game_id,effective.id
+`
+
+type ListEffectiveDirectReactionsRow struct {
+	FeedbackID        pgtype.UUID        `json:"feedback_id"`
+	GameID            pgtype.UUID        `json:"game_id"`
+	Action            string             `json:"action"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	EmbeddingSnapshot []string           `json:"embedding_snapshot"`
+}
+
+// embedding_snapshot is [model,input_content_hash,vector_text]; all three entries
+// are empty when no saved embedding exists, so callers never infer a zero vector.
+func (q *Queries) ListEffectiveDirectReactions(ctx context.Context, userID pgtype.UUID) ([]ListEffectiveDirectReactionsRow, error) {
+	rows, err := q.db.Query(ctx, listEffectiveDirectReactions, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListEffectiveDirectReactionsRow{}
+	for rows.Next() {
+		var i ListEffectiveDirectReactionsRow
+		if err := rows.Scan(
+			&i.FeedbackID,
+			&i.GameID,
+			&i.Action,
+			&i.CreatedAt,
+			&i.EmbeddingSnapshot,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEffectivePreferenceAdjustments = `-- name: ListEffectivePreferenceAdjustments :many
+WITH effective_negative AS (
+    SELECT DISTINCT ON (rec.game_id) f.id,f.user_id,rec.game_id,f.action
+    FROM feedback_events f
+    JOIN recommendations rec ON rec.id=f.recommendation_id AND rec.user_id=f.user_id
+    WHERE f.user_id=$1 AND f.action IN ('like','dislike','exclude')
+    ORDER BY rec.game_id,f.created_at DESC,f.id DESC
+)
+SELECT adjustment.id, adjustment.user_id, adjustment.source_feedback_id, adjustment.source_game_id, adjustment.dimension, adjustment.target, adjustment.direction, adjustment.confidence, adjustment.strength, adjustment.active, adjustment.disable_rebuild_job_id, adjustment.disable_previous_ranking_version, adjustment.created_at, adjustment.updated_at, adjustment.disabled_at
+FROM preference_adjustments adjustment
+JOIN effective_negative effective
+  ON effective.id=adjustment.source_feedback_id
+ AND effective.user_id=adjustment.user_id
+ AND effective.game_id=adjustment.source_game_id
+ AND effective.action IN ('dislike','exclude')
+WHERE adjustment.user_id=$1 AND adjustment.active
+ORDER BY adjustment.created_at,adjustment.id
+`
+
+func (q *Queries) ListEffectivePreferenceAdjustments(ctx context.Context, userID pgtype.UUID) ([]PreferenceAdjustment, error) {
+	rows, err := q.db.Query(ctx, listEffectivePreferenceAdjustments, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PreferenceAdjustment{}
+	for rows.Next() {
+		var i PreferenceAdjustment
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.SourceFeedbackID,
+			&i.SourceGameID,
+			&i.Dimension,
+			&i.Target,
+			&i.Direction,
+			&i.Confidence,
+			&i.Strength,
+			&i.Active,
+			&i.DisableRebuildJobID,
+			&i.DisablePreviousRankingVersion,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DisabledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const upsertFeedbackClassification = `-- name: UpsertFeedbackClassification :exec
 INSERT INTO feedback_classifications(feedback_id,taxonomy,polarity,confidence,actionable,model,input_content_hash,schema_version,preference_dimension,preference_target,preference_direction)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)

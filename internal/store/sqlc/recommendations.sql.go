@@ -12,7 +12,7 @@ import (
 )
 
 const getLatestRecommendations = `-- name: GetLatestRecommendations :many
-SELECT r.id, r.user_id, r.game_id, r.profile_id, r.algorithm_version, r.score, r.text_model, r.embedding_model, r.explanation, r.explanation_input_content_hash, r.created_at, r.ranking_version, r.explanation_evidence, r.explanation_generated, r.explanation_source, r.explanation_failure_reason, g.name FROM recommendations r JOIN games g ON g.id=r.game_id
+SELECT r.id, r.user_id, r.game_id, r.profile_id, r.algorithm_version, r.score, r.text_model, r.embedding_model, r.explanation, r.explanation_input_content_hash, r.created_at, r.ranking_version, r.explanation_evidence, r.explanation_generated, r.explanation_source, r.explanation_failure_reason, r.preference_overlay_id, g.name FROM recommendations r JOIN games g ON g.id=r.game_id
 WHERE r.user_id=$1 AND r.ranking_version=(SELECT max(ranking_version) FROM recommendation_runs WHERE user_id=$1 AND published)
 ORDER BY r.score DESC, lower(g.name) COLLATE "C", g.name COLLATE "C", g.id
 `
@@ -34,6 +34,7 @@ type GetLatestRecommendationsRow struct {
 	ExplanationGenerated        bool               `json:"explanation_generated"`
 	ExplanationSource           string             `json:"explanation_source"`
 	ExplanationFailureReason    pgtype.Text        `json:"explanation_failure_reason"`
+	PreferenceOverlayID         pgtype.UUID        `json:"preference_overlay_id"`
 	Name                        string             `json:"name"`
 }
 
@@ -63,6 +64,7 @@ func (q *Queries) GetLatestRecommendations(ctx context.Context, userID pgtype.UU
 			&i.ExplanationGenerated,
 			&i.ExplanationSource,
 			&i.ExplanationFailureReason,
+			&i.PreferenceOverlayID,
 			&i.Name,
 		); err != nil {
 			return nil, err
@@ -92,7 +94,7 @@ func (q *Queries) GetRecommendationFactors(ctx context.Context, recommendationID
 }
 
 const getRecommendationForUser = `-- name: GetRecommendationForUser :one
-SELECT r.id, r.user_id, r.game_id, r.profile_id, r.algorithm_version, r.score, r.text_model, r.embedding_model, r.explanation, r.explanation_input_content_hash, r.created_at, r.ranking_version, r.explanation_evidence, r.explanation_generated, r.explanation_source, r.explanation_failure_reason, g.name FROM recommendations r JOIN games g ON g.id=r.game_id
+SELECT r.id, r.user_id, r.game_id, r.profile_id, r.algorithm_version, r.score, r.text_model, r.embedding_model, r.explanation, r.explanation_input_content_hash, r.created_at, r.ranking_version, r.explanation_evidence, r.explanation_generated, r.explanation_source, r.explanation_failure_reason, r.preference_overlay_id, g.name FROM recommendations r JOIN games g ON g.id=r.game_id
 WHERE r.id=$1 AND r.user_id=$2
 `
 
@@ -118,6 +120,7 @@ type GetRecommendationForUserRow struct {
 	ExplanationGenerated        bool               `json:"explanation_generated"`
 	ExplanationSource           string             `json:"explanation_source"`
 	ExplanationFailureReason    pgtype.Text        `json:"explanation_failure_reason"`
+	PreferenceOverlayID         pgtype.UUID        `json:"preference_overlay_id"`
 	Name                        string             `json:"name"`
 }
 
@@ -141,7 +144,41 @@ func (q *Queries) GetRecommendationForUser(ctx context.Context, arg GetRecommend
 		&i.ExplanationGenerated,
 		&i.ExplanationSource,
 		&i.ExplanationFailureReason,
+		&i.PreferenceOverlayID,
 		&i.Name,
+	)
+	return i, err
+}
+
+const getRecommendationRunProvenance = `-- name: GetRecommendationRunProvenance :one
+SELECT profile_id,preference_overlay_id,ranking_version,algorithm_version,build_key,published
+FROM recommendation_runs WHERE user_id=$1 AND ranking_version=$2
+`
+
+type GetRecommendationRunProvenanceParams struct {
+	UserID         pgtype.UUID `json:"user_id"`
+	RankingVersion int64       `json:"ranking_version"`
+}
+
+type GetRecommendationRunProvenanceRow struct {
+	ProfileID           pgtype.UUID `json:"profile_id"`
+	PreferenceOverlayID pgtype.UUID `json:"preference_overlay_id"`
+	RankingVersion      int64       `json:"ranking_version"`
+	AlgorithmVersion    string      `json:"algorithm_version"`
+	BuildKey            string      `json:"build_key"`
+	Published           bool        `json:"published"`
+}
+
+func (q *Queries) GetRecommendationRunProvenance(ctx context.Context, arg GetRecommendationRunProvenanceParams) (GetRecommendationRunProvenanceRow, error) {
+	row := q.db.QueryRow(ctx, getRecommendationRunProvenance, arg.UserID, arg.RankingVersion)
+	var i GetRecommendationRunProvenanceRow
+	err := row.Scan(
+		&i.ProfileID,
+		&i.PreferenceOverlayID,
+		&i.RankingVersion,
+		&i.AlgorithmVersion,
+		&i.BuildKey,
+		&i.Published,
 	)
 	return i, err
 }

@@ -111,3 +111,14 @@ WHERE job_id = $1 AND worker_id = $2 AND fencing_token = $3 AND status = 'runnin
 
 -- name: GetJobChildren :many
 SELECT * FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id;
+
+-- name: GetLatestSucceededRootSteamSync :one
+SELECT * FROM sync_jobs
+WHERE user_id=sqlc.arg(user_id) AND kind='steam.sync' AND parent_job_id IS NULL AND status='succeeded'
+ORDER BY updated_at DESC,id DESC LIMIT 1;
+
+-- name: GetActiveRootSteamSync :one
+SELECT * FROM sync_jobs
+WHERE user_id=sqlc.arg(user_id) AND kind='steam.sync' AND parent_job_id IS NULL
+  AND status IN ('queued','running','retryable','waiting')
+ORDER BY created_at,id LIMIT 1;

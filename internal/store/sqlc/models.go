@@ -50,6 +50,22 @@ type AchievementSummary struct {
 	SnapshotGeneration    int64              `json:"snapshot_generation"`
 }
 
+type ActivityProfileEvidence struct {
+	ProfileID                     pgtype.UUID        `json:"profile_id"`
+	GameID                        pgtype.UUID        `json:"game_id"`
+	PlaytimeMinutes               int64              `json:"playtime_minutes"`
+	RecentlyPlayedMinutes         int64              `json:"recently_played_minutes"`
+	LastPlayedAt                  pgtype.Timestamptz `json:"last_played_at"`
+	Achieved                      int32              `json:"achieved"`
+	Total                         int32              `json:"total"`
+	CompletionEndingCount         int32              `json:"completion_ending_count"`
+	CompletionHundredPercentBasis bool               `json:"completion_hundred_percent_basis"`
+	CompletionWeight              float64            `json:"completion_weight"`
+	CompletionAt                  pgtype.Timestamptz `json:"completion_at"`
+	CompletionBasis               pgtype.Text        `json:"completion_basis"`
+	CompletionAlgorithmVersion    pgtype.Text        `json:"completion_algorithm_version"`
+}
+
 type CatalogBudgetReservation struct {
 	Kind         string             `json:"kind"`
 	HourAt       pgtype.Timestamptz `json:"hour_at"`
@@ -552,6 +568,27 @@ type PreferenceAdjustment struct {
 	DisabledAt                    pgtype.Timestamptz `json:"disabled_at"`
 }
 
+type PreferenceOverlay struct {
+	ID                pgtype.UUID        `json:"id"`
+	UserID            pgtype.UUID        `json:"user_id"`
+	Version           int64              `json:"version"`
+	AlgorithmVersion  string             `json:"algorithm_version"`
+	BuildKey          string             `json:"build_key"`
+	InputContentHash  string             `json:"input_content_hash"`
+	AlgorithmMetadata []byte             `json:"algorithm_metadata"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type PreferenceOverlayEmbedding struct {
+	OverlayID             pgtype.UUID        `json:"overlay_id"`
+	Polarity              string             `json:"polarity"`
+	Model                 string             `json:"model"`
+	InputContentHash      string             `json:"input_content_hash"`
+	Embedding             pgvector_go.Vector `json:"embedding"`
+	Source                string             `json:"source"`
+	LastSuccessfulFetchAt pgtype.Timestamptz `json:"last_successful_fetch_at"`
+}
+
 type PreferenceProfile struct {
 	ID                pgtype.UUID        `json:"id"`
 	UserID            pgtype.UUID        `json:"user_id"`
@@ -562,6 +599,9 @@ type PreferenceProfile struct {
 	AlgorithmMetadata []byte             `json:"algorithm_metadata"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	BuildKey          pgtype.Text        `json:"build_key"`
+	PublicationState  string             `json:"publication_state"`
+	PublishedAt       pgtype.Timestamptz `json:"published_at"`
+	SummarySource     pgtype.Text        `json:"summary_source"`
 }
 
 type ProfileEmbedding struct {
@@ -591,6 +631,7 @@ type Recommendation struct {
 	ExplanationGenerated        bool               `json:"explanation_generated"`
 	ExplanationSource           string             `json:"explanation_source"`
 	ExplanationFailureReason    pgtype.Text        `json:"explanation_failure_reason"`
+	PreferenceOverlayID         pgtype.UUID        `json:"preference_overlay_id"`
 }
 
 type RecommendationFactor struct {
@@ -600,14 +641,15 @@ type RecommendationFactor struct {
 }
 
 type RecommendationRun struct {
-	ID               pgtype.UUID        `json:"id"`
-	UserID           pgtype.UUID        `json:"user_id"`
-	ProfileID        pgtype.UUID        `json:"profile_id"`
-	RankingVersion   int64              `json:"ranking_version"`
-	AlgorithmVersion string             `json:"algorithm_version"`
-	BuildKey         string             `json:"build_key"`
-	Published        bool               `json:"published"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	ID                  pgtype.UUID        `json:"id"`
+	UserID              pgtype.UUID        `json:"user_id"`
+	ProfileID           pgtype.UUID        `json:"profile_id"`
+	RankingVersion      int64              `json:"ranking_version"`
+	AlgorithmVersion    string             `json:"algorithm_version"`
+	BuildKey            string             `json:"build_key"`
+	Published           bool               `json:"published"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	PreferenceOverlayID pgtype.UUID        `json:"preference_overlay_id"`
 }
 
 type Session struct {

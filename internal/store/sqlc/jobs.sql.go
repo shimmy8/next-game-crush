@@ -317,6 +317,42 @@ func (q *Queries) FinishSuccessfulAttempt(ctx context.Context, arg FinishSuccess
 	return err
 }
 
+const getActiveRootSteamSync = `-- name: GetActiveRootSteamSync :one
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id, priority, lane FROM sync_jobs
+WHERE user_id=$1 AND kind='steam.sync' AND parent_job_id IS NULL
+  AND status IN ('queued','running','retryable','waiting')
+ORDER BY created_at,id LIMIT 1
+`
+
+func (q *Queries) GetActiveRootSteamSync(ctx context.Context, userID pgtype.UUID) (SyncJob, error) {
+	row := q.db.QueryRow(ctx, getActiveRootSteamSync, userID)
+	var i SyncJob
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.IdempotencyKey,
+		&i.Payload,
+		&i.Status,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.AvailableAt,
+		&i.WorkerID,
+		&i.FencingToken,
+		&i.LeaseUntil,
+		&i.LastError,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ParentJobID,
+		&i.Required,
+		&i.Stage,
+		&i.Result,
+		&i.UserID,
+		&i.Priority,
+		&i.Lane,
+	)
+	return i, err
+}
+
 const getJobChildren = `-- name: GetJobChildren :many
 SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id, priority, lane FROM sync_jobs WHERE parent_job_id = $1 ORDER BY created_at, id
 `
@@ -397,6 +433,41 @@ func (q *Queries) GetJobWorkflowID(ctx context.Context, id pgtype.UUID) (pgtype.
 	var id_2 pgtype.UUID
 	err := row.Scan(&id_2)
 	return id_2, err
+}
+
+const getLatestSucceededRootSteamSync = `-- name: GetLatestSucceededRootSteamSync :one
+SELECT id, kind, idempotency_key, payload, status, attempts, max_attempts, available_at, worker_id, fencing_token, lease_until, last_error, created_at, updated_at, parent_job_id, required, stage, result, user_id, priority, lane FROM sync_jobs
+WHERE user_id=$1 AND kind='steam.sync' AND parent_job_id IS NULL AND status='succeeded'
+ORDER BY updated_at DESC,id DESC LIMIT 1
+`
+
+func (q *Queries) GetLatestSucceededRootSteamSync(ctx context.Context, userID pgtype.UUID) (SyncJob, error) {
+	row := q.db.QueryRow(ctx, getLatestSucceededRootSteamSync, userID)
+	var i SyncJob
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.IdempotencyKey,
+		&i.Payload,
+		&i.Status,
+		&i.Attempts,
+		&i.MaxAttempts,
+		&i.AvailableAt,
+		&i.WorkerID,
+		&i.FencingToken,
+		&i.LeaseUntil,
+		&i.LastError,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ParentJobID,
+		&i.Required,
+		&i.Stage,
+		&i.Result,
+		&i.UserID,
+		&i.Priority,
+		&i.Lane,
+	)
+	return i, err
 }
 
 const insertJobAttempt = `-- name: InsertJobAttempt :exec

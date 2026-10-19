@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -11,8 +12,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pressly/goose/v3"
 	migrationfiles "next-game-crush/db/migrations"
+	dbgen "next-game-crush/internal/store/sqlc"
 )
 
 func TestSteamSearchMigrationAllowsEmptyRollback(t *testing.T) {
@@ -252,7 +255,8 @@ func TestPreferenceAdjustmentsMigration(t *testing.T) {
 	if strings.Contains(baseURL, "?") {
 		separator = "&"
 	}
-	database, err := sql.Open("pgx", fmt.Sprintf("%s%ssearch_path=%s%%2Cpublic", baseURL, separator, schema))
+	isolatedURL := fmt.Sprintf("%s%ssearch_path=%s%%2Cpublic", baseURL, separator, schema)
+	database, err := sql.Open("pgx", isolatedURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +342,8 @@ func TestGroundedExplanationMigrationBackfillsLegacySources(t *testing.T) {
 	if strings.Contains(baseURL, "?") {
 		separator = "&"
 	}
-	database, err := sql.Open("pgx", fmt.Sprintf("%s%ssearch_path=%s%%2Cpublic", baseURL, separator, schema))
+	isolatedURL := fmt.Sprintf("%s%ssearch_path=%s%%2Cpublic", baseURL, separator, schema)
+	database, err := sql.Open("pgx", isolatedURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,4 +724,248 @@ func TestAchievementCompletionMigrationBackfillsHundredPercentAndConstraints(t *
 			t.Fatalf("game cascade left %s rows=%d err=%v", table, count, err)
 		}
 	}
+}
+
+func TestActivityProfilePreferenceOverlayMigration(t *testing.T) {
+	ctx, database, provider, _ := migrationDatabaseAt(t, 19)
+
+	userID, blankUserID, whitespaceUserID := uuid.New(), uuid.New(), uuid.New()
+	profileID, blankProfileID, whitespaceProfileID := uuid.New(), uuid.New(), uuid.New()
+	gameID, recommendationID, runID := uuid.New(), uuid.New(), uuid.New()
+	createdAt := time.Date(2026, time.October, 18, 9, 30, 0, 0, time.UTC)
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO users(id) VALUES($1),($2),($3)`, []any{userID, blankUserID, whitespaceUserID}},
+		{`INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,20001,'Shared','test',now())`, []any{gameID}},
+		{`INSERT INTO preference_profiles(id,user_id,version,summary,created_at,build_key) VALUES
+			($1,$2,1,'Legacy summary',$5,'legacy-ready'),
+			($3,$4,1,'   ',$5,'legacy-blank')`, []any{profileID, userID, blankProfileID, blankUserID, createdAt}},
+		{`INSERT INTO preference_profiles(id,user_id,version,summary,created_at,build_key) VALUES($1,$2,1,E'\t\n\r',$3,'legacy-whitespace')`, []any{whitespaceProfileID, whitespaceUserID, createdAt}},
+		{`INSERT INTO recommendation_runs(id,user_id,profile_id,ranking_version,algorithm_version,build_key,published) VALUES($1,$2,$3,1,'legacy','legacy-run',true)`, []any{runID, userID, profileID}},
+		{`INSERT INTO recommendations(id,user_id,game_id,profile_id,algorithm_version,score,ranking_version) VALUES($1,$2,$3,$4,'legacy',50,1)`, []any{recommendationID, userID, gameID, profileID}},
+	} {
+		if _, err := database.ExecContext(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := provider.UpTo(ctx, 20); err != nil {
+		t.Fatal(err)
+	}
+
+	var state, source string
+	var publishedAt time.Time
+	if err := database.QueryRowContext(ctx, `SELECT publication_state,summary_source,published_at FROM preference_profiles WHERE id=$1`, profileID).Scan(&state, &source, &publishedAt); err != nil {
+		t.Fatal(err)
+	}
+	if state != "published" || source != "legacy" || !publishedAt.Equal(createdAt) {
+		t.Fatalf("legacy ready profile state=%q source=%q published_at=%v", state, source, publishedAt)
+	}
+	var blankPublishedAt, blankSource any
+	if err := database.QueryRowContext(ctx, `SELECT publication_state,published_at,summary_source FROM preference_profiles WHERE id=$1`, blankProfileID).Scan(&state, &blankPublishedAt, &blankSource); err != nil {
+		t.Fatal(err)
+	}
+	if state != "failed" || blankPublishedAt != nil || blankSource != nil {
+		t.Fatalf("legacy blank profile state=%q published_at=%v source=%v", state, blankPublishedAt, blankSource)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT publication_state,published_at,summary_source FROM preference_profiles WHERE id=$1`, whitespaceProfileID).Scan(&state, &blankPublishedAt, &blankSource); err != nil {
+		t.Fatal(err)
+	}
+	if state != "failed" || blankPublishedAt != nil || blankSource != nil {
+		t.Fatalf("legacy control-whitespace profile state=%q published_at=%v source=%v", state, blankPublishedAt, blankSource)
+	}
+	for _, table := range []string{"recommendation_runs", "recommendations"} {
+		var nullable bool
+		if err := database.QueryRowContext(ctx, `SELECT is_nullable='YES' FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=$1 AND column_name='preference_overlay_id'`, table).Scan(&nullable); err != nil || !nullable {
+			t.Fatalf("%s.preference_overlay_id nullable=%v err=%v", table, nullable, err)
+		}
+	}
+
+	overlayID := uuid.New()
+	if _, err := database.ExecContext(ctx, `INSERT INTO preference_overlays(id,user_id,version,algorithm_version,build_key,input_content_hash) VALUES($1,$2,1,'overlay-v1','build-one','hash-one')`, overlayID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO preference_overlays(id,user_id,version,algorithm_version,build_key,input_content_hash) VALUES(gen_random_uuid(),$1,1,'overlay-v1','build-two','hash-two')`, userID); err == nil {
+		t.Fatal("duplicate overlay version unexpectedly accepted")
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO preference_overlays(id,user_id,version,algorithm_version,build_key,input_content_hash) VALUES(gen_random_uuid(),$1,2,'overlay-v1','build-one','hash-two')`, userID); err == nil {
+		t.Fatal("duplicate overlay build key unexpectedly accepted")
+	}
+
+	if _, err := provider.Down(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var removed bool
+	if err := database.QueryRowContext(ctx, `SELECT to_regclass('preference_overlays') IS NULL
+		AND to_regclass('activity_profile_evidence') IS NULL
+		AND NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='preference_profiles' AND column_name='publication_state')
+		AND NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='recommendations' AND column_name='preference_overlay_id')`).Scan(&removed); err != nil || !removed {
+		t.Fatalf("migration rollback incomplete: removed=%v err=%v", removed, err)
+	}
+	var legacyRows int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM recommendation_runs WHERE id=$1`, runID).Scan(&legacyRows); err != nil || legacyRows != 1 {
+		t.Fatalf("rollback changed legacy rows: count=%d err=%v", legacyRows, err)
+	}
+}
+
+func TestActivityProfilePublicationChecks(t *testing.T) {
+	ctx, database, _, _ := migrationDatabaseAt(t, 20)
+	userID := uuid.New()
+	if _, err := database.ExecContext(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	valid := []string{
+		`INSERT INTO preference_profiles(id,user_id,version,publication_state) VALUES(gen_random_uuid(),$1,1,'building')`,
+		`INSERT INTO preference_profiles(id,user_id,version,publication_state) VALUES(gen_random_uuid(),$1,2,'failed')`,
+		`INSERT INTO preference_profiles(id,user_id,version,publication_state) VALUES(gen_random_uuid(),$1,3,'insufficient')`,
+		`INSERT INTO preference_profiles(id,user_id,version,summary,publication_state,published_at,summary_source) VALUES(gen_random_uuid(),$1,4,'ready','published',now(),'deterministic')`,
+	}
+	for _, statement := range valid {
+		if _, err := database.ExecContext(ctx, statement, userID); err != nil {
+			t.Fatalf("valid publication row rejected: %v", err)
+		}
+	}
+	invalid := []string{
+		`INSERT INTO preference_profiles(id,user_id,version,summary,publication_state) VALUES(gen_random_uuid(),$1,5,'ready','published')`,
+		`INSERT INTO preference_profiles(id,user_id,version,summary,publication_state,published_at,summary_source) VALUES(gen_random_uuid(),$1,6,'   ','published',now(),'openai')`,
+		`INSERT INTO preference_profiles(id,user_id,version,summary,publication_state,published_at,summary_source) VALUES(gen_random_uuid(),$1,9,E'\t\n\r','published',now(),'openai')`,
+		`INSERT INTO preference_profiles(id,user_id,version,publication_state,published_at) VALUES(gen_random_uuid(),$1,7,'failed',now())`,
+		`INSERT INTO preference_profiles(id,user_id,version,publication_state,summary_source) VALUES(gen_random_uuid(),$1,8,'building','legacy')`,
+	}
+	for _, statement := range invalid {
+		if _, err := database.ExecContext(ctx, statement, userID); err == nil {
+			t.Fatalf("invalid publication row unexpectedly accepted: %s", statement)
+		}
+	}
+}
+
+func TestPreferenceOverlayDeletionGuards(t *testing.T) {
+	ctx, database, _, _ := migrationDatabaseAt(t, 20)
+	userID, gameID, profileID, overlayID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO users(id) VALUES($1)`, []any{userID}},
+		{`INSERT INTO games(id,steam_app_id,name,source,last_successful_fetch_at) VALUES($1,20002,'Shared','test',now())`, []any{gameID}},
+		{`INSERT INTO game_embeddings(game_id,model,input_content_hash,embedding) VALUES($1,'shared','shared-hash',$2)`, []any{gameID, migrationZeroVector()}},
+		{`INSERT INTO preference_profiles(id,user_id,version,publication_state) VALUES($1,$2,1,'building')`, []any{profileID, userID}},
+		{`INSERT INTO activity_profile_evidence(profile_id,game_id,playtime_minutes,recently_played_minutes,achieved,total,completion_weight,completion_basis,completion_algorithm_version) VALUES($1,$2,60,5,1,10,0.5,'ending','completion-v1')`, []any{profileID, gameID}},
+		{`INSERT INTO preference_overlays(id,user_id,version,algorithm_version,build_key,input_content_hash) VALUES($1,$2,1,'overlay-v1','build','hash')`, []any{overlayID, userID}},
+		{`INSERT INTO preference_overlay_embeddings(overlay_id,polarity,model,input_content_hash,embedding) VALUES($1,'positive','test','hash',$2)`, []any{overlayID, migrationZeroVector()}},
+		{`INSERT INTO deleted_user_tombstones(user_id) VALUES($1)`, []any{userID}},
+	} {
+		if _, err := database.ExecContext(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO preference_overlays(id,user_id,version,algorithm_version,build_key,input_content_hash) VALUES(gen_random_uuid(),$1,2,'overlay-v1','late','late')`, userID); err == nil {
+		t.Fatal("late overlay insert after tombstone unexpectedly accepted")
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO preference_overlay_embeddings(overlay_id,polarity,model,input_content_hash,embedding) VALUES($1,'negative','test','late',$2)`, overlayID, migrationZeroVector()); err == nil {
+		t.Fatal("late overlay embedding insert after tombstone unexpectedly accepted")
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM users WHERE id=$1`, userID); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"activity_profile_evidence", "preference_overlays", "preference_overlay_embeddings"} {
+		var count int
+		if err := database.QueryRowContext(ctx, `SELECT count(*) FROM `+pgx.Identifier{table}.Sanitize()).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("cascade left %s rows=%d err=%v", table, count, err)
+		}
+	}
+	var shared int
+	if err := database.QueryRowContext(ctx, `SELECT count(*) FROM game_embeddings WHERE game_id=$1`, gameID).Scan(&shared); err != nil || shared != 1 {
+		t.Fatalf("shared embedding count=%d err=%v", shared, err)
+	}
+}
+
+func TestActivityProfilePublicationQueriesFenceDeletedUser(t *testing.T) {
+	ctx, database, _, isolatedURL := migrationDatabaseAt(t, 20)
+	userID, profileID := uuid.New(), uuid.New()
+	if _, err := database.ExecContext(ctx, `INSERT INTO users(id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO preference_profiles(id,user_id,version,publication_state) VALUES($1,$2,1,'building')`, profileID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO deleted_user_tombstones(user_id) VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := Open(ctx, isolatedURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	pgUserID := pgtype.UUID{Bytes: userID, Valid: true}
+	pgProfileID := pgtype.UUID{Bytes: profileID, Valid: true}
+	_, err = storage.Queries.PublishActivityProfile(ctx, dbgen.PublishActivityProfileParams{
+		Summary:       pgtype.Text{String: "late summary", Valid: true},
+		SummarySource: pgtype.Text{String: "deterministic", Valid: true},
+		PublishedAt:   pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+		ID:            pgProfileID,
+		UserID:        pgUserID,
+	})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("late publication error=%v, want pgx.ErrNoRows", err)
+	}
+	rows, err := storage.Queries.FailBuildingActivityProfile(ctx, dbgen.FailBuildingActivityProfileParams{ID: pgProfileID, UserID: pgUserID})
+	if err != nil || rows != 0 {
+		t.Fatalf("late failure rows=%d err=%v, want zero rows", rows, err)
+	}
+	var state string
+	if err := database.QueryRowContext(ctx, `SELECT publication_state FROM preference_profiles WHERE id=$1`, profileID).Scan(&state); err != nil || state != "building" {
+		t.Fatalf("tombstoned profile state=%q err=%v, want building", state, err)
+	}
+}
+
+func migrationDatabaseAt(t *testing.T, version int64) (context.Context, *sql.DB, *goose.Provider, string) {
+	t.Helper()
+	baseURL := os.Getenv("TEST_DATABASE_URL")
+	if baseURL == "" {
+		t.Skip("TEST_DATABASE_URL is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	admin, err := pgx.Connect(ctx, baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := "overlay_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	_ = admin.Close(ctx)
+	t.Cleanup(func() {
+		cleanup, cleanupErr := pgx.Connect(context.Background(), baseURL)
+		if cleanupErr == nil {
+			_, _ = cleanup.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+			_ = cleanup.Close(context.Background())
+		}
+	})
+	separator := "?"
+	if strings.Contains(baseURL, "?") {
+		separator = "&"
+	}
+	isolatedURL := fmt.Sprintf("%s%ssearch_path=%s%%2Cpublic", baseURL, separator, schema)
+	database, err := sql.Open("pgx", isolatedURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	provider, err := goose.NewProvider(goose.DialectPostgres, database, migrationfiles.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = provider.Close() })
+	if _, err = provider.UpTo(ctx, version); err != nil {
+		t.Fatal(err)
+	}
+	return ctx, database, provider, isolatedURL
+}
+
+func migrationZeroVector() string {
+	return "[" + strings.TrimSuffix(strings.Repeat("0,", 1536), ",") + "]"
 }
