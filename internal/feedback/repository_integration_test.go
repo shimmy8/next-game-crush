@@ -145,7 +145,7 @@ func TestRankingDiffReportsAddedRemovedAndReorderedRecommendationIDs(t *testing.
 	}
 }
 
-func TestClassificationDoesNotDuplicateDirectGameSignals(t *testing.T) {
+func TestClassificationDoesNotDuplicateOverlayDirectGameSignals(t *testing.T) {
 	db := openFeedbackStore(t)
 	ctx := context.Background()
 	userID, profileID := uuid.New(), uuid.New()
@@ -186,12 +186,18 @@ func TestClassificationDoesNotDuplicateDirectGameSignals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	likes := map[uuid.UUID]int{}
-	for _, signal := range signals {
-		likes[signal.GameID] = signal.Likes
+	if len(signals) != 1 || signals[0].GameID != highGame || signals[0].Likes != 0 || signals[0].Dislikes != 0 {
+		t.Fatalf("activity signals include feedback-only evidence: %+v", signals)
 	}
-	if likes[highGame] != 1 || likes[lowGame] != 1 {
-		t.Fatalf("profile likes=%v", likes)
+	preferenceRepository, _ := preferences.NewSQLRepository(db)
+	snapshot, err := preferenceRepository.LoadOverlaySnapshot(ctx, userID)
+	if err != nil || len(snapshot.Reactions) != 2 {
+		t.Fatalf("initial overlay reactions=%+v err=%v", snapshot.Reactions, err)
+	}
+	for _, reaction := range snapshot.Reactions {
+		if reaction.Action != ActionLike {
+			t.Fatalf("initial reaction=%+v", reaction)
+		}
 	}
 	for _, gameID := range []uuid.UUID{highGame, lowGame} {
 		rec := highRec
@@ -210,31 +216,31 @@ func TestClassificationDoesNotDuplicateDirectGameSignals(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	signals, err = repo.LoadSignals(ctx, userID)
+	snapshot, err = preferenceRepository.LoadOverlaySnapshot(ctx, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := []profilepkg.Signal{{GameID: highGame, Vector: vector, PlaytimeMinutes: 10000, LastPlayedAt: lastPlayed, Likes: 1, Dislikes: 1}, {GameID: lowGame, Vector: otherVector, Likes: 1, Dislikes: 1}}
-	for _, s := range signals {
-		if s.Likes != 1 || s.Dislikes != 1 {
-			t.Fatal("classification duplicated direct feedback")
+	if len(snapshot.Reactions) != 2 {
+		t.Fatalf("negative overlay reactions=%+v", snapshot.Reactions)
+	}
+	for _, reaction := range snapshot.Reactions {
+		if reaction.Action != ActionDislike {
+			t.Fatalf("negative reaction=%+v", reaction)
 		}
 	}
-	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
-	if !reflect.DeepEqual(profilepkg.BuildVectors(signals, now), profilepkg.BuildVectors(expected, now)) {
-		t.Fatal("classification changed direct vector weight")
+	vectors := preferences.BuildOverlay(snapshot)
+	if vectors.PositiveSources != 0 || vectors.NegativeSources != 2 {
+		t.Fatalf("classification changed direct overlay weight: %+v", vectors)
 	}
 	if _, err := db.Pool.Exec(ctx, `INSERT INTO feedback_events(id,recommendation_id,user_id,action,idempotency_key)VALUES($1,$2,$3,'dislike','second-dislike')`, uuid.New(), highRec, userID); err != nil {
 		t.Fatal(err)
 	}
-	signals, err = repo.LoadSignals(ctx, userID)
+	snapshot, err = preferenceRepository.LoadOverlaySnapshot(ctx, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range signals {
-		if s.GameID == highGame && s.Dislikes != 2 {
-			t.Fatal("repeated direct dislike lost")
-		}
+	if len(snapshot.Reactions) != 2 || preferences.BuildOverlay(snapshot).NegativeSources != 2 {
+		t.Fatalf("repeated direct dislike stacked: %+v", snapshot.Reactions)
 	}
 }
 
@@ -431,6 +437,35 @@ func TestClassificationAndAdjustmentAtomicWinningValue(t *testing.T) {
 	a, err := pr.ForFeedback(ctx, event.UserID, event.ID)
 	if err != nil || stored.Preference == nil || a.Target != stored.Preference.Target {
 		t.Fatal("adjustment does not match immutable winner")
+	}
+}
+
+func TestIdempotentFeedbackDoesNotStack(t *testing.T) {
+	db := openFeedbackStore(t)
+	ctx := context.Background()
+	userID, profileID := uuid.New(), uuid.New()
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO users(id)VALUES($1)`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool.Exec(ctx, `INSERT INTO preference_profiles(id,user_id,version)VALUES($1,$2,1)`, profileID, userID); err != nil {
+		t.Fatal(err)
+	}
+	gameID := insertFeedbackGame(t, db, 90444, "Idempotent overlay fixture")
+	recommendationID := insertFeedbackRanking(t, db, userID, profileID, gameID, 1, 80, "idempotent-overlay")
+	repository, _ := NewSQLRepository(db)
+	command := Command{UserID: userID, RecommendationID: recommendationID, Action: ActionLike, IdempotencyKey: "one-effective-reaction"}
+	first, created, err := repository.Record(ctx, command)
+	if err != nil || !created {
+		t.Fatalf("first=%+v created=%v err=%v", first, created, err)
+	}
+	second, created, err := repository.Record(ctx, command)
+	if err != nil || created || second.ID != first.ID {
+		t.Fatalf("second=%+v created=%v err=%v", second, created, err)
+	}
+	preferenceRepository, _ := preferences.NewSQLRepository(db)
+	snapshot, err := preferenceRepository.LoadOverlaySnapshot(ctx, userID)
+	if err != nil || len(snapshot.Reactions) != 1 || snapshot.Reactions[0].FeedbackID != first.ID {
+		t.Fatalf("effective reactions=%+v err=%v", snapshot.Reactions, err)
 	}
 }
 

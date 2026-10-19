@@ -5,12 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"next-game-crush/internal/jobs"
 )
 
 type Service struct {
 	repository *SQLRepository
 	queue      *jobs.Queue
+}
+
+type OverlayJobPayload struct {
+	Version int       `json:"version"`
+	UserID  uuid.UUID `json:"user_id"`
 }
 
 func NewService(repository *SQLRepository, queue *jobs.Queue) (*Service, error) {
@@ -25,9 +31,28 @@ func (s *Service) List(ctx context.Context, userID uuid.UUID, includeInactive bo
 func (s *Service) Disable(ctx context.Context, userID, adjustmentID uuid.UUID) (DisableAccepted, error) {
 	return s.repository.DisableAndEnqueue(ctx, userID, adjustmentID)
 }
+func (s *Service) EnsureCurrent(ctx context.Context, userID uuid.UUID) (Overlay, error) {
+	return s.repository.RebuildOverlay(ctx, userID, "")
+}
 func (s *Service) RegisterHandlers(worker *jobs.Worker) error {
 	if worker == nil {
 		return errors.New("worker is required")
+	}
+	if err := worker.Register(OverlayJobKind, func(ctx context.Context, lease jobs.Lease) error {
+		var payload OverlayJobPayload
+		if json.Unmarshal(lease.Payload, &payload) != nil || payload.Version != 1 || payload.UserID == uuid.Nil || lease.UserID != payload.UserID {
+			return errors.New("unsupported preference overlay job payload schema")
+		}
+		overlay, err := s.repository.OverlayByBuildKey(ctx, payload.UserID, lease.IdempotencyKey)
+		if errors.Is(err, pgx.ErrNoRows) {
+			overlay, err = s.repository.RebuildOverlay(ctx, payload.UserID, lease.IdempotencyKey)
+		}
+		if err != nil {
+			return err
+		}
+		return s.queue.RecordResult(ctx, lease, map[string]any{"preferenceOverlayId": overlay.ID, "preferenceOverlayVersion": overlay.Version, "inputContentHash": overlay.InputContentHash})
+	}); err != nil {
+		return err
 	}
 	return worker.Register(DisableJobKind, func(ctx context.Context, lease jobs.Lease) error {
 		var payload DisablePayload
