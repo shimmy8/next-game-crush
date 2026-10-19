@@ -72,13 +72,12 @@ MOCK
   cat >"$mock_bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-{
-  printf 'docker APP_IMAGE_REF=%q' "${APP_IMAGE_REF:-}"
-  for argument in "$@"; do
-    printf ' %q' "$argument"
-  done
-  printf '\n'
-} >>"$MOCK_COMMAND_LOG"
+printf -v command_line 'docker APP_IMAGE_REF=%q' "${APP_IMAGE_REF:-}"
+for argument in "$@"; do
+  printf -v quoted_argument ' %q' "$argument"
+  command_line+="$quoted_argument"
+done
+printf '%s\n' "$command_line" >>"$MOCK_COMMAND_LOG"
 
 if [[ "${1:-}" == "image" && "${2:-}" == "prune" ]]; then
   exit "${MOCK_PRUNE_EXIT:-0}"
@@ -145,11 +144,12 @@ MOCK
   cat >"$mock_bin/gzip" <<'MOCK'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-printf 'gzip' >>"$MOCK_COMMAND_LOG"
+command_line='gzip'
 for argument in "$@"; do
-  printf ' %q' "$argument" >>"$MOCK_COMMAND_LOG"
+  printf -v quoted_argument ' %q' "$argument"
+  command_line+="$quoted_argument"
 done
-printf '\n' >>"$MOCK_COMMAND_LOG"
+printf '%s\n' "$command_line" >>"$MOCK_COMMAND_LOG"
 if [[ "${MOCK_GZIP_EXIT:-0}" != "0" ]]; then
   exit "$MOCK_GZIP_EXIT"
 fi
