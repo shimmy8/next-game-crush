@@ -135,6 +135,54 @@ func TestAppStopsWhenEitherWorkerFails(t *testing.T) {
 	}
 }
 
+func TestAppRunsHTTPWithoutStartingJobsWhenDisabled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	httpReady := make(chan struct{})
+	runnerStarted := make(chan string, 3)
+	jobRunner := func(name string) appRunnerFunc {
+		return func(ctx context.Context) error {
+			runnerStarted <- name
+			<-ctx.Done()
+			return nil
+		}
+	}
+	application := &App{
+		server:            nil,
+		jobsDisabled:      true,
+		interactiveWorker: jobRunner("interactive worker"),
+		catalogWorker:     jobRunner("catalog worker"),
+		scheduler:         jobRunner("catalog scheduler"),
+		serve: func() error {
+			close(httpReady)
+			<-ctx.Done()
+			return http.ErrServerClosed
+		},
+	}
+	result := make(chan error, 1)
+	go func() { result <- application.Run(ctx) }()
+
+	select {
+	case <-httpReady:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP server did not start")
+	}
+
+	cancel()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run() did not stop after cancellation")
+	}
+	select {
+	case name := <-runnerStarted:
+		t.Fatalf("%s started while jobs were disabled", name)
+	default:
+	}
+}
+
 func TestStartupCatchupDoesNotBlockHTTP(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

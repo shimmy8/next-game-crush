@@ -19,9 +19,61 @@ func setRequiredEnvironment(t *testing.T) {
 		"OPENAI_MODEL":           "",
 		"OPENAI_EMBEDDING_MODEL": "",
 		"WORKER_CONCURRENCY":     "",
+		"JOBS_ENABLED":           "",
 		"DEMO_MODE_ENABLED":      "",
 	} {
 		t.Setenv(name, value)
+	}
+}
+
+func TestLoadJobsEnabled(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		setRequiredEnvironment(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.JobsEnabled {
+			t.Fatal("jobs must default to enabled")
+		}
+	})
+
+	for _, value := range []string{"1", "true"} {
+		t.Run("enabled "+value, func(t *testing.T) {
+			setRequiredEnvironment(t)
+			t.Setenv("JOBS_ENABLED", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !cfg.JobsEnabled {
+				t.Fatalf("JobsEnabled = false for %q", value)
+			}
+		})
+	}
+
+	for _, value := range []string{"0", "false"} {
+		t.Run("disabled "+value, func(t *testing.T) {
+			setRequiredEnvironment(t)
+			t.Setenv("JOBS_ENABLED", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.JobsEnabled {
+				t.Fatalf("JobsEnabled = true for %q", value)
+			}
+		})
+	}
+
+	for _, value := range []string{"yes", "TRUE", "2"} {
+		t.Run("reject "+value, func(t *testing.T) {
+			setRequiredEnvironment(t)
+			t.Setenv("JOBS_ENABLED", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "JOBS_ENABLED") {
+				t.Fatalf("Load() error = %v, want JOBS_ENABLED validation error", err)
+			}
+		})
 	}
 }
 
