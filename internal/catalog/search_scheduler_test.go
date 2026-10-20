@@ -223,6 +223,32 @@ func TestDisabledDiscoveryRunRecoversRebuildAfterEarlySyncNudge(t *testing.T) {
 	}
 }
 
+func TestSearchSchedulerRunTreatsCancellationDuringRecoveryAsGraceful(t *testing.T) {
+	db := openCatalogTestStore(t)
+	cfg := DefaultDiscoveryConfig()
+	cfg.Enabled = false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	now := searchClock()
+	clockCalls := 0
+	scheduler, err := NewSearchScheduler(NewSearchRepository(db), jobs.NewQueue(db), cfg, func() time.Time {
+		clockCalls++
+		if clockCalls == 3 {
+			cancel()
+		}
+		return now
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler.recoveryInterval = time.Millisecond
+
+	if err := scheduler.Run(ctx); err != nil {
+		t.Fatalf("graceful cancellation returned %v", err)
+	}
+}
+
 func TestDeadOccurrenceCreatesOneFencedRetryGeneration(t *testing.T) {
 	s, db := searchSchedulerFixture(t)
 	ctx := context.Background()

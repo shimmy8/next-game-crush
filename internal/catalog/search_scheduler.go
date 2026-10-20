@@ -130,6 +130,9 @@ func (s *SearchScheduler) Run(ctx context.Context) error {
 	// User-sync ingress remains recoverable even when Search discovery is
 	// disabled, so startup always performs one durable outbox sweep.
 	if err := s.EnsureScheduled(ctx); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+			return nil
+		}
 		return err
 	}
 	for {
@@ -159,6 +162,9 @@ func (s *SearchScheduler) Run(ctx context.Context) error {
 			return nil
 		case <-timer.C:
 			if err := s.EnsureScheduled(ctx); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+					return nil
+				}
 				return err
 			}
 		}
