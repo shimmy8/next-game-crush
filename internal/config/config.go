@@ -40,6 +40,7 @@ type Config struct {
 	OpenAIBaseURL            string
 	HTTPAddr                 string
 	WorkerConcurrency        int
+	JobsEnabled              bool
 }
 
 func Load() (Config, error) {
@@ -64,9 +65,17 @@ func Load() (Config, error) {
 		OpenAIBaseURL:            strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")),
 		HTTPAddr:                 envOrDefault("HTTP_ADDR", ":8080"),
 		WorkerConcurrency:        10,
+		JobsEnabled:              true,
 	}
 	cfg.OpenAI = OpenAICapability{Enabled: cfg.OpenAIAPIKey != ""}
 	var problems []string
+	if raw := strings.TrimSpace(os.Getenv("JOBS_ENABLED")); raw != "" {
+		if raw != "0" && raw != "1" && raw != "true" && raw != "false" {
+			problems = append(problems, "JOBS_ENABLED must be 0, 1, true or false")
+		} else {
+			cfg.JobsEnabled = raw == "1" || raw == "true"
+		}
+	}
 	if raw := strings.TrimSpace(os.Getenv("CATALOG_DISCOVERY_ENABLED")); raw != "" {
 		if raw != "0" && raw != "1" && raw != "true" && raw != "false" {
 			problems = append(problems, "CATALOG_DISCOVERY_ENABLED must be 0, 1, true or false")

@@ -43,6 +43,7 @@ type App struct {
 	scheduler         interface{ Run(context.Context) error }
 	catalogRestart    chan chan error
 	serve             func() error
+	jobsDisabled      bool
 }
 
 func New(cfg config.Config) (*App, error) {
@@ -352,7 +353,7 @@ func New(cfg config.Config) (*App, error) {
 	}))
 	deps.Data = dataService
 	application := &App{store: db, queue: queue, searchRepo: searchRepo, searchScan: searchScan, aiService: aiService,
-		interactiveWorker: interactiveWorker, catalogWorker: catalogWorker, scheduler: searchScheduler, server: &http.Server{
+		interactiveWorker: interactiveWorker, catalogWorker: catalogWorker, scheduler: searchScheduler, jobsDisabled: !cfg.JobsEnabled, server: &http.Server{
 			Addr:              cfg.HTTPAddr,
 			Handler:           httpapi.NewRouter(deps),
 			ReadHeaderTimeout: 5 * time.Second,
@@ -422,10 +423,21 @@ func (app *App) Run(ctx context.Context) error {
 		name string
 		err  error
 	}
-	results := make(chan componentResult, 3)
-	go func() { results <- componentResult{"http server", app.listenAndServe()} }()
-	go func() { results <- componentResult{"interactive job worker", app.interactiveWorker.Run(ctx)} }()
-	go func() { results <- componentResult{"catalog runtime", app.runCatalogRuntime(ctx)} }()
+	type component struct {
+		name string
+		run  func() error
+	}
+	components := []component{{"http server", app.listenAndServe}}
+	if !app.jobsDisabled {
+		components = append(components,
+			component{"interactive job worker", func() error { return app.interactiveWorker.Run(ctx) }},
+			component{"catalog runtime", func() error { return app.runCatalogRuntime(ctx) }},
+		)
+	}
+	results := make(chan componentResult, len(components))
+	for _, current := range components {
+		go func() { results <- componentResult{current.name, current.run()} }()
+	}
 	var first componentResult
 	select {
 	case first = <-results:
@@ -434,7 +446,7 @@ func (app *App) Run(ctx context.Context) error {
 	}
 	cancel()
 	shutdownErr := app.shutdownHTTP()
-	remaining := 3
+	remaining := len(components)
 	if first.name != "context" {
 		remaining--
 	}
